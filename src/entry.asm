@@ -5,6 +5,6 @@ _start:
     call rust_main
 .section .bss.stack
 boot_stack_top:
-    .space 4096*16
+    .space 4096*64
 boot_stack_bottom:
 

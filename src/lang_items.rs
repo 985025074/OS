@@ -1,7 +1,10 @@
 use core::panic::PanicInfo;
 
+use crate::{println, sbi::shutdown};
+
 #[panic_handler]
 #[allow(unused)]
 fn panic<'b>(info: &PanicInfo<'b>) -> ! {
-    loop {}
+    println!("PANIC: {}\n", info);
+    shutdown();
 }
