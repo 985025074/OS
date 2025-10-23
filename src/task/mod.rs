@@ -9,10 +9,14 @@ use crate::{
     utils::RefCellSafe,
 };
 use lazy_static::lazy_static;
-use riscv::register::{sepc, sstatus::Sstatus};
+use riscv::{
+    interrupt::Trap,
+    register::{sepc, sstatus::Sstatus},
+};
 mod stack;
 mod switch;
 use stack::{STACK_SIZE, Stack};
+mod task_context;
 static KERNEL_STACK: Stack = Stack {
     data: [0; STACK_SIZE],
 };
@@ -44,7 +48,6 @@ impl Display for TaskState {
 #[derive(Copy, Clone)]
 struct TaskBlock {
     task_name: [u8; 32],
-    trap_context: TrapContext,
     state: TaskState,
     code_start: usize,
     code_end: usize,
@@ -54,12 +57,7 @@ impl TaskBlock {
     pub fn new_raw() -> Self {
         Self {
             task_name: [0; 32],
-            trap_context: TrapContext {
-                x: [0; 32],
 
-                sstatus: Sstatus::from_bits(0),
-                sepc: 0,
-            },
             state: TaskState::Exited,
             code_start: 0,
             code_end: 0,
@@ -78,7 +76,7 @@ impl TaskBlock {
                 task_name: _app_name,
                 code_start: app_start,
                 code_end: app_end,
-                trap_context: TrapContext::app_init_context(TARGET_LOC, USER_STACK[no].top()),
+
                 state: TaskState::Ready,
             }; // set user stack pointer
             result
@@ -96,8 +94,8 @@ impl Display for TaskBlock {
         let name_str = core::str::from_utf8(&self.task_name[..name_end]).unwrap_or("Invalid UTF-8");
         write!(
             f,
-            "TaskBlock {{ name: {}, state: {:?}, sepc: {:#x} }}",
-            name_str, self.state, self.trap_context.sepc
+            "TaskBlock {{ name: {}, state: {:?}}}",
+            name_str, self.state,
         )
     }
 }
@@ -177,7 +175,7 @@ fn go_to_first_task() -> ! {
         let inner = TASK_MANAGER.borrow_mut();
         let target_place: *mut TrapContext = start_ptr as *mut TrapContext;
         let source_place: *const TrapContext =
-            (&inner.task_blocks[0].trap_context) as *const TrapContext;
+            &TrapContext::app_init_context(TARGET_LOC, USER_STACK[0].top());
         drop(inner);
 
         target_place.copy_from(source_place, 1);
@@ -203,7 +201,7 @@ pub fn load_next_task() {
         let inner = TASK_MANAGER.borrow();
         let target_place: *mut TrapContext = start_ptr as *mut TrapContext;
         let source_place: *const TrapContext =
-            (&inner.task_blocks[0].trap_context) as *const TrapContext;
+            &TrapContext::app_init_context(TARGET_LOC, USER_STACK[next as usize].top());
         target_place.copy_from(source_place, 1);
     }
     // we dont need to call restore here. because we re in trap this time.
