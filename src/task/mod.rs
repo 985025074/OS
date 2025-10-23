@@ -5,6 +5,7 @@ use core::{arch::asm, cell::RefCell, fmt::Display, task};
 use crate::{
     console::print,
     println,
+    task::task_context::TaskContext,
     trap::{context::TrapContext, trap::restore},
     utils::RefCellSafe,
 };
@@ -16,89 +17,24 @@ use riscv::{
 mod stack;
 mod switch;
 use stack::{STACK_SIZE, Stack};
+mod code;
+mod task_block;
 mod task_context;
-static KERNEL_STACK: Stack = Stack {
+use task_block::{TaskBlock, TaskState};
+static KERNEL_STACK: [Stack; MAX_TASKS] = [Stack {
     data: [0; STACK_SIZE],
-};
+}; MAX_TASKS];
 static USER_STACK: [Stack; MAX_TASKS] = [Stack {
     data: [0; STACK_SIZE],
 }; MAX_TASKS];
+static EMPTY_TASK_CONTEXT: TaskContext = TaskContext {
+    ra: 0,
+    sp: 0,
+    s: [0; 12],
+};
 const MAX_TASKS: usize = 8;
 const TARGET_LOC: usize = 0x8040_0000;
-const CODE_SIZE: usize = 4096 * 2; // 4KB
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 
-enum TaskState {
-    Ready = 1,
-    Running = 2,
-    Suspended = 3,
-    Exited = 4,
-}
-impl Display for TaskState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let state_str = match self {
-            TaskState::Ready => "Ready",
-            TaskState::Running => "Running",
-            TaskState::Suspended => "Suspended",
-            TaskState::Exited => "Exited",
-        };
-        write!(f, "{}", state_str)
-    }
-}
-#[derive(Copy, Clone)]
-struct TaskBlock {
-    task_name: [u8; 32],
-    state: TaskState,
-    code_start: usize,
-    code_end: usize,
-    // TODO: 我认为不能写死大小??
-}
-impl TaskBlock {
-    pub fn new_raw() -> Self {
-        Self {
-            task_name: [0; 32],
-
-            state: TaskState::Exited,
-            code_start: 0,
-            code_end: 0,
-        }
-    }
-    pub fn new(app_start: usize, app_end: usize, app_name: usize, no: usize) -> Self {
-        // unsafe {
-        //     let task_name_array =
-        //     let app_code = core::slice::from_raw_parts(app_start as *const u8, app_end - app_start);
-
-        // }
-        unsafe {
-            let _app_name: [u8; 32] = *(app_name as *const [u8; 32]);
-
-            let mut result = Self {
-                task_name: _app_name,
-                code_start: app_start,
-                code_end: app_end,
-
-                state: TaskState::Ready,
-            }; // set user stack pointer
-            result
-        }
-    }
-}
-impl Display for TaskBlock {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let name_end = self
-            .task_name
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(self.task_name.len());
-        // .asciz makes sure there is a null terminator
-        let name_str = core::str::from_utf8(&self.task_name[..name_end]).unwrap_or("Invalid UTF-8");
-        write!(
-            f,
-            "TaskBlock {{ name: {}, state: {:?}}}",
-            name_str, self.state,
-        )
-    }
-}
 struct TaskManager {
     current_task: isize,
     task_blocks: [TaskBlock; MAX_TASKS],
@@ -107,11 +43,12 @@ struct TaskManager {
 impl TaskManager {
     fn new() -> Self {
         println!("[kernel] Initializing Task Manager.. .");
-        Self {
+        let mut result = Self {
             current_task: -1,
             task_blocks: [TaskBlock::new_raw(); MAX_TASKS],
             num_tasks: RefCell::new(0),
-        }
+        };
+        result
     }
     fn current_task(&self) -> &TaskBlock {
         &self.task_blocks[self.current_task as usize]
@@ -135,9 +72,15 @@ impl TaskManager {
                 let now_app_name = *ptr.add(2);
                 println!("{:x},{:x},{:x}", now_app_start, now_app_end, now_app_name);
                 ptr = ptr.add(3);
+                println!(
+                    "[kernel] Loading app {} from {:#x} to {:#x}",
+                    i, now_app_start, now_app_end
+                );
                 self.task_blocks[i as usize] =
                     TaskBlock::new(now_app_start, now_app_end, now_app_name, i as usize);
+                code::load_code(i as usize, now_app_start, now_app_end);
                 println!("[kernel] Loaded app {}.", self.task_blocks[i as usize]);
+                // println!("{}", self.task_blocks[i as usize].task_context);
             }
         }
     }
@@ -150,76 +93,65 @@ pub fn task_init() {
     inner.load_apps();
     drop(inner);
     println!("[kernel] Task initialized.");
-    load_next_task();
-    go_to_first_task();
 }
 fn suspend_current_task() {}
 fn exit_current_task() {}
-fn get_next_task() -> isize {
+fn get_next_task(now: isize) -> isize {
+    let now = if now == -1 { 0 } else { now as usize };
     let inner = TASK_MANAGER.borrow();
-    let next = (inner.current_task + 1) as usize;
-    let num_apps: usize = *inner.num_tasks.borrow();
-    drop(inner);
-    if next >= num_apps { -1 } else { next as isize }
+    let num_apps = *inner.num_tasks.borrow();
+    for i in 0..num_apps {
+        let index = (now + i + 1) % num_apps;
+        if inner.task_blocks[index].state == TaskState::Suspended
+            || inner.task_blocks[index].state == TaskState::Ready
+        {
+            return index as isize;
+        }
+    }
+    return -1;
 }
 
-fn go_to_first_task() -> ! {
+pub fn go_to_first_task() -> ! {
     println!("[kernel] Jumping to first task...");
-    // here we should restore...
-    // push the trap context of the first task
-
-    let mut start_ptr = KERNEL_STACK.top();
-    start_ptr -= core::mem::size_of::<TrapContext>();
-
-    unsafe {
-        let inner = TASK_MANAGER.borrow_mut();
-        let target_place: *mut TrapContext = start_ptr as *mut TrapContext;
-        let source_place: *const TrapContext =
-            &TrapContext::app_init_context(TARGET_LOC, USER_STACK[0].top());
-        drop(inner);
-
-        target_place.copy_from(source_place, 1);
-
-        restore(target_place)
-    }
-
+    go_to_next_task();
     panic!("Unreachable in go_to_first_task!");
 }
-pub fn load_next_task() {
-    let next = get_next_task();
+pub fn go_to_next_task() {
+    let inner = TASK_MANAGER.borrow();
+    let current = inner.current_task;
+    drop(inner);
+    let next = get_next_task(current);
     if next == -1 {
         panic!("No more tasks to run!");
     }
     println!("[kernel] Switching to task {}", next);
-    // load code to target destnation
-    load_code(next as usize);
-    let mut start_ptr = KERNEL_STACK.top();
-    start_ptr -= core::mem::size_of::<TrapContext>();
 
-    // load trap context
-    unsafe {
-        let inner = TASK_MANAGER.borrow();
-        let target_place: *mut TrapContext = start_ptr as *mut TrapContext;
-        let source_place: *const TrapContext =
-            &TrapContext::app_init_context(TARGET_LOC, USER_STACK[next as usize].top());
-        target_place.copy_from(source_place, 1);
-    }
-    // we dont need to call restore here. because we re in trap this time.
-    // and restore will be called automaticly after we exit the trap handler.
-}
-fn load_code(which: usize) {
-    // load the code to TARGET_LOC
-    unsafe {
-        let task_manager_ref = TASK_MANAGER.borrow();
-        let ptr = task_manager_ref.task_blocks[which].code_start as *const u8;
-        let end_ptr = task_manager_ref.task_blocks[which].code_end as *const u8;
-        (TARGET_LOC as *mut u8).copy_from(ptr, end_ptr.offset_from(ptr) as usize);
-        drop(task_manager_ref);
-    }
     let mut inner = TASK_MANAGER.borrow_mut();
-    inner.current_task = which as isize;
+    let current = inner.current_task;
+    inner.current_task = next;
+    inner.task_blocks[next as usize].state = TaskState::Running;
+    let new_task_cx_ptr =
+        &inner.task_blocks[next as usize].task_context as *const TaskContext as *const usize;
+    let old_task_cx_ptr = if current == -1 {
+        &EMPTY_TASK_CONTEXT as *const TaskContext as *mut usize
+    } else {
+        &mut inner.task_blocks[current as usize].task_context as *mut TaskContext as *mut usize
+    };
     drop(inner);
-    unsafe {
-        asm!("fence.i");
-    }
+    unsafe { switch::switch(old_task_cx_ptr, new_task_cx_ptr) }
+}
+pub fn suspend_and_go_to_next() {
+    let mut inner = TASK_MANAGER.borrow_mut();
+    let current = inner.current_task;
+    inner.task_blocks[current as usize].state = TaskState::Suspended;
+    drop(inner);
+    go_to_next_task();
+}
+pub fn exit_and_go_to_next() {
+    let mut inner = TASK_MANAGER.borrow_mut();
+    let current = inner.current_task;
+    inner.task_blocks[current as usize].state = TaskState::Exited;
+    println!("[kernel] task {} exited!", current);
+    drop(inner);
+    go_to_next_task();
 }

@@ -1,4 +1,5 @@
-use crate::task::load_next_task;
+use crate::task::{go_to_next_task, suspend_and_go_to_next};
+use crate::time::set_next_trigger;
 use crate::{println, trap::context::TrapContext};
 
 pub mod context;
@@ -21,6 +22,7 @@ fn log_for_trap_context(context: &TrapContext) {
 
 const USER_ENV_CALL: usize = 8;
 const INSTRUCTION_FAULT: usize = 1;
+const TIME_INTERVAL: usize = 5;
 pub fn init_trap() {
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
@@ -51,7 +53,11 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
                 "Instruction Fault at sepc = {:#x}, stval = {:#x}",
                 cx.sepc, stval
             );
-            load_next_task();
+            go_to_next_task();
+        }
+        Trap::Interrupt(TIME_INTERVAL) => {
+            set_next_trigger();
+            suspend_and_go_to_next();
         }
         _ => {
             let Trap::Exception(code) = code else {

@@ -3,3 +3,4 @@ elf-gdb
 temp.bin
 temp.elf
 kernel_release.bin
+/results

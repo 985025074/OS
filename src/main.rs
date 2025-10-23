@@ -4,12 +4,12 @@
 use core::{arch::global_asm, panic};
 
 use crate::syscall::syscall;
-
 mod console;
 mod lang_items;
 mod sbi;
 mod syscall;
 mod task;
+mod time;
 mod trap;
 mod utils;
 global_asm!(include_str!("entry.asm"));
@@ -35,9 +35,11 @@ fn rust_main() {
             num_of_apps, num_user_apps as usize
         );
     }
-
     println!("Hello, CongCore!");
     trap::init_trap();
+    trap::trap::enable_timer_interrupt();
     task::task_init();
+    time::set_next_trigger();
+    task::go_to_first_task();
     panic!("hello!");
 }

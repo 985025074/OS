@@ -17,7 +17,7 @@ KERNEL:USER_APPS
 
 # find all excutable in the user's target dir strip it and copy to the os_str
 USER_APPS:
-	@cd ../user && cargo build --$(MODE)
+	@cd ../user &&  uv run build.py
 	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
 			base=$$(basename $$f); \
@@ -31,6 +31,7 @@ clean:
 	@cargo clean
 	@rm -f $(APP_DIR)/*.bin $(APP_DIR)/*.elf 
 	@rm -f *.bin *.elf
+	@cd ../user && cargo clean
 # if stuck use CTRL-A X to exit QEMU
 run: KERNEL
 	@qemu-system-riscv64 \

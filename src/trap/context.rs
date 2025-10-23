@@ -8,6 +8,8 @@ pub struct TrapContext {
     // the next pc to run
     pub sepc: usize,
 }
+use core::fmt::Display;
+
 use riscv::register::sstatus::{self, SPP, Sstatus};
 
 impl TrapContext {
@@ -26,5 +28,20 @@ impl TrapContext {
         };
         cx.set_sp(sp); // app's user stack pointer
         cx // return initial Trap Context of app
+    }
+}
+
+impl Display for TrapContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "TrapContext {{ ")?;
+        for i in 0..32 {
+            write!(f, "x[{}]: {:#x}, ", i, self.x[i])?;
+        }
+        write!(
+            f,
+            "sstatus: {:#x}, sepc: {:#x} }}",
+            self.sstatus.bits(),
+            self.sepc
+        )
     }
 }
