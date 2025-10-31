@@ -268,6 +268,16 @@ impl MemorySet {
             false
         }
     }
+
+    pub fn remove_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        if let Some((idx, area)) = self.areas.iter_mut().enumerate().find(|(_idx, area)| {
+            area.vpn_range.get_start() == start_va.floor()
+                && area.vpn_range.get_end() == end_va.ceil()
+        }) {
+            area.unmap(&mut self.page_table);
+            self.areas.remove(idx);
+        };
+    }
 }
 
 /// map area structure, controls a contiguous piece of virtual memory

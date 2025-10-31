@@ -15,6 +15,7 @@ use riscv::{
     register::{sepc, sstatus::Sstatus},
 };
 mod pid;
+mod stack;
 mod switch;
 mod task_block;
 mod task_context;
