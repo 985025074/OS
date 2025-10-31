@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
-
+#![feature(alloc_error_handler)]
+#![allow(unreachable_code)]
 use core::{arch::global_asm, panic};
-
+extern crate alloc;
 use crate::syscall::syscall;
+mod config;
 mod console;
 mod lang_items;
+mod mm;
 mod sbi;
 mod syscall;
 mod task;
@@ -18,8 +21,8 @@ global_asm!(include_str!("link_app.asm"));
 fn rust_main() {
     unsafe extern "C" {
         fn num_user_apps();
-        fn sbss();
-        fn ebss();
+        safe fn sbss();
+        safe fn ebss();
     }
     unsafe {
         //clear bss
@@ -36,10 +39,13 @@ fn rust_main() {
         );
     }
     println!("Hello, CongCore!");
+    mm::init();
+    mm::remap_test();
+    println!("[kernel] memory management initialized.");
     trap::init_trap();
     trap::trap::enable_timer_interrupt();
     task::task_init();
     time::set_next_trigger();
     task::go_to_first_task();
-    panic!("hello!");
+    panic!("shouldn't be here");
 }

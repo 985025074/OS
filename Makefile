@@ -17,11 +17,11 @@ KERNEL:USER_APPS
 
 # find all excutable in the user's target dir strip it and copy to the os_str
 USER_APPS:
-	@cd ../user &&  uv run build.py
+	@cd ../user  && cargo build --$(MODE)
 	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
 			base=$$(basename $$f); \
-			rust-objcopy --strip-all $$f -O binary ../os/$(APP_DIR)/$$base.bin; \
+			cp $$f  ../os/$(APP_DIR)/$$base.bin; \
 			echo "find user app: $$base"; \
 		fi; \
 	done
@@ -39,6 +39,9 @@ run: KERNEL
 		-nographic \
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -m 1G
+test:KERNEL
+	@cd ../tests && cargo test -- --nocapture
+
 debug:KERNEL
 	@qemu-system-riscv64 \
 		-machine virt \

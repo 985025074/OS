@@ -15,7 +15,7 @@ pub fn syscall(id: usize, args: [usize; 3]) -> isize {
     //     id, args[0], args[1], args[2]
     // );
     match id {
-        SYSCALL_WRITE => flow::syscall_write(args[0], args[1], args[2]),
+        SYSCALL_WRITE => flow::syscall_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_FORTEST => flow::syscall_fortest(args[0], args[1]),
         SYSCALL_YIELD => flow::syscall_yield(),

@@ -1,20 +1,22 @@
 use crate::{
+    mm::translated_byte_buffer,
     print, println,
-    task::{exit_and_go_to_next, go_to_next_task, suspend_and_go_to_next},
+    task::{exit_and_go_to_next, suspend_and_go_to_next},
+    trap::get_current_token,
 };
-
-pub fn syscall_write(_fd: usize, _buf: usize, _len: usize) -> isize {
-    if _fd == 1 {
-        //stdout
-        let slice = unsafe { core::slice::from_raw_parts(_buf as *const u8, _len) };
-        if let Ok(s) = core::str::from_utf8(slice) {
-            print!("{}", s);
-            return _len as isize;
-        } else {
-            return -1;
+const FD_STDOUT: usize = 1;
+pub fn syscall_write(fd: usize, buf: *const u8, len: usize) -> isize {
+    match fd {
+        FD_STDOUT => {
+            let buffers = translated_byte_buffer(get_current_token(), buf, len);
+            for buffer in buffers {
+                print!("{}", core::str::from_utf8(buffer).unwrap());
+            }
+            len as isize
         }
-    } else {
-        return -1;
+        _ => {
+            panic!("Unsupported fd in sys_write!");
+        }
     }
 }
 pub fn syscall_exit(_code: usize) -> isize {

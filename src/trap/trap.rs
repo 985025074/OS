@@ -8,7 +8,7 @@ global_asm!(include_str!("trap.asm"));
 
 unsafe extern "C" {
     pub fn alltraps();
-    pub fn restore(TrapContextPtr: *const TrapContext) -> !;
+    pub fn restore();
 }
 /// timer interrupt enabled
 pub fn enable_timer_interrupt() {

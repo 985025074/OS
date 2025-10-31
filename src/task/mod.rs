@@ -14,41 +14,28 @@ use riscv::{
     interrupt::Trap,
     register::{sepc, sstatus::Sstatus},
 };
-mod stack;
+mod pid;
 mod switch;
-use stack::{STACK_SIZE, Stack};
-mod code;
 mod task_block;
 mod task_context;
 use task_block::{TaskBlock, TaskState};
-static KERNEL_STACK: [Stack; MAX_TASKS] = [Stack {
-    data: [0; STACK_SIZE],
-}; MAX_TASKS];
-static USER_STACK: [Stack; MAX_TASKS] = [Stack {
-    data: [0; STACK_SIZE],
-}; MAX_TASKS];
-static EMPTY_TASK_CONTEXT: TaskContext = TaskContext {
-    ra: 0,
-    sp: 0,
-    s: [0; 12],
-};
+
 const MAX_TASKS: usize = 8;
 const TARGET_LOC: usize = 0x8040_0000;
 
-struct TaskManager {
-    current_task: isize,
-    task_blocks: [TaskBlock; MAX_TASKS],
-    num_tasks: RefCell<usize>,
+pub struct TaskManager {
+    pub current_task: isize,
+    pub task_blocks: [TaskBlock; MAX_TASKS],
+    pub num_tasks: RefCell<usize>,
 }
 impl TaskManager {
     fn new() -> Self {
-        println!("[kernel] Initializing Task Manager.. .");
-        let mut result = Self {
+        let task_blocks: [TaskBlock; MAX_TASKS] = unsafe { core::mem::zeroed() };
+        Self {
             current_task: -1,
-            task_blocks: [TaskBlock::new_raw(); MAX_TASKS],
+            task_blocks: task_blocks,
             num_tasks: RefCell::new(0),
-        };
-        result
+        }
     }
     fn current_task(&self) -> &TaskBlock {
         &self.task_blocks[self.current_task as usize]
@@ -78,7 +65,8 @@ impl TaskManager {
                 );
                 self.task_blocks[i as usize] =
                     TaskBlock::new(now_app_start, now_app_end, now_app_name, i as usize);
-                code::load_code(i as usize, now_app_start, now_app_end);
+                // code::load_code(i as usize, now_app_start, now_app_end);
+                // the above one is handled by new now.
                 println!("[kernel] Loaded app {}.", self.task_blocks[i as usize]);
                 // println!("{}", self.task_blocks[i as usize].task_context);
             }
@@ -86,7 +74,7 @@ impl TaskManager {
     }
 }
 lazy_static! {
-    static ref TASK_MANAGER: RefCellSafe<TaskManager> = RefCellSafe::new(TaskManager::new());
+    pub static ref TASK_MANAGER: RefCellSafe<TaskManager> = RefCellSafe::new(TaskManager::new());
 }
 pub fn task_init() {
     let mut inner = TASK_MANAGER.borrow_mut();
@@ -133,7 +121,7 @@ pub fn go_to_next_task() {
     let new_task_cx_ptr =
         &inner.task_blocks[next as usize].task_context as *const TaskContext as *const usize;
     let old_task_cx_ptr = if current == -1 {
-        &EMPTY_TASK_CONTEXT as *const TaskContext as *mut usize
+        &TaskContext::new() as *const TaskContext as *mut usize
     } else {
         &mut inner.task_blocks[current as usize].task_context as *mut TaskContext as *mut usize
     };

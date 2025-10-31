@@ -1,5 +1,3 @@
-use crate::println;
-
 pub struct RefCellSafe<T> {
     refcell: core::cell::RefCell<T>,
 }
@@ -16,4 +14,39 @@ impl<T> RefCellSafe<T> {
     pub fn borrow_mut(&self) -> core::cell::RefMut<T> {
         self.refcell.borrow_mut()
     }
+}
+pub fn is_equal_two_string(string1: usize, string2: usize) -> bool {
+    unsafe {
+        let mut ptr1 = string1 as *const u8;
+        let mut ptr2 = string2 as *const u8;
+        loop {
+            let c1 = *ptr1;
+            let c2 = *ptr2;
+            if c1 == 0 && c2 == 0 {
+                return true;
+            }
+            if c1 != c2 {
+                return false;
+            }
+            ptr1 = ptr1.add(1);
+            ptr2 = ptr2.add(1);
+        }
+    }
+}
+
+pub fn get_app_data_by_name(name: usize, number_of_apps: usize, start_loc: usize) -> &'static [u8] {
+    unsafe {
+        let now_ptr = start_loc as *const usize;
+        for _ in 0..number_of_apps {
+            let app_start = *now_ptr;
+            let app_end = *now_ptr.add(1);
+            let app_name = *now_ptr.add(2);
+            if is_equal_two_string(app_name, name) {
+                let app_size = app_end - app_start;
+                let app_slice = core::slice::from_raw_parts(app_start as *const u8, app_size);
+                return app_slice;
+            }
+        }
+    }
+    panic!("App data not found for name: {}", name);
 }
