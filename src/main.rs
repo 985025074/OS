@@ -46,6 +46,6 @@ fn rust_main() {
     trap::trap::enable_timer_interrupt();
     task::task_init();
     time::set_next_trigger();
-    task::go_to_first_task();
+    task::task_start();
     panic!("shouldn't be here");
 }

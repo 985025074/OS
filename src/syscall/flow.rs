@@ -1,7 +1,7 @@
 use crate::{
     mm::translated_byte_buffer,
     print, println,
-    task::{exit_and_go_to_next, suspend_and_go_to_next},
+    task::processor::{exit_current_and_run_next, suspend_current_and_run_next},
     trap::get_current_token,
 };
 const FD_STDOUT: usize = 1;
@@ -20,7 +20,7 @@ pub fn syscall_write(fd: usize, buf: *const u8, len: usize) -> isize {
     }
 }
 pub fn syscall_exit(_code: usize) -> isize {
-    exit_and_go_to_next();
+    exit_current_and_run_next(_code as i32);
     return 0;
 }
 // the below one is just for testing
@@ -29,6 +29,6 @@ pub fn syscall_fortest(a: usize, b: usize) -> isize {
     0
 }
 pub fn syscall_yield() -> isize {
-    suspend_and_go_to_next();
+    suspend_current_and_run_next();
     0
 }

@@ -1,20 +1,19 @@
 use core::arch::asm;
 
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT, kernel_stack_position};
-use crate::task::TASK_MANAGER;
-use crate::task::{go_to_next_task, suspend_and_go_to_next};
+use crate::task::manager::TASK_MANAGER;
+use crate::task::processor::{PROCESSOR, exit_current_and_run_next, suspend_current_and_run_next};
 use crate::time::set_next_trigger;
 use crate::{println, trap::context::TrapContext};
 pub mod context;
 pub mod trap;
 use crate::syscall::syscall;
-use riscv::register::scause::set;
-use riscv::register::stvec::{Stvec, TrapMode};
 use riscv::{
-    interrupt::{Exception, Trap},
+    interrupt::Trap,
     register::{scause, stval},
 };
 
+#[allow(unused)]
 fn log_for_trap_context(context: &TrapContext) {
     println!("--- Trap Context ---");
     for i in 0..32 {
@@ -37,6 +36,7 @@ pub fn init_trap() {
 fn trap_from_kernel() -> ! {
     panic!("not impled");
 }
+#[allow(unused)]
 fn set_kernel_trap_entry() {
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
@@ -59,16 +59,22 @@ fn set_user_trap_entry() {
     //     stvec::write(trampoline as usize, TrapMode::Direct);
     // }
 }
+// todo : avoid cloning here..
 fn get_trap_context() -> &'static mut TrapContext {
-    let now_task_num = TASK_MANAGER.borrow_mut().current_task;
-    let task_block = &TASK_MANAGER.borrow().task_blocks[now_task_num as usize];
-    let cx = task_block.trap_context_loc.get_bytes_array();
-    unsafe { &mut *(cx.as_mut_ptr() as *mut TrapContext) }
+    let processor = PROCESSOR.borrow_mut();
+    let now_task_block = processor.current().unwrap();
+    drop(processor);
+    let now_task_block_inner = now_task_block.get_inner();
+    let cx = now_task_block_inner.trap_context_loc.get_mut();
+    //
+    cx
 }
 pub fn get_current_token() -> usize {
-    let now_task_num = TASK_MANAGER.borrow_mut().current_task;
-    let task_block = &TASK_MANAGER.borrow().task_blocks[now_task_num as usize];
-    task_block.code_memory_set.token()
+    let processor = PROCESSOR.borrow_mut();
+    let now_task_block = processor.current().unwrap();
+    drop(processor);
+    let now_task_block_inner = now_task_block.get_inner();
+    now_task_block_inner.code_memory_set.token()
 }
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
@@ -94,11 +100,11 @@ pub fn trap_handler() {
                 "Instruction Fault at sepc = {:#x}, stval = {:#x}",
                 cx.sepc, stval
             );
-            go_to_next_task();
+            exit_current_and_run_next(-1);
         }
         Trap::Interrupt(TIME_INTERVAL) => {
             set_next_trigger();
-            suspend_and_go_to_next();
+            suspend_current_and_run_next();
         }
         _ => {
             let Trap::Exception(code) = code else {
