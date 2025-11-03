@@ -5,3 +5,4 @@ temp.elf
 kernel_release.bin
 kernel_release.elf
 /results
+*.elf
