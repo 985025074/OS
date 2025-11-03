@@ -80,22 +80,24 @@ pub fn get_current_token() -> usize {
 pub fn trap_handler() {
     // now is kernel space
     // set_kernel_trap_entry();
-    let cx: &mut TrapContext = get_trap_context();
     use crate::println;
     // log_for_trap_context(cx);
     let scause = scause::read();
     let stval = stval::read();
     let code = scause.cause(); // usize
-
     match code {
         // user env call ...
         Trap::Exception(USER_ENV_CALL) => {
-            // UserEnvCall
+            let mut cx = get_trap_context();
             cx.sepc += 4;
-            // println!("USER ENV CALL!,call id = {}", cx.x[17]);
-            cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
+            // get system call return value
+            let result = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]);
+            // cx is changed during sys_exec, so we have to call it again
+            cx = get_trap_context();
+            cx.x[10] = result as usize;
         }
         Trap::Exception(INSTRUCTION_FAULT) => {
+            let cx = get_trap_context();
             println!(
                 "Instruction Fault at sepc = {:#x}, stval = {:#x}",
                 cx.sepc, stval

@@ -1,11 +1,11 @@
 .section .rodata
 .align 3
 app_0_name:
-    .asciz "01helloworld"
+    .asciz "00shell"
 .align 3
 .section .data
 app_0_start:
-    .incbin "./results/01helloworld.bin"
+    .incbin "./results/00shell.bin"
 .align 3
 app_0_end:
 .section .rodata
@@ -40,9 +40,19 @@ app_3_start:
 app_3_end:
 .section .rodata
 .align 3
+app_4_name:
+    .asciz "123"
+.align 3
+.section .data
+app_4_start:
+    .incbin "./results/123.bin"
+.align 3
+app_4_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 4
+    .quad 5
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -55,3 +65,6 @@ num_user_apps:
     .quad app_3_start
     .quad app_3_end
     .quad app_3_name
+    .quad app_4_start
+    .quad app_4_end
+    .quad app_4_name

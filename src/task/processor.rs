@@ -3,7 +3,7 @@ use crate::{
     task::{
         manager::{TASK_MANAGER, add_task, fetch_task},
         switch,
-        task_block::{TaskBlock, TaskState},
+        task_block::{self, TaskBlock, TaskState},
         task_context::{self, TaskContext},
     },
     utils::RefCellSafe,
@@ -33,7 +33,38 @@ impl Processor {
         self.now_task_block.as_ref().cloned()
     }
 }
-fn take_current_task() -> Option<Arc<TaskBlock>> {
+pub fn current_task() -> Option<Arc<TaskBlock>> {
+    let processor = PROCESSOR.borrow();
+    let task = processor.current();
+    drop(processor);
+    task
+}
+pub fn current_task_has_child(pid_or_negative: isize, exit_code: &mut i32) -> Option<usize> {
+    // 获取当前任务（当前正在运行的进程）
+    let pid = pid_or_negative;
+    if let Some(current) = current_task() {
+        // 获取当前任务的内部可变数据
+        let inner = current.get_inner();
+
+        // 遍历当前任务的所有子任务
+        for child in inner.children_task.iter() {
+            let child_inner = child.get_inner();
+
+            // 匹配 pid 且子进程已退出
+            if (pid == -1 || child.pid.0 == pid as usize) && child_inner.state == TaskState::Exited
+            {
+                // 将退出码写入 exit_code
+                *exit_code = child_inner.exit_code;
+                return Some(child.pid.0);
+            }
+        }
+    }
+    None
+
+    // 没有找到匹配的子任务
+}
+
+pub fn take_current_task() -> Option<Arc<TaskBlock>> {
     let mut processor = PROCESSOR.borrow_mut();
     let task = processor.take_current_task();
     drop(processor);
@@ -63,15 +94,14 @@ pub fn idle_task() {
             let mut task_inner = task.get_inner();
             let next_task_cx_ptr = &task_inner.task_context as *const TaskContext;
             task_inner.state = TaskState::Running;
+
+            // println!("[kernel] Switching to task PID {}", task.pid.0);
             drop(task_inner);
             // release coming task TCB manually
             processor.now_task_block = Some(task);
             // release processor manually
             drop(processor);
-            println!(
-                "switch from {:x} to {:x}",
-                idle_task_cx_ptr as usize, next_task_cx_ptr as usize
-            );
+
             unsafe {
                 switch::switch(
                     idle_task_cx_ptr as *const usize,

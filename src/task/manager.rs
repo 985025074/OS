@@ -49,10 +49,10 @@ pub fn add_task(task: Arc<TaskBlock>) {
     drop(inner);
 }
 pub fn fetch_task() -> Option<Arc<TaskBlock>> {
-    println!("[kernel] Fetching next task.");
+    // println!("[kernel] Fetching next task.");
 
     let mut inner = TASK_MANAGER.borrow_mut();
-    println!("task manger borrowed");
+    // println!("task manger borrowed");
     let temp = inner.task_blocks.pop_front();
     drop(inner);
     temp

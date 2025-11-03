@@ -19,13 +19,12 @@ mod pid;
 pub mod processor;
 mod stack;
 mod switch;
-mod task_block;
-mod task_context;
+pub mod task_block;
+pub mod task_context;
 use task_block::{TaskBlock, TaskState};
 pub fn task_init() {
     let mut inner = TASK_MANAGER.borrow_mut();
-    inner.load_app_by_name("01helloworld\0");
-    inner.load_app_by_name("02helloqiukaiyu\0");
+    inner.load_app_by_name("00shell\0");
     drop(inner);
     println!("[kernel] Task initialized.");
 }

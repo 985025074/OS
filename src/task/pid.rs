@@ -28,6 +28,7 @@ impl PidAllocator {
         self.recycle.push(pid.0);
     }
 }
+
 lazy_static! {
     /// frame allocator instance through lazy_static!
     pub static ref PID_ALLOCATOR: RefCellSafe<PidAllocator> =
@@ -38,4 +39,9 @@ pub fn alloc_pid() -> Pid {
 }
 pub fn dealloc_pid(pid: Pid) {
     PID_ALLOCATOR.borrow_mut().dealloc(pid);
+}
+impl Drop for Pid {
+    fn drop(&mut self) {
+        dealloc_pid(Pid(self.0));
+    }
 }

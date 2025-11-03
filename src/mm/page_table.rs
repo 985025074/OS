@@ -132,8 +132,23 @@ impl PageTable {
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
     }
+    pub fn clone(&self) -> Self {
+        //todo:alloc new frames...
+        return Self {
+            root_ppn: self.root_ppn,
+            frames: Vec::new(),
+        };
+    }
 }
 
+/// translate a single pointer
+pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(ptr as usize);
+    let vpn = va.floor();
+    let ppn = page_table.translate(vpn).unwrap().ppn();
+    &mut ppn.get_bytes_array()[va.page_offset()]
+}
 /// translate a pointer to a mutable u8 Vec through page table
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
     let page_table = PageTable::from_token(token);

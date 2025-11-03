@@ -278,6 +278,31 @@ impl MemorySet {
             self.areas.remove(idx);
         };
     }
+
+    pub fn clone(&self) -> Self {
+        let mut new_memory_set = Self::new_bare();
+        new_memory_set.map_trampoline();
+        for area in &self.areas {
+            let new_area = MapArea::new(
+                VirtAddr::from(area.vpn_range.get_start()),
+                VirtAddr::from(area.vpn_range.get_end()),
+                area.map_type,
+                area.map_perm,
+            );
+            new_memory_set.push(new_area, None);
+            //then copy data
+
+            for vpn in area.vpn_range {
+                let src_ppn = self.page_table.translate(vpn).unwrap().ppn();
+                let dst_ppn = new_memory_set.page_table.translate(vpn).unwrap().ppn();
+                let src_bytes = src_ppn.get_bytes_array();
+                let dst_bytes = dst_ppn.get_bytes_array();
+                dst_bytes.copy_from_slice(&src_bytes);
+            }
+        }
+
+        new_memory_set
+    }
 }
 
 /// map area structure, controls a contiguous piece of virtual memory

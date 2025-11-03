@@ -1,5 +1,4 @@
-use alloc::rc::Weak;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use riscv::interrupt::Trap;
 
@@ -10,7 +9,7 @@ use crate::task::pid::{Pid, alloc_pid};
 use crate::task::stack::KernelStack;
 use crate::trap::context::{TrapContext, push_trap_context_at};
 use crate::trap::{trap_handler, trap_return};
-use crate::utils::RefCellSafe;
+use crate::utils::{RefCellSafe, get_app_data_by_name};
 use crate::{println, trap};
 
 use super::restore;
@@ -59,6 +58,7 @@ pub struct TaskBlockInner {
     pub trap_context_loc: PhysPageNum,
     pub children_task: Vec<Arc<TaskBlock>>,
     pub father_task: Option<Weak<TaskBlock>>,
+    pub exit_code: i32,
 }
 impl TaskBlock {
     pub fn new_raw() -> Self {
@@ -73,6 +73,7 @@ impl TaskBlock {
                 trap_context_loc: PhysPageNum(0),
                 children_task: Vec::new(),
                 father_task: None,
+                exit_code: 0,
             }),
         }
     }
@@ -131,10 +132,87 @@ impl TaskBlock {
                     trap_context_loc: trap_page,
                     father_task: None,
                     children_task: Vec::new(),
+                    exit_code: 0,
                 }),
             }; // set user stack pointer
             result
         }
+    }
+    // ...existing code...
+    pub fn exec(&self, name: usize) -> Result<(), &'static str> {
+        unsafe extern "C" {
+            fn num_user_apps();
+        }
+        let number_of_apps = unsafe { *(num_user_apps as *const i64) } as usize;
+        let start_loc = (num_user_apps as usize) + core::mem::size_of::<usize>();
+        let elf_data = get_app_data_by_name(name, number_of_apps, start_loc);
+        let (mem_set, user_sp, entry_point) = MemorySet::from_elf(&elf_data);
+        let kernel_stack_top = self.kernel_stack.kernel_stack_top;
+        let trap_page = mem_set
+            .translate(VirtAddr::from(TRAP_CONTEXT).into())
+            .ok_or("ERROR while get trap context")?
+            .ppn();
+        self.get_inner().code_memory_set = mem_set;
+        let token = KERNEL_SPACE.borrow().token();
+        let trap_context = crate::trap::context::TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            token,
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        let trap_context_ref: &mut TrapContext = trap_page.get_mut();
+        *trap_context_ref = trap_context;
+        self.get_inner().trap_context_loc = trap_page;
+        self.get_inner().task_context =
+            TaskContext::set_for_app(trap_return as usize, kernel_stack_top);
+        // self.get_inner().state = TaskState::Ready; // 确保任务准备运行
+        Ok(())
+    }
+    // ...existing code...
+    pub fn fork(now_task_block: Arc<TaskBlock>) -> Arc<TaskBlock> {
+        let child_pid = alloc_pid();
+        let kernel_stack = KernelStack::new(child_pid.0);
+        let kernel_stack_top = kernel_stack.kernel_stack_top;
+        let mem_set = now_task_block.get_inner().code_memory_set.clone(); // todo: clone the memory set
+        // attention: we dont need to manually initialize the trap context it should be done
+        // in the prior clone. since the trap context is stored in the user space
+        // correct:we still need to change the trap_context's kernel_sp to the new one
+        // and return value register
+        let trap_page = mem_set
+            .translate(VirtAddr::from(TRAP_CONTEXT).into())
+            .unwrap()
+            .ppn();
+
+        let mut result = Self {
+            pid: child_pid,
+            task_name: now_task_block.task_name,
+
+            kernel_stack,
+            // fill this later
+            //todo there are some error!!
+            task_block_inner: RefCellSafe::new(TaskBlockInner {
+                task_context: TaskContext::set_for_app(trap_return as usize, kernel_stack_top),
+                state: TaskState::Ready,
+                code_memory_set: mem_set,
+                trap_context_loc: trap_page,
+                father_task: Some(Arc::downgrade(&now_task_block)),
+                children_task: Vec::new(),
+                exit_code: 0,
+            }),
+        }; // set user stack pointer
+        // we need to change the kernel stack here...
+        let trap_context_ref: &mut TrapContext = trap_page.get_mut();
+        trap_context_ref.kernel_sp = kernel_stack_top;
+        trap_context_ref.x[10] = 0; // Child process return value
+
+        let target_arc = Arc::new(result);
+
+        now_task_block
+            .get_inner()
+            .children_task
+            .push(target_arc.clone());
+        target_arc
     }
 }
 // impl Display for TaskBlock {

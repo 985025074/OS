@@ -4,6 +4,23 @@ use crate::{
     task::processor::{exit_current_and_run_next, suspend_current_and_run_next},
     trap::get_current_token,
 };
+pub fn syscall_read(_fd: usize, buf: *mut u8, len: usize) -> isize {
+    // use get char to get stdin 0
+    match _fd {
+        0 => {
+            if len != 1 {
+                panic!("sys_read only support len = 1 now!");
+            }
+            let c = crate::sbi::console_getchar();
+            let mut buffers = translated_byte_buffer(get_current_token(), buf, len);
+            buffers[0][0] = c as u8;
+            1
+        }
+        _ => {
+            panic!("Unsupported fd in sys_read!");
+        }
+    }
+}
 const FD_STDOUT: usize = 1;
 pub fn syscall_write(fd: usize, buf: *const u8, len: usize) -> isize {
     match fd {
