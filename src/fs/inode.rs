@@ -14,6 +14,7 @@ use bitflags::*;
 use easy_fs::debug::debug_log;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
+// 底层内核INode 的一份拷贝
 /// A wrapper around a filesystem inode
 /// to implement File trait atop
 pub struct OSInode {
@@ -100,19 +101,23 @@ impl OpenFlags {
 }
 ///Open file with flags
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+    // 可读,可写与否
     let (readable, writable) = flags.read_write();
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
             // clear size
+            // 清空已有的问ian
             inode.clear();
             Some(Arc::new(OSInode::new(readable, writable, inode)))
         } else {
             // create file
+            // 在 root i node 穿过ian文件
             ROOT_INODE
                 .create(name)
                 .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
         }
     } else {
+        // 并非创建文件
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.clear();

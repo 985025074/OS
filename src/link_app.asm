@@ -50,9 +50,29 @@ app_4_start:
 app_4_end:
 .section .rodata
 .align 3
+app_5_name:
+    .asciz "05open"
+.align 3
+.section .data
+app_5_start:
+    .incbin "./results/05open.bin"
+.align 3
+app_5_end:
+.section .rodata
+.align 3
+app_6_name:
+    .asciz "05"
+.align 3
+.section .data
+app_6_start:
+    .incbin "./results/05.bin"
+.align 3
+app_6_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 5
+    .quad 7
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -68,3 +88,9 @@ num_user_apps:
     .quad app_4_start
     .quad app_4_end
     .quad app_4_name
+    .quad app_5_start
+    .quad app_5_end
+    .quad app_5_name
+    .quad app_6_start
+    .quad app_6_end
+    .quad app_6_name

@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![feature(str_from_raw_parts)]
 #![allow(unreachable_code)]
 use core::{arch::global_asm, panic};
 extern crate alloc;
