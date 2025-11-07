@@ -1,5 +1,7 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
+use crate::mm::PhysAddr;
+
 use super::{FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -128,6 +130,15 @@ impl PageTable {
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
+    }
+    /// Translate `VirtAddr` to `PhysAddr`
+    pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
+        self.find_pte(va.clone().floor()).map(|pte| {
+            let aligned_pa: PhysAddr = pte.ppn().into();
+            let offset = va.page_offset();
+            let aligned_pa_usize: usize = aligned_pa.into();
+            (aligned_pa_usize + offset).into()
+        })
     }
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0

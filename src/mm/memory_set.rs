@@ -419,7 +419,9 @@ bitflags! {
         const U = 1 << 4;
     }
 }
-
+pub fn kernel_token() -> usize {
+    KERNEL_SPACE.borrow().token()
+}
 #[allow(unused)]
 pub fn remap_test() {
     let mut kernel_space = KERNEL_SPACE.borrow_mut();

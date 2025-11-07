@@ -1,8 +1,7 @@
-use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use riscv::interrupt::Trap;
-
+use super::restore;
+use super::task_context::TaskContext;
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT, kernel_stack_position};
+use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MapPermission, MemorySet, PhysPageNum, VirtAddr, VirtPageNum};
 use crate::task::manager::TaskManager;
 use crate::task::pid::{Pid, alloc_pid};
@@ -11,11 +10,12 @@ use crate::trap::context::{TrapContext, push_trap_context_at};
 use crate::trap::{trap_handler, trap_return};
 use crate::utils::{RefCellSafe, get_app_data_by_name};
 use crate::{println, trap};
-
-use super::restore;
-use super::task_context::TaskContext;
+use alloc::sync::{Arc, Weak};
+use alloc::vec;
+use alloc::vec::Vec;
 use core::cell::{Ref, RefMut};
 use core::fmt::Display;
+use riscv::interrupt::Trap;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 
 pub enum TaskState {
@@ -59,6 +59,7 @@ pub struct TaskBlockInner {
     pub children_task: Vec<Arc<TaskBlock>>,
     pub father_task: Option<Weak<TaskBlock>>,
     pub exit_code: i32,
+    pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 }
 impl TaskBlock {
     pub fn new_raw() -> Self {
@@ -74,6 +75,7 @@ impl TaskBlock {
                 children_task: Vec::new(),
                 father_task: None,
                 exit_code: 0,
+                fd_table: Vec::new(),
             }),
         }
     }
@@ -133,6 +135,13 @@ impl TaskBlock {
                     father_task: None,
                     children_task: Vec::new(),
                     exit_code: 0,
+                    fd_table: vec![
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
                 }),
             }; // set user stack pointer
             result
@@ -199,6 +208,12 @@ impl TaskBlock {
                 father_task: Some(Arc::downgrade(&now_task_block)),
                 children_task: Vec::new(),
                 exit_code: 0,
+                fd_table: now_task_block
+                    .get_inner()
+                    .fd_table
+                    .iter()
+                    .map(|fd_option| fd_option.as_ref().map(|fd| Arc::clone(fd)))
+                    .collect(),
             }),
         }; // set user stack pointer
         // we need to change the kernel stack here...

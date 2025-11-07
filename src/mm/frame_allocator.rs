@@ -109,7 +109,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 }
 
 /// deallocate a frame
-fn frame_dealloc(ppn: PhysPageNum) {
+pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.borrow_mut().dealloc(ppn);
 }
 

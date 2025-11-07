@@ -4,9 +4,11 @@
 #![allow(unreachable_code)]
 use core::{arch::global_asm, panic};
 extern crate alloc;
-use crate::syscall::syscall;
+use crate::{fs::list_apps, syscall::syscall};
 mod config;
 mod console;
+mod drivers;
+mod fs;
 mod lang_items;
 mod mm;
 mod sbi;
@@ -15,6 +17,7 @@ mod task;
 mod time;
 mod trap;
 mod utils;
+
 global_asm!(include_str!("entry.asm"));
 global_asm!(include_str!("link_app.asm"));
 #[unsafe(no_mangle)]
@@ -46,6 +49,8 @@ fn rust_main() {
     trap::trap::enable_timer_interrupt();
     task::task_init();
     time::set_next_trigger();
+    fs::init_fs_debuger();
+    list_apps();
     task::task_start();
     panic!("shouldn't be here");
 }

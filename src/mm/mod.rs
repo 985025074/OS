@@ -12,16 +12,32 @@ mod heap_allocator;
 mod memory_set;
 mod page_table;
 
+use crate::println;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use address::{StepByOne, VPNRange};
-pub use frame_allocator::{FrameTracker, frame_alloc};
+use alloc::vec::Vec;
+pub use frame_allocator::{FrameTracker, frame_alloc, frame_dealloc};
+pub use memory_set::kernel_token;
 pub use memory_set::remap_test;
 pub use memory_set::{KERNEL_SPACE, MapPermission, MemorySet};
-use page_table::{PTEFlags, PageTable};
+pub use page_table::{PTEFlags, PageTable};
 pub use page_table::{PageTableEntry, translated_byte_buffer, translated_single_address};
+pub struct UserBuffer {
+    pub buffers: Vec<&'static mut [u8]>,
+}
 
-use crate::println;
-
+impl UserBuffer {
+    pub fn new(buffers: Vec<&'static mut [u8]>) -> Self {
+        Self { buffers }
+    }
+    pub fn len(&self) -> usize {
+        let mut total: usize = 0;
+        for b in self.buffers.iter() {
+            total += b.len();
+        }
+        total
+    }
+}
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     heap_allocator::init_heap();
