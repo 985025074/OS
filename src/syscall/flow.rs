@@ -16,9 +16,7 @@ pub fn syscall_read(_fd: usize, buf: *mut u8, len: usize) -> isize {
             buffers[0][0] = c as u8;
             1
         }
-        _ => {
-            panic!("Unsupported fd in sys_read!");
-        }
+        file_fd => super::filesystem::syscall_read(file_fd, buf as usize, len),
     }
 }
 const FD_STDOUT: usize = 1;
@@ -31,9 +29,7 @@ pub fn syscall_write(fd: usize, buf: *const u8, len: usize) -> isize {
             }
             len as isize
         }
-        _ => {
-            panic!("Unsupported fd in sys_write!");
-        }
+        file_fd => super::filesystem::syscall_write(file_fd, buf as usize, len),
     }
 }
 pub fn syscall_exit(_code: usize) -> isize {

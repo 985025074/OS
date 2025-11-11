@@ -70,9 +70,39 @@ app_6_start:
 app_6_end:
 .section .rodata
 .align 3
+app_7_name:
+    .asciz "06"
+.align 3
+.section .data
+app_7_start:
+    .incbin "./results/06.bin"
+.align 3
+app_7_end:
+.section .rodata
+.align 3
+app_8_name:
+    .asciz "07"
+.align 3
+.section .data
+app_8_start:
+    .incbin "./results/07.bin"
+.align 3
+app_8_end:
+.section .rodata
+.align 3
+app_9_name:
+    .asciz "all_tests"
+.align 3
+.section .data
+app_9_start:
+    .incbin "./results/all_tests.bin"
+.align 3
+app_9_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 7
+    .quad 10
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -94,3 +124,12 @@ num_user_apps:
     .quad app_6_start
     .quad app_6_end
     .quad app_6_name
+    .quad app_7_start
+    .quad app_7_end
+    .quad app_7_name
+    .quad app_8_start
+    .quad app_8_end
+    .quad app_8_name
+    .quad app_9_start
+    .quad app_9_end
+    .quad app_9_name

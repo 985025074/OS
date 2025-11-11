@@ -61,7 +61,7 @@ fn set_user_trap_entry() {
 }
 // todo : avoid cloning here..
 fn get_trap_context() -> &'static mut TrapContext {
-    let processor = PROCESSOR.borrow_mut();
+    let processor = PROCESSOR.borrow();
     let now_task_block = processor.current().unwrap();
     drop(processor);
     let now_task_block_inner = now_task_block.get_inner();
@@ -70,7 +70,7 @@ fn get_trap_context() -> &'static mut TrapContext {
     cx
 }
 pub fn get_current_token() -> usize {
-    let processor = PROCESSOR.borrow_mut();
+    let processor = PROCESSOR.borrow();
     let now_task_block = processor.current().unwrap();
     drop(processor);
     let now_task_block_inner = now_task_block.get_inner();
