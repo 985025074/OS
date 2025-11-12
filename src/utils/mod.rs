@@ -1,22 +1,93 @@
+#![no_std]
 use crate::println;
+use core::cell::{Ref, RefCell, RefMut};
+use core::panic::Location;
 
+/// RefCellSafe 改良版：记录上一次借用位置并打印当前借用尝试位置
 pub struct RefCellSafe<T> {
-    refcell: core::cell::RefCell<T>,
+    refcell: RefCell<T>,
+    last_borrow_loc: RefCell<Option<&'static Location<'static>>>,
+    last_borrow_mut_loc: RefCell<Option<&'static Location<'static>>>,
 }
+
 unsafe impl<T> Sync for RefCellSafe<T> {}
+
 impl<T> RefCellSafe<T> {
     pub const fn new(val: T) -> Self {
         Self {
-            refcell: core::cell::RefCell::new(val),
+            refcell: RefCell::new(val),
+            last_borrow_loc: RefCell::new(None),
+            last_borrow_mut_loc: RefCell::new(None),
         }
     }
-    pub fn borrow(&self) -> core::cell::Ref<T> {
-        self.refcell.borrow()
+
+    /// 不可变 borrow
+    #[track_caller]
+    pub fn borrow(&self) -> Ref<T> {
+        let caller = Location::caller();
+        match self.refcell.try_borrow() {
+            Ok(r) => {
+                *self.last_borrow_loc.borrow_mut() = Some(caller);
+                r
+            }
+            Err(_) => {
+                let last_mut = *self.last_borrow_mut_loc.borrow();
+                println!(
+                    "[RefCellSafe] ❌ borrow() failed! This borrow at {}:{}",
+                    caller.file(),
+                    caller.line()
+                );
+                if let Some(last) = last_mut {
+                    println!(
+                        "[RefCellSafe] ❌ previous mutable borrow at {}:{}",
+                        last.file(),
+                        last.line()
+                    );
+                } else {
+                    println!("[RefCellSafe] ❌ no previous mutable borrow recorded");
+                }
+                panic!("RefCellSafe borrow() failed");
+            }
+        }
     }
-    pub fn borrow_mut(&self) -> core::cell::RefMut<T> {
-        self.refcell.borrow_mut()
+
+    /// 可变 borrow
+    #[track_caller]
+    pub fn borrow_mut(&self) -> RefMut<T> {
+        let caller = Location::caller();
+        match self.refcell.try_borrow_mut() {
+            Ok(rm) => {
+                *self.last_borrow_mut_loc.borrow_mut() = Some(caller);
+                rm
+            }
+            Err(_) => {
+                let last_mut = *self.last_borrow_mut_loc.borrow();
+                let last_borrow = *self.last_borrow_loc.borrow();
+                println!(
+                    "[RefCellSafe] ❌ borrow_mut() failed! This borrow at {}:{}",
+                    caller.file(),
+                    caller.line()
+                );
+                if let Some(last) = last_mut {
+                    println!(
+                        "[RefCellSafe] ❌ previous mutable borrow at {}:{}",
+                        last.file(),
+                        last.line()
+                    );
+                }
+                if let Some(last) = last_borrow {
+                    println!(
+                        "[RefCellSafe] ❌ previous immutable borrow at {}:{}",
+                        last.file(),
+                        last.line()
+                    );
+                }
+                panic!("RefCellSafe borrow_mut() failed");
+            }
+        }
     }
 }
+
 pub fn is_equal_two_string(string1: usize, string2: usize) -> bool {
     unsafe {
         let mut ptr1 = string1 as *const u8;

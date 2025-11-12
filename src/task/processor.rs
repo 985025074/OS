@@ -1,6 +1,7 @@
 use crate::{
     println,
     task::{
+        INITPROC,
         manager::{TASK_MANAGER, add_task, fetch_task},
         switch,
         task_block::{self, TaskBlock, TaskState},
@@ -44,10 +45,11 @@ pub fn current_task_has_child(pid_or_negative: isize, exit_code: &mut i32) -> Op
     let pid = pid_or_negative;
     if let Some(current) = current_task() {
         // 获取当前任务的内部可变数据
-        let inner = current.get_inner();
+        let mut inner = current.get_inner();
 
         // 遍历当前任务的所有子任务
-        for child in inner.children_task.iter() {
+        let mut possible_index: Option<usize> = None;
+        for (index, child) in inner.children_task.iter().enumerate() {
             let child_inner = child.get_inner();
 
             // 匹配 pid 且子进程已退出
@@ -55,9 +57,16 @@ pub fn current_task_has_child(pid_or_negative: isize, exit_code: &mut i32) -> Op
             {
                 // 将退出码写入 exit_code
                 *exit_code = child_inner.exit_code;
-                return Some(child.pid.0);
+                possible_index = Some(index);
+                break;
             }
+            drop(child_inner);
         }
+        if let Some(pid_index) = possible_index {
+            let child = inner.children_task.remove(pid_index);
+            return Some(child.pid.0);
+        }
+        drop(inner);
     }
     None
 
@@ -153,7 +162,15 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // Change status to Zombie
     inner.state = TaskState::Exited;
     // ++++++ release parent PCB
-
+    // move the child to init_proc
+    let mut init_proc_inner = INITPROC.get_inner();
+    for child in &inner.children_task {
+        let child_target = child.clone();
+        child.get_inner().father_task = Some(Arc::downgrade(&INITPROC));
+        init_proc_inner.children_task.push(child.clone());
+    }
+    drop(init_proc_inner);
+    //todo : is it necessary to claer here ??
     drop(inner);
     // **** release current PCB
     // drop task manually to maintain rc correctly

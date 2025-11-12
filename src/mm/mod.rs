@@ -37,7 +37,44 @@ impl UserBuffer {
         }
         total
     }
+    pub fn into_iter(self) -> UserBufferIterator {
+        UserBufferIterator {
+            buffers: self.buffers,
+            buffer_index: 0,
+            offset_in_buffer: 0,
+        }
+    }
 }
+pub struct UserBufferIterator {
+    buffers: Vec<&'static mut [u8]>,
+    buffer_index: usize,
+    offset_in_buffer: usize,
+}
+impl Iterator for UserBufferIterator {
+    type Item = *mut u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buffer_index >= self.buffers.len() {
+            return None;
+        }
+
+        if self.offset_in_buffer >= self.buffers[self.buffer_index].len() {
+            self.buffer_index += 1;
+            self.offset_in_buffer = 0;
+            return self.next();
+        }
+
+        let ptr = unsafe {
+            self.buffers[self.buffer_index]
+                .as_mut_ptr()
+                .add(self.offset_in_buffer)
+        };
+
+        self.offset_in_buffer += 1;
+        Some(ptr)
+    }
+}
+
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     heap_allocator::init_heap();

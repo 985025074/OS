@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 
-use crate::utils::RefCellSafe;
+use crate::{println, utils::RefCellSafe};
 
 pub struct Pid(pub usize);
 pub struct PidAllocator {
@@ -24,8 +24,8 @@ impl PidAllocator {
             Pid(pid)
         }
     }
-    fn dealloc(&mut self, pid: Pid) {
-        self.recycle.push(pid.0);
+    fn dealloc(&mut self, pid: usize) {
+        self.recycle.push(pid);
     }
 }
 
@@ -37,11 +37,11 @@ lazy_static! {
 pub fn alloc_pid() -> Pid {
     PID_ALLOCATOR.borrow_mut().alloc()
 }
-pub fn dealloc_pid(pid: Pid) {
+pub fn dealloc_pid(pid: usize) {
     PID_ALLOCATOR.borrow_mut().dealloc(pid);
 }
 impl Drop for Pid {
     fn drop(&mut self) {
-        dealloc_pid(Pid(self.0));
+        dealloc_pid(self.0);
     }
 }

@@ -28,6 +28,7 @@ pub fn syscall_waitpid(pid_or_ne: isize, exit_code_ptr: *mut i32) -> isize {
             unsafe {
                 *(target_ptr as *mut u8 as *mut i32) = temp_exit_code;
             }
+
             return pid as isize;
         } else {
             suspend_current_and_run_next();

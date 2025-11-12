@@ -1,7 +1,7 @@
 //! File system in os
 mod inode;
+mod pipe;
 mod stdio;
-
 use crate::{mm::UserBuffer, println};
 /// File trait
 pub trait File: Send + Sync {
@@ -17,6 +17,7 @@ pub trait File: Send + Sync {
 
 use easy_fs::debug::Logger;
 pub use inode::{OSInode, OpenFlags, list_apps, open_file};
+pub use pipe::{Pipe, make_pipe};
 pub use stdio::{Stdin, Stdout};
 struct PrintlnLogger;
 impl Logger for PrintlnLogger {

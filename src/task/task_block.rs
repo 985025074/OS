@@ -61,6 +61,16 @@ pub struct TaskBlockInner {
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 }
+impl TaskBlockInner {
+    pub fn alloc_fd(&mut self) -> usize {
+        if let Some(fd) = (0..self.fd_table.len()).find(|&fd| self.fd_table[fd].is_none()) {
+            fd
+        } else {
+            self.fd_table.push(None);
+            self.fd_table.len() - 1
+        }
+    }
+}
 impl TaskBlock {
     pub fn new_raw() -> Self {
         Self {
@@ -228,6 +238,17 @@ impl TaskBlock {
             .children_task
             .push(target_arc.clone());
         target_arc
+    }
+    pub fn alloc_fd(&self) -> usize {
+        let mut inner_block = self.get_inner();
+        if let Some(fd) =
+            (0..inner_block.fd_table.len()).find(|&fd| inner_block.fd_table[fd].is_none())
+        {
+            fd
+        } else {
+            inner_block.fd_table.push(None);
+            inner_block.fd_table.len() - 1
+        }
     }
 }
 // impl Display for TaskBlock {

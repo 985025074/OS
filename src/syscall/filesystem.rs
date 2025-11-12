@@ -2,7 +2,7 @@ use core::str;
 
 use crate::{
     console::print,
-    fs::{OpenFlags, open_file},
+    fs::{OpenFlags, make_pipe, open_file},
     mm::{UserBuffer, translated_byte_buffer, translated_single_address},
     println,
     task::processor::current_task,
@@ -73,6 +73,33 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         len,
     ));
     let write_len = file.write(buf);
+    // println!(
+    //     "syscall_write wrote {} bytes.,while args {}",
+    //     write_len, len
+    // );
 
     write_len as isize
+}
+/// pipe: outer address of [read_fd, write_fd]
+pub fn syscall_pipe(pipe: *mut usize) -> isize {
+    let task = current_task().unwrap();
+    let token = get_current_token();
+    let (pipe_read, pipe_write) = make_pipe();
+
+    let mut inner = task.get_inner();
+    let read_fd = inner.alloc_fd();
+    inner.fd_table[read_fd] = Some(pipe_read);
+    let write_fd = inner.alloc_fd();
+    inner.fd_table[write_fd] = Some(pipe_write);
+    println!("pipe fds: {}, {}", read_fd, write_fd);
+    unsafe {
+        let addr = translated_single_address(token, pipe as *const u8) as *mut u8 as *mut usize;
+        *addr = read_fd;
+    }
+    unsafe {
+        let addr =
+            translated_single_address(token, pipe.add(1) as *const u8) as *mut u8 as *mut usize;
+        *addr = write_fd;
+    }
+    0
 }
