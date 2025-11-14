@@ -91,38 +91,48 @@ app_8_end:
 .section .rodata
 .align 3
 app_9_name:
-    .asciz "fork_no_wait"
+    .asciz "cat"
 .align 3
 .section .data
 app_9_start:
-    .incbin "./results/fork_no_wait.bin"
+    .incbin "./results/cat.bin"
 .align 3
 app_9_end:
 .section .rodata
 .align 3
 app_10_name:
-    .asciz "init_proc"
+    .asciz "fork_no_wait"
 .align 3
 .section .data
 app_10_start:
-    .incbin "./results/init_proc.bin"
+    .incbin "./results/fork_no_wait.bin"
 .align 3
 app_10_end:
 .section .rodata
 .align 3
 app_11_name:
-    .asciz "pipe_test"
+    .asciz "init_proc"
 .align 3
 .section .data
 app_11_start:
-    .incbin "./results/pipe_test.bin"
+    .incbin "./results/init_proc.bin"
 .align 3
 app_11_end:
 .section .rodata
 .align 3
+app_12_name:
+    .asciz "pipe_test"
+.align 3
+.section .data
+app_12_start:
+    .incbin "./results/pipe_test.bin"
+.align 3
+app_12_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 12
+    .quad 13
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -159,3 +169,6 @@ num_user_apps:
     .quad app_11_start
     .quad app_11_end
     .quad app_11_name
+    .quad app_12_start
+    .quad app_12_end
+    .quad app_12_name
