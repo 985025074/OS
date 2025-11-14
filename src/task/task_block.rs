@@ -2,7 +2,10 @@ use super::restore;
 use super::task_context::TaskContext;
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT, kernel_stack_position};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{KERNEL_SPACE, MapPermission, MemorySet, PhysPageNum, VirtAddr, VirtPageNum};
+use crate::mm::{
+    KERNEL_SPACE, MapPermission, MemorySet, PhysPageNum, VirtAddr, VirtPageNum,
+    translated_single_address,
+};
 use crate::task::manager::TaskManager;
 use crate::task::pid::{Pid, alloc_pid};
 use crate::task::stack::KernelStack;
@@ -10,6 +13,7 @@ use crate::trap::context::{TrapContext, push_trap_context_at};
 use crate::trap::{trap_handler, trap_return};
 use crate::utils::{RefCellSafe, get_app_data_by_name};
 use crate::{println, trap};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -158,28 +162,62 @@ impl TaskBlock {
         }
     }
     // ...existing code...
-    pub fn exec(&self, name: usize) -> Result<(), &'static str> {
+    pub fn exec(&self, name: usize, args: Vec<String>) -> Result<(), &'static str> {
         unsafe extern "C" {
             fn num_user_apps();
         }
         let number_of_apps = unsafe { *(num_user_apps as *const i64) } as usize;
         let start_loc = (num_user_apps as usize) + core::mem::size_of::<usize>();
         let elf_data = get_app_data_by_name(name, number_of_apps, start_loc);
-        let (mem_set, user_sp, entry_point) = MemorySet::from_elf(&elf_data);
+        let (mem_set, mut user_sp, entry_point) = MemorySet::from_elf(&elf_data);
         let kernel_stack_top = self.kernel_stack.kernel_stack_top;
         let trap_page = mem_set
             .translate(VirtAddr::from(TRAP_CONTEXT).into())
             .ok_or("ERROR while get trap context")?
             .ppn();
+
+        // push arguments on user stack
+        user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
+        let argv_base = user_sp;
+        let mut argv: Vec<*mut usize> = (0..=args.len())
+            .map(|arg| {
+                translated_single_address(
+                    mem_set.token(),
+                    (argv_base + arg * core::mem::size_of::<usize>()) as *const u8,
+                ) as *mut u8 as *mut usize
+            })
+            .collect();
+        unsafe {
+            *argv[args.len()] = 0;
+        }
+        for i in 0..args.len() {
+            user_sp -= args[i].len() + 1;
+            unsafe {
+                *argv[i] = user_sp;
+            }
+            let mut p = user_sp;
+            for c in args[i].as_bytes() {
+                *translated_single_address(mem_set.token(), p as *mut u8) = *c;
+                p += 1;
+            }
+            *translated_single_address(mem_set.token(), p as *mut u8) = 0;
+        }
+        // make the user_sp aligned to 8B for k210 platform
+        user_sp -= user_sp % core::mem::size_of::<usize>();
+
         self.get_inner().code_memory_set = mem_set;
         let token = KERNEL_SPACE.borrow().token();
-        let trap_context = crate::trap::context::TrapContext::app_init_context(
+        let mut trap_context = crate::trap::context::TrapContext::app_init_context(
             entry_point,
             user_sp,
             token,
             kernel_stack_top,
             trap_handler as usize,
         );
+
+        trap_context.x[10] = args.len(); // a0 = argc
+        trap_context.x[11] = argv_base; // a1 = argv
+
         let trap_context_ref: &mut TrapContext = trap_page.get_mut();
         *trap_context_ref = trap_context;
         self.get_inner().trap_context_loc = trap_page;

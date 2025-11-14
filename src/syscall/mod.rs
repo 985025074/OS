@@ -32,7 +32,7 @@ pub fn syscall(id: usize, args: [usize; 3]) -> isize {
         SYSCALL_FORTEST => flow::syscall_fortest(args[0], args[1]),
         SYSCALL_YIELD => flow::syscall_yield(),
         SYSCALL_WAITPID => process::syscall_waitpid(args[0] as isize, args[1] as *mut i32),
-        SYSCALL_EXEC => process::syscall_exec(args[0]),
+        SYSCALL_EXEC => process::syscall_exec(args[0], args[1]),
         SYSCALL_FORK => process::syscall_fork(),
         SYSCALL_OPEN => filesystem::syscall_open(args[0], args[1], args[2]),
 

@@ -91,31 +91,31 @@ app_8_end:
 .section .rodata
 .align 3
 app_9_name:
-    .asciz "init_proc"
+    .asciz "fork_no_wait"
 .align 3
 .section .data
 app_9_start:
-    .incbin "./results/init_proc.bin"
+    .incbin "./results/fork_no_wait.bin"
 .align 3
 app_9_end:
 .section .rodata
 .align 3
 app_10_name:
-    .asciz "pipe_test"
+    .asciz "init_proc"
 .align 3
 .section .data
 app_10_start:
-    .incbin "./results/pipe_test.bin"
+    .incbin "./results/init_proc.bin"
 .align 3
 app_10_end:
 .section .rodata
 .align 3
 app_11_name:
-    .asciz "fork_no_wait"
+    .asciz "pipe_test"
 .align 3
 .section .data
 app_11_start:
-    .incbin "./results/fork_no_wait.bin"
+    .incbin "./results/pipe_test.bin"
 .align 3
 app_11_end:
 .section .rodata
