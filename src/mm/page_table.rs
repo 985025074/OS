@@ -171,6 +171,10 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
     }
     string
 }
+pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
+    let real_addr = translated_single_address(token, ptr as *const u8);
+    unsafe { &mut *(real_addr as *mut u8 as *mut T) }
+}
 /// translate a single pointer
 pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {
     let page_table = PageTable::from_token(token);

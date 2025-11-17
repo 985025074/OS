@@ -3,6 +3,7 @@ use core::arch::asm;
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT, kernel_stack_position};
 use crate::task::manager::TASK_MANAGER;
 use crate::task::processor::{PROCESSOR, exit_current_and_run_next, suspend_current_and_run_next};
+// use crate::task::signal::{check_if_current_signals_error, handle_signals};
 use crate::time::set_next_trigger;
 use crate::{println, trap::context::TrapContext};
 pub mod context;
@@ -118,6 +119,13 @@ pub fn trap_handler() {
             panic!("Unsupported trap: cause = {}, stval = {:#x}", code, stval);
         }
     }
+    // println!("handle siganl");
+    // handle_signals();
+
+    // if let Some((errno, msg)) = check_if_current_signals_error() {
+    //     println!("[kernel] {}", msg);
+    //     exit_current_and_run_next(errno);
+    // }
     trap_return();
 }
 #[unsafe(no_mangle)]
@@ -126,6 +134,7 @@ pub fn trap_handler() {
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
     set_user_trap_entry();
+
     let trap_cx_ptr = TRAP_CONTEXT;
     let user_satp = get_current_token();
     unsafe extern "C" {

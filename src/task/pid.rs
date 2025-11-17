@@ -1,7 +1,11 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, task, vec::Vec};
 use lazy_static::lazy_static;
 
-use crate::{println, utils::RefCellSafe};
+use crate::{
+    println,
+    task::{manager::TASK_MANAGER, task_block::TaskBlock},
+    utils::RefCellSafe,
+};
 
 pub struct Pid(pub usize);
 pub struct PidAllocator {
@@ -39,6 +43,15 @@ pub fn alloc_pid() -> Pid {
 }
 pub fn dealloc_pid(pid: usize) {
     PID_ALLOCATOR.borrow_mut().dealloc(pid);
+}
+pub fn get_task_by_pid(pid: usize) -> Option<Arc<TaskBlock>> {
+    let task_manager = TASK_MANAGER.borrow();
+    for task in task_manager.task_blocks.iter() {
+        if task.pid.0 == pid {
+            return Some(task.clone());
+        }
+    }
+    None
 }
 impl Drop for Pid {
     fn drop(&mut self) {

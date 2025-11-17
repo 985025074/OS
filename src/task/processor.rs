@@ -97,6 +97,7 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 pub fn idle_task() {
     loop {
         let mut processor = PROCESSOR.borrow_mut();
+        // println!("[idle] trying to fetch next task");
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
             // access coming task TCB exclusively
@@ -104,7 +105,7 @@ pub fn idle_task() {
             let next_task_cx_ptr = &task_inner.task_context as *const TaskContext;
             task_inner.state = TaskState::Running;
 
-            // println!("[kernel] Switching to task PID {}", task.pid.0);
+            println!("[kernel] Switching to task PID {}", task.pid.0);
             drop(task_inner);
             // release coming task TCB manually
             processor.now_task_block = Some(task);

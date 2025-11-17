@@ -23,6 +23,7 @@ use riscv::{
 pub mod manager;
 mod pid;
 pub mod processor;
+pub mod signal;
 mod stack;
 mod switch;
 pub mod task_block;

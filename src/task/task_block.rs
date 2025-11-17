@@ -8,6 +8,7 @@ use crate::mm::{
 };
 use crate::task::manager::TaskManager;
 use crate::task::pid::{Pid, alloc_pid};
+use crate::task::signal::{self, SignalActions, SignalFlags};
 use crate::task::stack::KernelStack;
 use crate::trap::context::{TrapContext, push_trap_context_at};
 use crate::trap::{trap_handler, trap_return};
@@ -64,6 +65,15 @@ pub struct TaskBlockInner {
     pub father_task: Option<Weak<TaskBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    //siganl
+    pub signals: SignalFlags,
+    pub signal_mask: SignalFlags,
+    pub signal_actions: SignalActions,
+    // this is used to work with the the signal handling
+    pub killed: bool,
+    pub frozen: bool,
+    pub handling_signal: isize,
+    pub trap_ctx_backup: Option<TrapContext>,
 }
 impl TaskBlockInner {
     pub fn alloc_fd(&mut self) -> usize {
@@ -90,6 +100,13 @@ impl TaskBlock {
                 father_task: None,
                 exit_code: 0,
                 fd_table: Vec::new(),
+                frozen: false,
+                killed: false,
+                signals: SignalFlags::empty(),
+                signal_mask: SignalFlags::empty(),
+                signal_actions: SignalActions::default(),
+                handling_signal: -1,
+                trap_ctx_backup: None,
             }),
         }
     }
@@ -156,6 +173,13 @@ impl TaskBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    frozen: false,
+                    killed: false,
+                    signals: SignalFlags::empty(),
+                    signal_mask: SignalFlags::empty(),
+                    signal_actions: SignalActions::default(),
+                    handling_signal: -1,
+                    trap_ctx_backup: None,
                 }),
             }; // set user stack pointer
             result
@@ -241,6 +265,8 @@ impl TaskBlock {
             .unwrap()
             .ppn();
 
+        let mut now_task_block_inner = now_task_block.get_inner();
+
         let mut result = Self {
             pid: child_pid,
             task_name: now_task_block.task_name,
@@ -256,14 +282,21 @@ impl TaskBlock {
                 father_task: Some(Arc::downgrade(&now_task_block)),
                 children_task: Vec::new(),
                 exit_code: 0,
-                fd_table: now_task_block
-                    .get_inner()
+                fd_table: now_task_block_inner
                     .fd_table
                     .iter()
                     .map(|fd_option| fd_option.as_ref().map(|fd| Arc::clone(fd)))
                     .collect(),
+                frozen: false,
+                killed: false,
+                signals: now_task_block_inner.signals,
+                signal_mask: now_task_block_inner.signal_mask,
+                signal_actions: SignalActions::default(),
+                handling_signal: -1,
+                trap_ctx_backup: None,
             }),
         }; // set user stack pointer
+
         // we need to change the kernel stack here...
         let trap_context_ref: &mut TrapContext = trap_page.get_mut();
         trap_context_ref.kernel_sp = kernel_stack_top;
@@ -271,10 +304,8 @@ impl TaskBlock {
 
         let target_arc = Arc::new(result);
 
-        now_task_block
-            .get_inner()
-            .children_task
-            .push(target_arc.clone());
+        now_task_block_inner.children_task.push(target_arc.clone());
+        drop(now_task_block_inner);
         target_arc
     }
     pub fn alloc_fd(&self) -> usize {

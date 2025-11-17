@@ -22,7 +22,8 @@ pub use memory_set::remap_test;
 pub use memory_set::{KERNEL_SPACE, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable};
 pub use page_table::{
-    PageTableEntry, translated_byte_buffer, translated_single_address, translated_str,
+    PageTableEntry, translated_byte_buffer, translated_mutref, translated_single_address,
+    translated_str,
 };
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,
