@@ -130,9 +130,39 @@ app_12_start:
 app_12_end:
 .section .rodata
 .align 3
+app_13_name:
+    .asciz "signal_test"
+.align 3
+.section .data
+app_13_start:
+    .incbin "./results/signal_test.bin"
+.align 3
+app_13_end:
+.section .rodata
+.align 3
+app_14_name:
+    .asciz "signal_test2"
+.align 3
+.section .data
+app_14_start:
+    .incbin "./results/signal_test2.bin"
+.align 3
+app_14_end:
+.section .rodata
+.align 3
+app_15_name:
+    .asciz "signal_test3"
+.align 3
+.section .data
+app_15_start:
+    .incbin "./results/signal_test3.bin"
+.align 3
+app_15_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 13
+    .quad 16
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -172,3 +202,12 @@ num_user_apps:
     .quad app_12_start
     .quad app_12_end
     .quad app_12_name
+    .quad app_13_start
+    .quad app_13_end
+    .quad app_13_name
+    .quad app_14_start
+    .quad app_14_end
+    .quad app_14_name
+    .quad app_15_start
+    .quad app_15_end
+    .quad app_15_name

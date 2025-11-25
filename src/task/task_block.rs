@@ -113,6 +113,8 @@ impl TaskBlock {
     pub fn get_inner(&self) -> RefMut<'_, TaskBlockInner> {
         self.task_block_inner.borrow_mut()
     }
+    // todo:the code below create the signal_task on the stack and move ,which will cause problem
+    //maybe.  maybe we need to  solve this..
     pub fn new(elf_data: &[u8], app_name: usize) -> Self {
         // unsafe {
         //     let task_name_array =

@@ -77,3 +77,7 @@ pub fn syscall_exec(path: usize, args_addr: usize) -> isize {
     }
     0
 }
+pub fn syscall_getpid() -> isize {
+    let now_task = current_task().unwrap();
+    now_task.pid.0 as isize
+}

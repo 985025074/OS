@@ -3,7 +3,7 @@ use lazy_static::lazy_static;
 
 use crate::{
     println,
-    task::{manager::TASK_MANAGER, task_block::TaskBlock},
+    task::{manager::TASK_MANAGER, processor::current_task, task_block::TaskBlock},
     utils::RefCellSafe,
 };
 
@@ -45,6 +45,11 @@ pub fn dealloc_pid(pid: usize) {
     PID_ALLOCATOR.borrow_mut().dealloc(pid);
 }
 pub fn get_task_by_pid(pid: usize) -> Option<Arc<TaskBlock>> {
+    if let Some(task) = current_task() {
+        if task.pid.0 == pid {
+            return Some(task);
+        }
+    }
     let task_manager = TASK_MANAGER.borrow();
     for task in task_manager.task_blocks.iter() {
         if task.pid.0 == pid {

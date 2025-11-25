@@ -45,3 +45,6 @@ pub fn syscall_yield() -> isize {
     suspend_current_and_run_next();
     0
 }
+pub fn syscall_get_time() -> isize {
+    crate::time::get_time_ms() as isize
+}
