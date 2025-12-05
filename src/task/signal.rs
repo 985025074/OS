@@ -4,10 +4,8 @@ use bitflags::bitflags;
 use crate::{
     mm::{translated_mutref, translated_single_address},
     println,
-    task::{
-        pid::get_task_by_pid,
-        processor::{current_task, suspend_current_and_run_next},
-    },
+    task::processor::current_process,
+    task::{manager::pid2process, processor::suspend_current_and_run_next},
     trap::{context::TrapContext, get_current_token},
 };
 
@@ -68,12 +66,9 @@ impl SignalFlags {
     }
 }
 pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
-    if let Some(task) = current_task() {
-        let task_inner = task.get_inner();
-        task_inner.signals.check_error()
-    } else {
-        None
-    }
+    let process = current_process();
+    let process_inner = process.borrow_mut();
+    process_inner.signals.check_error()
 }
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
@@ -108,15 +103,12 @@ impl Default for SignalActions {
 
 // set the signal mask, return the old mask
 pub fn set_signal_mask(mask: u32) -> isize {
-    if let Some(task) = current_task() {
-        let mut inner = task.get_inner();
-        let old_mask = inner.signal_mask;
-        if let Some(flag) = SignalFlags::from_bits(mask) {
-            inner.signal_mask = flag;
-            old_mask.bits() as isize
-        } else {
-            -1
-        }
+    let cur_process = current_process();
+    let mut inner = cur_process.borrow_mut();
+    let old_mask = inner.signals;
+    if let Some(flag) = SignalFlags::from_bits(mask) {
+        inner.signals = flag;
+        old_mask.bits() as isize
     } else {
         -1
     }
@@ -141,8 +133,8 @@ pub fn set_signal(
     old_action: *mut SignalAction,
 ) -> isize {
     let token = get_current_token();
-    let task = current_task().unwrap();
-    let mut inner = task.get_inner();
+    let process = current_process();
+    let mut inner = process.borrow_mut();
     if signum as usize > MAX_SIG {
         return -1;
     }
@@ -150,9 +142,9 @@ pub fn set_signal(
         if check_sigaction_error(flag, action as usize, old_action as usize) {
             return -1;
         }
-        let prev_action = inner.signal_actions.table[signum as usize];
+        let prev_action = inner.signals_actions.table[signum as usize];
         *translated_mutref(token, old_action) = prev_action;
-        inner.signal_actions.table[signum as usize] =
+        inner.signals_actions.table[signum as usize] =
             *translated_mutref(token, action as *mut SignalAction);
         0
     } else {
@@ -162,166 +154,158 @@ pub fn set_signal(
 
 // insert the bit flag.. if already set  return -1
 pub fn kill(pid: usize, signum: i32) -> isize {
-    if let Some(task) = get_task_by_pid(pid) {
-        if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-            // insert the signal if legal
-            let mut task_ref = task.get_inner();
-            if task_ref.signals.contains(flag) {
-                return -1;
-            }
-            task_ref.signals.insert(flag);
-            0
-        } else {
-            -1
+    let process = pid2process(pid).unwrap();
+    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
+        // insert the signal if legal
+        let mut process_ref = process.borrow_mut();
+        if process_ref.signals.contains(flag) {
+            return -1;
         }
+        process_ref.signals.insert(flag);
+        0
     } else {
         -1
     }
 }
 
 pub fn kill_current(signum: i32) -> isize {
-    if let Some(task) = current_task() {
-        if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-            // insert the signal if legal
-            let mut task_ref = task.get_inner();
-            if task_ref.signals.contains(flag) {
-                return -1;
-            }
-            task_ref.signals.insert(flag);
-            0
-        } else {
-            -1
+    let process = current_process();
+    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
+        // insert the signal if legal
+        let mut process_ref = process.borrow_mut();
+        if process_ref.signals.contains(flag) {
+            return -1;
         }
+        process_ref.signals.insert(flag);
+        0
     } else {
         -1
     }
 }
 
-fn check_pending_signals() {
-    for sig in 0..(MAX_SIG + 1) {
-        let task = current_task().unwrap();
-        let task_inner = task.get_inner();
-        let signal = SignalFlags::from_bits(1 << sig).unwrap();
-        // 如果当前📶 进入 等候区间,并且 没有被mask
-        if task_inner.signals.contains(signal) && (!task_inner.signal_mask.contains(signal)) {
-            let mut masked = true;
-            let handling_sig = task_inner.handling_signal;
-            // 已经在处理了,那么 不进行信号处理
-            if handling_sig == -1 {
-                masked = false;
-            } else {
-                // 没有在处理,但是 没有handler
-                let handling_sig = handling_sig as usize;
-                if !task_inner.signal_actions.table[handling_sig]
-                    .mask
-                    .contains(signal)
-                {
-                    masked = false;
-                }
-            }
-            if !masked {
-                drop(task_inner);
-                drop(task);
-                if signal == SignalFlags::SIGKILL
-                    || signal == SignalFlags::SIGSTOP
-                    || signal == SignalFlags::SIGCONT
-                    || signal == SignalFlags::SIGDEF
-                {
-                    // signal is a kernel signal
-                    call_kernel_signal_handler(signal);
-                } else {
-                    // signal is a user signal
-                    call_user_signal_handler(sig, signal);
-                    return;
-                }
-            }
-        }
-    }
-}
+// fn check_pending_signals() {
+//     for sig in 0..(MAX_SIG + 1) {
+//         let process = current_process();
+//         let process_inner = process.borrow_mut();
+//         let signal = SignalFlags::from_bits(1 << sig).unwrap();
+//         // 如果当前📶 进入 等候区间,并且 没有被mask
+//         if process_inner.signals.contains(signal) && (!process_inner.signals_masks.contains(signal))
+//         {
+//             let mut masked = true;
+//             let handling_sig = process_inner.handling_signal;
+//             // 已经在处理了,那么 不进行信号处理
+//             if handling_sig == -1 {
+//                 masked = false;
+//             } else {
+//                 // 没有在处理,但是 没有handler
+//                 let handling_sig = handling_sig as usize;
+//                 if !process_inner.signals_actions.table[handling_sig]
+//                     .mask
+//                     .contains(signal)
+//                 {
+//                     masked = false;
+//                 }
+//             }
+//             if !masked {
+//                 drop(process_inner);
+//                 drop(process);
+//                 if signal == SignalFlags::SIGKILL
+//                     || signal == SignalFlags::SIGSTOP
+//                     || signal == SignalFlags::SIGCONT
+//                     || signal == SignalFlags::SIGDEF
+//                 {
+//                     // signal is a kernel signal
+//                     call_kernel_signal_handler(signal);
+//                 } else {
+//                     // signal is a user signal
+//                     call_user_signal_handler(sig, signal);
+//                     return;
+//                 }
+//             }
+//         }
+//     }
+// }
 // check if there is siganl to solve .
 // if so it will change the ret addr to the signal handler
 // if have pending signal ,it will suspend
-pub fn handle_signals() {
-    loop {
-        // in the below function , it will change the sepc address to the signal
-        // (if possible )
-        check_pending_signals();
-        let (frozen, killed) = {
-            let task = current_task().unwrap();
-            let task_inner = task.get_inner();
-            (task_inner.frozen, task_inner.killed)
-        };
-        // if not frozen or killed , then break
-        if !frozen || killed {
-            break;
-        }
-        suspend_current_and_run_next();
-    }
-}
+// pub fn handle_signals() {
+//     loop {
+//         // in the below function , it will change the sepc address to the signal
+//         // (if possible )
+//         check_pending_signals();
+//         let (frozen, killed) = {
+//             let process = current_process().unwrap();
+//             let process_inner = process.borrow_mut();
+//             (process_inner.frozen, process_inner.killed)
+//         };
+//         // if not frozen or killed , then break
+//         if !frozen || killed {
+//             break;
+//         }
+//         suspend_current_and_run_next();
+//     }
+// }
 
-// os/src/task/mod.rs
+// os/src/process/mod.rs
 
-fn call_kernel_signal_handler(signal: SignalFlags) {
-    let task = current_task().unwrap();
-    let mut task_inner = task.get_inner();
-    match signal {
-        SignalFlags::SIGSTOP => {
-            task_inner.frozen = true;
-            task_inner.signals ^= SignalFlags::SIGSTOP;
-        }
-        SignalFlags::SIGCONT => {
-            if task_inner.signals.contains(SignalFlags::SIGCONT) {
-                task_inner.signals ^= SignalFlags::SIGCONT;
-                task_inner.frozen = false;
-            }
-        }
-        _ => {
-            // println!(
-            //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
-            //     task_inner.signals
-            // );
-            task_inner.killed = true;
-        }
-    }
-}
+// fn call_kernel_signal_handler(signal: SignalFlags) {
+//     let process = current_process().unwrap();
+//     let mut process_inner = process.borrow_mut();
+//     match signal {
+//         SignalFlags::SIGSTOP => {
+//             process_inner.frozen = true;
+//             process_inner.signals ^= SignalFlags::SIGSTOP;
+//         }
+//         SignalFlags::SIGCONT => {
+//             if process_inner.signals.contains(SignalFlags::SIGCONT) {
+//                 process_inner.signals ^= SignalFlags::SIGCONT;
+//                 process_inner.frozen = false;
+//             }
+//         }
+//         _ => {
+//             // println!(
+//             //     "[K] call_kernel_signal_handler:: current process sigflag {:?}",
+//             //     process_inner.signals
+//             // );
+//             process_inner.killed = true;
+//         }
+//     }
+// }
 
-fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
-    let task = current_task().unwrap();
-    let mut task_inner = task.get_inner();
+// fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
+//     let process = current_process();
+//     let mut process_inner = process.borrow_mut();
 
-    let handler = task_inner.signal_actions.table[sig].handler;
-    if handler != 0 {
-        // user handler
+//     let handler = process_inner.signal_actions.table[sig].handler;
+//     if handler != 0 {
+//         // user handler
 
-        // handle flag
-        task_inner.handling_signal = sig as isize;
-        // remove the siganl ..
-        task_inner.signals ^= signal;
+//         // handle flag
+//         process_inner.handling_signal = sig as isize;
+//         // remove the siganl ..
+//         process_inner.signals ^= signal;
 
-        // backup trapframe
-        let mut trap_ctx = task.get_inner().trap_context_loc.get_mut() as &mut TrapContext;
-        task_inner.trap_ctx_backup = Some(*trap_ctx);
+//         // backup trapframe
+//         let mut trap_ctx = process.borrow_mut().trap_context_loc.get_mut() as &mut TrapContext;
+//         process_inner.trap_ctx_backup = Some(*trap_ctx);
 
-        // modify trapframe
-        trap_ctx.sepc = handler;
+//         // modify trapframe
+//         trap_ctx.sepc = handler;
 
-        // put args (a0)
-        trap_ctx.x[10] = sig;
-    } else {
-        // default action
-        println!("[K] task/call_user_signal_handler: default action: ignore it or kill process");
-    }
-}
+//         // put args (a0)
+//         trap_ctx.x[10] = sig;
+//     } else {
+//         // default action
+//         println!("[K] process/call_user_signal_handler: default action: ignore it or kill process");
+//     }
+// }
 
-pub fn sigreturn() -> isize {
-    if let Some(task) = current_task() {
-        let mut inner = task.get_inner();
-        inner.handling_signal = -1;
-        // restore the trap context
-        let trap_ctx = inner.trap_context_loc.get_mut() as &mut TrapContext;
-        *trap_ctx = inner.trap_ctx_backup.unwrap();
-        trap_ctx.x[10] as isize
-    } else {
-        -1
-    }
-}
+// pub fn sigreturn() -> isize {
+//     let process =current_process();
+//     let mut inner = process.borrow_mut();
+//     inner.handling_signal = -1;
+//     // restore the trap context
+//     let trap_ctx = inner.trap_context_loc.get_mut() as &mut TrapContext;
+//     *trap_ctx = inner.trap_ctx_backup.unwrap();
+//     trap_ctx.x[10] as isize
+// }

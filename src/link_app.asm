@@ -131,31 +131,31 @@ app_12_end:
 .section .rodata
 .align 3
 app_13_name:
-    .asciz "signal_test"
+    .asciz "thread"
 .align 3
 .section .data
 app_13_start:
-    .incbin "./results/signal_test.bin"
+    .incbin "./results/thread.bin"
 .align 3
 app_13_end:
 .section .rodata
 .align 3
 app_14_name:
-    .asciz "signal_test2"
+    .asciz "thread_arg"
 .align 3
 .section .data
 app_14_start:
-    .incbin "./results/signal_test2.bin"
+    .incbin "./results/thread_arg.bin"
 .align 3
 app_14_end:
 .section .rodata
 .align 3
 app_15_name:
-    .asciz "signal_test3"
+    .asciz "thread_counter"
 .align 3
 .section .data
 app_15_start:
-    .incbin "./results/signal_test3.bin"
+    .incbin "./results/thread_counter.bin"
 .align 3
 app_15_end:
 .section .rodata

@@ -1,8 +1,8 @@
-use crate::task::signal::{SignalAction, kill, set_signal, set_signal_mask, sigreturn};
+use crate::task::signal::{SignalAction, kill, set_signal, set_signal_mask};
 
-pub fn syscall_sigreturn() -> isize {
-    sigreturn()
-}
+// pub fn syscall_sigreturn() -> isize {
+//     sigreturn()
+// }
 
 pub fn syscall_kill(pid: usize, signum: i32) -> isize {
     kill(pid, signum)

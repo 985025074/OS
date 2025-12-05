@@ -5,7 +5,7 @@ use crate::{
     fs::{OpenFlags, make_pipe, open_file},
     mm::{UserBuffer, translated_byte_buffer, translated_single_address},
     println,
-    task::processor::current_task,
+    task::processor::current_process,
     trap::get_current_token,
 };
 
@@ -17,35 +17,35 @@ pub fn syscall_open(file_path: usize, open_flags: usize, file_path_len: usize) -
     let open_flags = OpenFlags::from_bits(open_flags as u32).unwrap();
 
     let result = open_file(path_str, open_flags).unwrap();
-    let task_now = current_task().unwrap();
-    let mut task_now_inner = task_now.get_inner();
-    task_now_inner.fd_table.push(Some(result));
-    now_len = task_now_inner.fd_table.len();
+    let process_now = current_process();
+    let mut process_now_inner = process_now.borrow_mut();
+    process_now_inner.fd_table.push(Some(result));
+    now_len = process_now_inner.fd_table.len();
     now_len as isize - 1
 }
 pub fn syscall_close(fd: usize) -> isize {
-    let task_now = current_task().unwrap();
-    let mut task_now_inner = task_now.get_inner();
-    if fd >= task_now_inner.fd_table.len() {
+    let process_now = current_process();
+    let mut process_now_inner = process_now.borrow_mut();
+    if fd >= process_now_inner.fd_table.len() {
         return -1;
     }
-    task_now_inner.fd_table[fd] = None;
+    process_now_inner.fd_table[fd] = None;
     0
 }
 pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
-    let task_now = current_task().unwrap();
-    let task_now_inner = task_now.get_inner();
-    if fd >= task_now_inner.fd_table.len() {
+    let process_now = current_process();
+    let process_now_inner = process_now.borrow_mut();
+    if fd >= process_now_inner.fd_table.len() {
         return -1;
     }
-    let file_option = &task_now_inner.fd_table[fd];
+    let file_option = &process_now_inner.fd_table[fd];
 
     if file_option.is_none() {
         return -1;
     }
     let file = file_option.as_ref().unwrap().clone();
-    // get current will need to use task..
-    drop(task_now_inner);
+    // get current will need to use process..
+    drop(process_now_inner);
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -55,18 +55,18 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     read_len as isize
 }
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
-    let task_now = current_task().unwrap();
-    let task_now_inner = task_now.get_inner();
-    if fd >= task_now_inner.fd_table.len() {
+    let process_now = current_process();
+    let process_now_inner = process_now.borrow_mut();
+    if fd >= process_now_inner.fd_table.len() {
         return -1;
     }
-    let file_option = &task_now_inner.fd_table[fd];
+    let file_option = &process_now_inner.fd_table[fd];
     if file_option.is_none() {
         return -1;
     }
     let file = file_option.as_ref().unwrap().clone();
 
-    drop(task_now_inner);
+    drop(process_now_inner);
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -82,11 +82,11 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
 }
 /// pipe: outer address of [read_fd, write_fd]
 pub fn syscall_pipe(pipe: *mut usize) -> isize {
-    let task = current_task().unwrap();
+    let process = current_process();
     let token = get_current_token();
     let (pipe_read, pipe_write) = make_pipe();
 
-    let mut inner = task.get_inner();
+    let mut inner = process.borrow_mut();
     let read_fd = inner.alloc_fd();
     inner.fd_table[read_fd] = Some(pipe_read);
     let write_fd = inner.alloc_fd();

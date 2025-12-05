@@ -48,7 +48,6 @@ fn rust_main() {
     println!("[kernel] memory management initialized.");
     trap::init_trap();
     trap::trap::enable_timer_interrupt();
-    task::task_init();
     time::set_next_trigger();
     fs::init_fs_debuger();
     list_apps();

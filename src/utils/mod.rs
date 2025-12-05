@@ -2,7 +2,8 @@
 use crate::println;
 use core::cell::{Ref, RefCell, RefMut};
 use core::panic::Location;
-
+mod id_allocator;
+pub use id_allocator::RecycleAllocator;
 /// RefCellSafe 改良版：记录上一次借用位置并打印当前借用尝试位置
 pub struct RefCellSafe<T> {
     refcell: RefCell<T>,

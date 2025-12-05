@@ -1,7 +1,6 @@
 use core::arch::asm;
 
-use crate::config::{TRAMPOLINE, TRAP_CONTEXT, kernel_stack_position};
-use crate::task::manager::TASK_MANAGER;
+use crate::config::TRAMPOLINE;
 use crate::task::processor::{PROCESSOR, exit_current_and_run_next, suspend_current_and_run_next};
 // use crate::task::signal::{check_if_current_signals_error, handle_signals};
 use crate::time::set_next_trigger;
@@ -26,7 +25,17 @@ fn log_for_trap_context(context: &TrapContext) {
 }
 
 const USER_ENV_CALL: usize = 8;
-const INSTRUCTION_FAULT: usize = 1;
+const INSTRUCTION_ADDRESS_MISALIGNED: usize = 0;
+const INSTRUCTION_ACCESS_FAULT: usize = 1;
+const ILLEGAL_INSTRUCTION: usize = 2;
+const BREAKPOINT: usize = 3;
+const LOAD_ADDRESS_MISALIGNED: usize = 4;
+const LOAD_ACCESS_FAULT: usize = 5;
+const STORE_ADDRESS_MISALIGNED: usize = 6;
+const STORE_ACCESS_FAULT: usize = 7;
+const INSTRUCTION_PAGE_FAULT: usize = 12;
+const LOAD_PAGE_FAULT: usize = 13;
+const STORE_PAGE_FAULT: usize = 15;
 const TIME_INTERVAL: usize = 5;
 pub fn init_trap() {
     // todo : 这里仍有bug dont know why
@@ -65,23 +74,28 @@ fn get_trap_context() -> &'static mut TrapContext {
     let processor = PROCESSOR.borrow();
     let now_task_block = processor.current().unwrap();
     drop(processor);
-    let now_task_block_inner = now_task_block.get_inner();
-    let cx = now_task_block_inner.trap_context_loc.get_mut();
-    //
-    cx
+    let now_task_block_inner = now_task_block.borrow_mut();
+    let trap_cx_ppn = now_task_block_inner.trap_cx_ppn;
+    // IMPORTANT: Drop the borrow before returning the reference
+    // This is safe because:
+    // 1. trap_cx_ppn is a PhysPageNum (Copy type)
+    // 2. The physical page won't be deallocated while the task is running
+    // 3. We're in kernel space with traps disabled
+    drop(now_task_block_inner);
+    trap_cx_ppn.get_mut()
 }
 pub fn get_current_token() -> usize {
     let processor = PROCESSOR.borrow();
     let now_task_block = processor.current().unwrap();
     drop(processor);
-    let now_task_block_inner = now_task_block.get_inner();
-    now_task_block_inner.code_memory_set.token()
+    let process = now_task_block.process.upgrade().unwrap();
+    let process_inner = process.borrow_mut();
+    process_inner.memory_set.token()
 }
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
     // now is kernel space
     // set_kernel_trap_entry();
-    use crate::println;
     // log_for_trap_context(cx);
     let scause = scause::read();
     let stval = stval::read();
@@ -89,34 +103,32 @@ pub fn trap_handler() {
     match code {
         // user env call ...
         Trap::Exception(USER_ENV_CALL) => {
-            let mut cx = get_trap_context();
-            cx.sepc += 4;
-            // get system call return value
-            let result = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]);
-            // cx is changed during sys_exec, so we have to call it again
-            cx = get_trap_context();
+            // Get syscall arguments
+            let (syscall_id, args) = {
+                let cx = get_trap_context();
+                cx.sepc += 4;
+                (cx.x[17], [cx.x[10], cx.x[11], cx.x[12]])
+            }; // cx is dropped here, releasing the borrow
+
+            // Execute syscall (may change memory layout via exec)
+            let result = syscall(syscall_id, args);
+
+            // Get trap context again (may be different after exec)
+            let cx = get_trap_context();
             cx.x[10] = result as usize;
         }
-        Trap::Exception(INSTRUCTION_FAULT) => {
-            let cx = get_trap_context();
-            println!(
-                "Instruction Fault at sepc = {:#x}, stval = {:#x}",
-                cx.sepc, stval
-            );
-            exit_current_and_run_next(-1);
+        Trap::Exception(code) => {
+            handle_user_exception(code, stval);
         }
         Trap::Interrupt(TIME_INTERVAL) => {
             set_next_trigger();
             suspend_current_and_run_next();
         }
-        _ => {
-            let Trap::Exception(code) = code else {
-                panic!(
-                    "Unsupported interupt: cause = {:?}, stval = {:#x}",
-                    code, stval
-                )
-            };
-            panic!("Unsupported trap: cause = {}, stval = {:#x}", code, stval);
+        Trap::Interrupt(interrupt) => {
+            panic!(
+                "Unsupported interrupt: cause = {:?}, stval = {:#x}",
+                interrupt, stval
+            );
         }
     }
     // println!("handle siganl");
@@ -128,6 +140,39 @@ pub fn trap_handler() {
     // }
     trap_return();
 }
+
+fn exception_name(code: usize) -> &'static str {
+    match code {
+        INSTRUCTION_ADDRESS_MISALIGNED => "Instruction address misaligned",
+        INSTRUCTION_ACCESS_FAULT => "Instruction access fault",
+        ILLEGAL_INSTRUCTION => "Illegal instruction",
+        BREAKPOINT => "Breakpoint",
+        LOAD_ADDRESS_MISALIGNED => "Load address misaligned",
+        LOAD_ACCESS_FAULT => "Load access fault",
+        STORE_ADDRESS_MISALIGNED => "Store address misaligned",
+        STORE_ACCESS_FAULT => "Store access fault",
+        INSTRUCTION_PAGE_FAULT => "Instruction page fault",
+        LOAD_PAGE_FAULT => "Load page fault",
+        STORE_PAGE_FAULT => "Store page fault",
+        USER_ENV_CALL => "Environment call from U-mode",
+        _ => "Unknown exception",
+    }
+}
+
+fn handle_user_exception(code: usize, stval: usize) {
+    {
+        let cx = get_trap_context();
+        println!(
+            "[kernel] Unhandled user trap: {} (code = {}), sepc = {:#x}, stval = {:#x}",
+            exception_name(code),
+            code,
+            cx.sepc,
+            stval
+        );
+    }
+    exit_current_and_run_next(-1);
+}
+
 #[unsafe(no_mangle)]
 /// set the new addr of __restore asm function in TRAMPOLINE page,
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
@@ -135,14 +180,19 @@ pub fn trap_handler() {
 pub fn trap_return() -> ! {
     set_user_trap_entry();
 
-    let trap_cx_ptr = TRAP_CONTEXT;
+    // Get the trap context virtual address for the current thread
+    let task = crate::task::processor::current_task().unwrap();
+    let task_inner = task.borrow_mut();
+    let trap_cx_ptr = task_inner.res.as_ref().unwrap().trap_cx_user_va();
+    drop(task_inner);
+
     let user_satp = get_current_token();
+
     unsafe extern "C" {
         fn alltraps();
         fn restore();
     }
     let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
-    // println!("restore va {:x}", restore_va);
     unsafe {
         asm!(
             "fence.i",

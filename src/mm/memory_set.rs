@@ -154,7 +154,7 @@ impl MemorySet {
         memory_set
     }
     /// Include sections in elf and trampoline and TrapContext and user stack,
-    /// also returns user_sp and entry point.
+    /// also returns user_sp and entry poremove_areeint.
     /// 用户占 被设计为 程序地址 (虚拟地址) 的最高端.
     pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
         let mut memory_set = Self::new_bare();
@@ -197,6 +197,13 @@ impl MemorySet {
         // guard page
         user_stack_bottom += PAGE_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+
+        // use crate::println;
+        // println!(
+        //     "[DEBUG] from_elf mapping user stack: bottom={:#x}, top={:#x}",
+        //     user_stack_bottom, user_stack_top
+        // );
+
         memory_set.push(
             MapArea::new(
                 user_stack_bottom.into(),
@@ -226,11 +233,32 @@ impl MemorySet {
             ),
             None,
         );
+        // Return user_stack_bottom as ustack_base for thread allocation
+        // Each thread will calculate its stack as: ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
         (
             memory_set,
-            user_stack_top,
+            user_stack_bottom,
             elf.header.pt2.entry_point() as usize,
         )
+    }
+    pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
+        let mut memory_set = Self::new_bare();
+        // map trampoline
+        memory_set.map_trampoline();
+        // copy data sections/trap_context/user_stack
+        for area in user_space.areas.iter() {
+            let new_area = MapArea::from_another(area);
+            memory_set.push(new_area, None);
+            // copy data from another space
+            for vpn in area.vpn_range {
+                let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                dst_ppn
+                    .get_bytes_array()
+                    .copy_from_slice(src_ppn.get_bytes_array());
+            }
+        }
+        memory_set
     }
     pub fn activate(&self) {
         let satp = self.page_table.token();
@@ -278,6 +306,17 @@ impl MemorySet {
             self.areas.remove(idx);
         };
     }
+    pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
+        if let Some((idx, area)) = self
+            .areas
+            .iter_mut()
+            .enumerate()
+            .find(|(_idx, area)| area.vpn_range.get_start() == start_va.floor())
+        {
+            area.unmap(&mut self.page_table);
+            self.areas.remove(idx);
+        };
+    }
 
     pub fn clone(&self) -> Self {
         let mut new_memory_set = Self::new_bare();
@@ -303,6 +342,10 @@ impl MemorySet {
 
         new_memory_set
     }
+    pub fn recycle_data_pages(&mut self) {
+        //*self = Self::new_bare();
+        self.areas.clear();
+    }
 }
 
 /// map area structure, controls a contiguous piece of virtual memory
@@ -327,6 +370,14 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+        }
+    }
+    pub fn from_another(another: &MapArea) -> Self {
+        Self {
+            vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
+            data_frames: BTreeMap::new(),
+            map_type: another.map_type,
+            map_perm: another.map_perm,
         }
     }
     /// map _one 两种映射类型.其中恒等映射 本人是不持有 frame 的.

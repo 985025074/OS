@@ -8,6 +8,7 @@ use crate::{
     println,
     task::{
         manager::{TASK_MANAGER, add_task},
+        process_block::ProcessControlBlock,
         processor::{current_task, go_to_first_task},
         task_context::TaskContext,
     },
@@ -20,29 +21,27 @@ use riscv::{
     interrupt::Trap,
     register::{sepc, sstatus::Sstatus},
 };
+mod id;
 pub mod manager;
-mod pid;
+mod process_block;
 pub mod processor;
 pub mod signal;
-mod stack;
 mod switch;
 pub mod task_block;
 pub mod task_context;
-use task_block::{TaskBlock, TaskState};
 lazy_static! {
-    pub static ref INITPROC: Arc<TaskBlock> = {
+    pub static ref INITPROC: Arc<ProcessControlBlock> = {
         let inode = open_file("init_proc", OpenFlags::RDONLY).unwrap();
-        Arc::new(TaskBlock::new(
-            &inode.read_all(),
-            "init_proc".as_ptr() as usize,
-        ))
+        ProcessControlBlock::new(&inode.read_all())
     };
 }
-
 pub fn task_init() {
-    add_task(INITPROC.clone());
+    //现在这个过程 在new 内部
+    // add_task(INITPROC.clone());
+    INITPROC.clone();
     println!("[kernel] Task initialized.");
 }
 pub fn task_start() {
+    task_init();
     go_to_first_task();
 }
