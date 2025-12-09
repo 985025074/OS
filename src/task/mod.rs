@@ -21,10 +21,14 @@ use riscv::{
     interrupt::Trap,
     register::{sepc, sstatus::Sstatus},
 };
+pub mod block_sleep;
+pub mod condvar;
 mod id;
 pub mod manager;
+pub mod mutex;
 mod process_block;
 pub mod processor;
+pub mod semaphore;
 pub mod signal;
 mod switch;
 pub mod task_block;

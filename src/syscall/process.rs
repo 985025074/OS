@@ -4,12 +4,8 @@ use core::mem::size_of;
 use crate::{
     fs::{OpenFlags, open_file},
     mm::{translated_single_address, translated_str},
-    println,
-    task::{
-        manager::add_task,
-        processor::{
-            current_process, current_process_has_child, current_task, suspend_current_and_run_next,
-        },
+    task::processor::{
+        current_process, current_process_has_child, current_task, suspend_current_and_run_next,
     },
     trap::get_current_token,
 };
@@ -72,7 +68,11 @@ pub fn syscall_exec(path: usize, args_addr: usize) -> isize {
         }
     }
     let app_name = translated_str(token, path as *const u8);
-    let app_data = open_file(&app_name, OpenFlags::RDONLY).unwrap().read_all();
+    let file = open_file(&app_name, OpenFlags::RDONLY);
+    if file.is_none() {
+        return -1;
+    }
+    let app_data = file.unwrap().read_all();
     now_process.exec(&app_data, args_vec);
     0
 }

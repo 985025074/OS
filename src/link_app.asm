@@ -121,48 +121,168 @@ app_11_end:
 .section .rodata
 .align 3
 app_12_name:
-    .asciz "pipe_test"
+    .asciz "mutex_block"
 .align 3
 .section .data
 app_12_start:
-    .incbin "./results/pipe_test.bin"
+    .incbin "./results/mutex_block.bin"
 .align 3
 app_12_end:
 .section .rodata
 .align 3
 app_13_name:
-    .asciz "thread"
+    .asciz "mutex_spin"
 .align 3
 .section .data
 app_13_start:
-    .incbin "./results/thread.bin"
+    .incbin "./results/mutex_spin.bin"
 .align 3
 app_13_end:
 .section .rodata
 .align 3
 app_14_name:
-    .asciz "thread_arg"
+    .asciz "pipe_test"
 .align 3
 .section .data
 app_14_start:
-    .incbin "./results/thread_arg.bin"
+    .incbin "./results/pipe_test.bin"
 .align 3
 app_14_end:
 .section .rodata
 .align 3
 app_15_name:
-    .asciz "thread_counter"
+    .asciz "producer"
 .align 3
 .section .data
 app_15_start:
-    .incbin "./results/thread_counter.bin"
+    .incbin "./results/producer.bin"
 .align 3
 app_15_end:
 .section .rodata
 .align 3
+app_16_name:
+    .asciz "semaphore_basic"
+.align 3
+.section .data
+app_16_start:
+    .incbin "./results/semaphore_basic.bin"
+.align 3
+app_16_end:
+.section .rodata
+.align 3
+app_17_name:
+    .asciz "semaphore_cond"
+.align 3
+.section .data
+app_17_start:
+    .incbin "./results/semaphore_cond.bin"
+.align 3
+app_17_end:
+.section .rodata
+.align 3
+app_18_name:
+    .asciz "sleep_debug"
+.align 3
+.section .data
+app_18_start:
+    .incbin "./results/sleep_debug.bin"
+.align 3
+app_18_end:
+.section .rodata
+.align 3
+app_19_name:
+    .asciz "sleep_simple"
+.align 3
+.section .data
+app_19_start:
+    .incbin "./results/sleep_simple.bin"
+.align 3
+app_19_end:
+.section .rodata
+.align 3
+app_20_name:
+    .asciz "sleep_stress"
+.align 3
+.section .data
+app_20_start:
+    .incbin "./results/sleep_stress.bin"
+.align 3
+app_20_end:
+.section .rodata
+.align 3
+app_21_name:
+    .asciz "sleep_test"
+.align 3
+.section .data
+app_21_start:
+    .incbin "./results/sleep_test.bin"
+.align 3
+app_21_end:
+.section .rodata
+.align 3
+app_22_name:
+    .asciz "thread"
+.align 3
+.section .data
+app_22_start:
+    .incbin "./results/thread.bin"
+.align 3
+app_22_end:
+.section .rodata
+.align 3
+app_23_name:
+    .asciz "thread_arg"
+.align 3
+.section .data
+app_23_start:
+    .incbin "./results/thread_arg.bin"
+.align 3
+app_23_end:
+.section .rodata
+.align 3
+app_24_name:
+    .asciz "thread_counter"
+.align 3
+.section .data
+app_24_start:
+    .incbin "./results/thread_counter.bin"
+.align 3
+app_24_end:
+.section .rodata
+.align 3
+app_25_name:
+    .asciz "thread_lock"
+.align 3
+.section .data
+app_25_start:
+    .incbin "./results/thread_lock.bin"
+.align 3
+app_25_end:
+.section .rodata
+.align 3
+app_26_name:
+    .asciz "sync_abc_mutex"
+.align 3
+.section .data
+app_26_start:
+    .incbin "./results/sync_abc_mutex.bin"
+.align 3
+app_26_end:
+.section .rodata
+.align 3
+app_27_name:
+    .asciz "condvar_basic"
+.align 3
+.section .data
+app_27_start:
+    .incbin "./results/condvar_basic.bin"
+.align 3
+app_27_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 16
+    .quad 28
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -211,3 +331,39 @@ num_user_apps:
     .quad app_15_start
     .quad app_15_end
     .quad app_15_name
+    .quad app_16_start
+    .quad app_16_end
+    .quad app_16_name
+    .quad app_17_start
+    .quad app_17_end
+    .quad app_17_name
+    .quad app_18_start
+    .quad app_18_end
+    .quad app_18_name
+    .quad app_19_start
+    .quad app_19_end
+    .quad app_19_name
+    .quad app_20_start
+    .quad app_20_end
+    .quad app_20_name
+    .quad app_21_start
+    .quad app_21_end
+    .quad app_21_name
+    .quad app_22_start
+    .quad app_22_end
+    .quad app_22_name
+    .quad app_23_start
+    .quad app_23_end
+    .quad app_23_name
+    .quad app_24_start
+    .quad app_24_end
+    .quad app_24_name
+    .quad app_25_start
+    .quad app_25_end
+    .quad app_25_name
+    .quad app_26_start
+    .quad app_26_end
+    .quad app_26_name
+    .quad app_27_start
+    .quad app_27_end
+    .quad app_27_name

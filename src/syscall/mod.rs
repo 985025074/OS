@@ -3,8 +3,11 @@ use core::panic;
 use crate::{println, task::signal::SignalAction};
 mod filesystem;
 
+mod condvar;
 mod flow;
+mod mutex;
 mod process;
+mod semaphore;
 mod signal;
 mod thread;
 const SYSCALL_READ: usize = 63;
@@ -37,6 +40,7 @@ const SYSCALL_SEMAPHORE_DOWN: usize = 1022;
 const SYSCALL_CONDVAR_CREATE: usize = 1030;
 const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
+const SYSCALL_SLEEP: usize = 101;
 
 pub fn syscall(id: usize, args: [usize; 3]) -> isize {
     // println!(
@@ -70,6 +74,18 @@ pub fn syscall(id: usize, args: [usize; 3]) -> isize {
         SYSCALL_THREAD_CREATE => thread::sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => thread::sys_gettid(),
         SYSCALL_WAITTID => thread::sys_waittid(args[0] as usize) as isize,
+
+        SYSCALL_MUTEX_CREATE => mutex::sys_mutex_create(args[0] == 1),
+        SYSCALL_MUTEX_LOCK => mutex::sys_mutex_lock(args[0]),
+        SYSCALL_MUTEX_UNLOCK => mutex::sys_mutex_unlock(args[0]),
+        SYSCALL_SEMAPHORE_CREATE => semaphore::sys_semaphore_create(args[0]),
+        SYSCALL_SEMAPHORE_UP => semaphore::sys_semaphore_up(args[0]),
+        SYSCALL_SEMAPHORE_DOWN => semaphore::sys_semaphore_down(args[0]),
+        SYSCALL_SLEEP => thread::sys_sleep(args[0]),
+        // condvar
+        SYSCALL_CONDVAR_CREATE => condvar::sys_condvar_create(),
+        SYSCALL_CONDVAR_SIGNAL => condvar::sys_condvar_signal(args[0]),
+        SYSCALL_CONDVAR_WAIT => condvar::sys_condvar_wait(args[0], args[1]),
 
         _ => {
             panic!(

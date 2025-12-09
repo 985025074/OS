@@ -114,18 +114,12 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 pub fn idle_task() {
     loop {
         let mut processor = PROCESSOR.borrow_mut();
-        // println!("[DEBUG] idle_task: trying to fetch next task");
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
-
-            // println!(
-            //     "[DEBUG] idle_task switching to task, task_cx: {}",
-            //     task_inner.task_cx
-            // );
 
             drop(task_inner);
             // release coming task TCB manually
@@ -139,9 +133,9 @@ pub fn idle_task() {
                     next_task_cx_ptr as *const usize,
                 );
             }
-            // println!("[DEBUG] idle_task returned from switch");
         } else {
-            panic!("all tasks done!");
+            // No ready tasks - just release lock and continue loop
+            drop(processor);
         }
     }
 }
@@ -169,6 +163,30 @@ pub fn suspend_current_and_run_next() {
     add_task(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+}
+pub fn block_current_and_run_next() {
+    // There must be an application running.
+    let task = take_current_task().unwrap();
+
+    // ---- access current TCB exclusively
+    let mut task_inner = task.borrow_mut();
+    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    // Change status to Ready
+    task_inner.task_status = TaskStatus::Blocked;
+    drop(task_inner);
+    // ---- release current PCB
+
+    // we dont need to add block task here;
+    // add_task(task);
+    // jump to scheduling cycle
+    schedule(task_cx_ptr);
+}
+pub fn wakeup_task(task: Arc<TaskControlBlock>) {
+    let mut task_inner = task.borrow_mut();
+    assert_eq!(task_inner.task_status, TaskStatus::Blocked);
+    task_inner.task_status = TaskStatus::Ready;
+    drop(task_inner);
+    add_task(task);
 }
 
 /// pid of usertests app in make run TEST=1
@@ -280,10 +298,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     drop(process);
     // we do not have to save task context
-    println!(
-        "[DEBUG] exit_current_and_run_next: about to schedule, tid={}",
-        tid
-    );
+    // println!(
+    //     "[DEBUG] exit_current_and_run_next: about to schedule, tid={}",
+    //     tid
+    // );
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
 }

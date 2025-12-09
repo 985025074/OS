@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 use crate::config::TRAMPOLINE;
+use crate::task::block_sleep::check_timer;
 use crate::task::processor::{PROCESSOR, exit_current_and_run_next, suspend_current_and_run_next};
 // use crate::task::signal::{check_if_current_signals_error, handle_signals};
 use crate::time::set_next_trigger;
@@ -10,7 +11,7 @@ pub mod trap;
 use crate::syscall::syscall;
 use riscv::{
     interrupt::Trap,
-    register::{scause, stval},
+    register::{scause, sscratch, sstatus, stval},
 };
 
 #[allow(unused)]
@@ -37,23 +38,26 @@ const INSTRUCTION_PAGE_FAULT: usize = 12;
 const LOAD_PAGE_FAULT: usize = 13;
 const STORE_PAGE_FAULT: usize = 15;
 const TIME_INTERVAL: usize = 5;
+
 pub fn init_trap() {
-    // todo : 这里仍有bug dont know why
-    // set_kernel_trap_entry();
-    set_user_trap_entry();
+    set_kernel_trap_entry();
 }
-#[unsafe(no_mangle)]
-fn trap_from_kernel() -> ! {
-    panic!("not impled");
-}
-#[allow(unused)]
+
+// kernel_interupt made the os able to stop when time is up.
+// so some sleeping task can be waked up.
 fn set_kernel_trap_entry() {
+    unsafe extern "C" {
+        fn alltraps();
+        fn alltraps_k();
+    }
+    let alltraps_k_va = alltraps_k as usize - alltraps as usize + TRAMPOLINE;
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
-            trap_from_kernel as usize,
+            alltraps_k_va,
             riscv::register::stvec::TrapMode::Direct,
         );
         riscv::register::stvec::write(to_write);
+        sscratch::write(trap_from_kernel as usize);
     }
 }
 
@@ -65,9 +69,38 @@ fn set_user_trap_entry() {
         );
         riscv::register::stvec::write(to_write);
     }
-    // unsafe {
-    //     stvec::write(trampoline as usize, TrapMode::Direct);
-    // }
+}
+
+fn enable_supervisor_interrupt() {
+    unsafe {
+        sstatus::set_sie();
+    }
+}
+
+fn disable_supervisor_interrupt() {
+    unsafe {
+        sstatus::clear_sie();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn trap_from_kernel(_trap_cx: &TrapContext) {
+    let scause = scause::read();
+    let stval = stval::read();
+    match scause.cause() {
+        Trap::Interrupt(TIME_INTERVAL) => {
+            set_next_trigger();
+            check_timer();
+            // do not schedule, just return to kernel
+        }
+        _ => {
+            panic!(
+                "Unsupported trap from kernel: {:?}, stval = {:#x}!",
+                scause.cause(),
+                stval
+            );
+        }
+    }
 }
 // todo : avoid cloning here..
 fn get_trap_context() -> &'static mut TrapContext {
@@ -95,8 +128,7 @@ pub fn get_current_token() -> usize {
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
     // now is kernel space
-    // set_kernel_trap_entry();
-    // log_for_trap_context(cx);
+    set_kernel_trap_entry();
     let scause = scause::read();
     let stval = stval::read();
     let code = scause.cause(); // usize
@@ -110,6 +142,9 @@ pub fn trap_handler() {
                 (cx.x[17], [cx.x[10], cx.x[11], cx.x[12]])
             }; // cx is dropped here, releasing the borrow
 
+            // Enable S-mode interrupt so timer can fire during syscall
+            enable_supervisor_interrupt();
+
             // Execute syscall (may change memory layout via exec)
             let result = syscall(syscall_id, args);
 
@@ -122,6 +157,7 @@ pub fn trap_handler() {
         }
         Trap::Interrupt(TIME_INTERVAL) => {
             set_next_trigger();
+            check_timer();
             suspend_current_and_run_next();
         }
         Trap::Interrupt(interrupt) => {
@@ -178,6 +214,8 @@ fn handle_user_exception(code: usize, stval: usize) {
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
+    // this shouln't be interrupted
+    disable_supervisor_interrupt();
     set_user_trap_entry();
 
     // Get the trap context virtual address for the current thread

@@ -1,7 +1,9 @@
+use alloc::collections::binary_heap::BinaryHeap;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use lazy_static::*;
 
+use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::utils::RefCellSafe;
@@ -77,7 +79,20 @@ pub fn remove_from_pid2process(pid: usize) {
     }
 }
 
+pub fn remove_timer(task: Arc<TaskControlBlock>) {
+    let mut timers = TIMERS.borrow_mut();
+    let mut temp = BinaryHeap::<TimeWrap>::new();
+    for condvar in timers.drain() {
+        if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
+            temp.push(condvar);
+        }
+    }
+    timers.clear();
+    timers.append(&mut temp);
+}
+
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     // 这里可能会加入 todo
-    remove_task(task);
+    remove_timer(task.clone());
+    remove_task(task.clone());
 }

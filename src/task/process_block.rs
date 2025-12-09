@@ -3,19 +3,20 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use spin::Mutex;
 
+use super::mutex::Mutex;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_mutref};
 use crate::println;
+use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
 use crate::task::manager::{add_task, insert_into_pid2process};
+use crate::task::semaphore::Semaphore;
 use crate::task::signal::{SignalActions, SignalFlags};
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::{RecycleAllocator, RefCellSafe};
-
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -41,9 +42,9 @@ pub struct ProcessControlBlockInner {
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     // 进程控制块 有一个分配 线程ID的分配器
     pub task_res_allocator: RecycleAllocator,
-    // pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
-    // pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
-    // pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
+    pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
+    pub condvar_list: Vec<Option<Arc<Condvar>>>,
 }
 
 impl ProcessControlBlockInner {
@@ -111,9 +112,9 @@ impl ProcessControlBlock {
                     handling_signal: -1,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
-                    // mutex_list: Vec::new(),
-                    // semaphore_list: Vec::new(),
-                    // condvar_list: Vec::new(),
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
                 })
             },
         });
@@ -242,9 +243,9 @@ impl ProcessControlBlock {
                     handling_signal: -1,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
-                    // mutex_list: Vec::new(),
-                    // semaphore_list: Vec::new(),
-                    // condvar_list: Vec::new(),
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
                 })
             },
         });

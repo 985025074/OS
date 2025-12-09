@@ -4,7 +4,14 @@ use alloc::sync::Arc;
 
 use crate::{
     mm::kernel_token,
-    task::{manager::add_task, processor::current_task, task_block::TaskControlBlock},
+    println,
+    task::{
+        block_sleep::add_timer,
+        manager::add_task,
+        processor::{block_current_and_run_next, current_task},
+        task_block::TaskControlBlock,
+    },
+    time::get_time_ms,
     trap::{context::TrapContext, trap_handler},
 };
 
@@ -81,4 +88,11 @@ pub fn sys_waittid(tid: usize) -> i32 {
         // waited thread has not exited
         -2
     }
+}
+
+pub fn sys_sleep(time_ms: usize) -> isize {
+    let task = current_task().unwrap();
+    add_timer(Arc::clone(&task), time_ms);
+    block_current_and_run_next();
+    0
 }
