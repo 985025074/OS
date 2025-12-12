@@ -4,16 +4,16 @@ use alloc::sync::Arc;
 
 use crate::{
     mm::kernel_token,
-    println,
+    time::get_time_ms,
     task::{
         block_sleep::add_timer,
         manager::add_task,
         processor::{block_current_and_run_next, current_task},
         task_block::TaskControlBlock,
     },
-    time::get_time_ms,
     trap::{context::TrapContext, trap_handler},
 };
+use crate::debug_config::DEBUG_TIMER;
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
@@ -91,8 +91,56 @@ pub fn sys_waittid(tid: usize) -> i32 {
 }
 
 pub fn sys_sleep(time_ms: usize) -> isize {
+    // Edge case: sleeping for 0ms should return immediately.
+    // Blocking here can hang if no timer tick arrives and wakes us up
+    // (or if the wakeup happens before we actually block).
+    if time_ms == 0 {
+        return 0;
+    }
     let task = current_task().unwrap();
+    if DEBUG_TIMER {
+        let tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        crate::println!(
+            "[sleep] tid={} request_ms={} now_ms={}",
+            tid,
+            time_ms,
+            get_time_ms()
+        );
+    }
+    // Prevent "lost wakeup": make the enqueue+block sequence atomic w.r.t. timer interrupts.
+    // If an interrupt fires after we enqueue but before we are actually blocked, the wakeup can
+    // be lost and the task may sleep forever.
+    unsafe {
+        riscv::register::sstatus::clear_sie();
+    }
+    {
+        let mut inner = task.borrow_mut();
+        inner.task_status = crate::task::task_block::TaskStatus::Blocked;
+    }
     add_timer(Arc::clone(&task), time_ms);
+    // This will take the task out of PROCESSOR and switch to idle, letting the scheduler run.
     block_current_and_run_next();
+    unsafe {
+        riscv::register::sstatus::set_sie();
+    }
+    if DEBUG_TIMER {
+        let tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        crate::println!(
+            "[sleep] tid={} woke now_ms={} slept_for~={}ms",
+            tid,
+            get_time_ms(),
+            time_ms
+        );
+    }
     0
 }

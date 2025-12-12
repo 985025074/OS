@@ -35,15 +35,15 @@ pub mod task_block;
 pub mod task_context;
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("init_proc", OpenFlags::RDONLY).unwrap();
-        ProcessControlBlock::new(&inode.read_all())
+        let inode = open_file("init_proc.bin", OpenFlags::RDONLY).unwrap();
+        let data = inode.read_all();
+        ProcessControlBlock::new(&data)
     };
 }
 pub fn task_init() {
     //现在这个过程 在new 内部
     // add_task(INITPROC.clone());
     INITPROC.clone();
-    println!("[kernel] Task initialized.");
 }
 pub fn task_start() {
     task_init();

@@ -17,6 +17,8 @@ use crate::{
 
 use alloc::{sync::Arc, task, vec::Vec};
 use lazy_static::lazy_static;
+
+use crate::debug_config::DEBUG_SCHED;
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
     idle_task_context: TaskContext,
@@ -113,12 +115,23 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 }
 pub fn idle_task() {
     loop {
-        let mut processor = PROCESSOR.borrow_mut();
+        // Disable interrupts while accessing TASK_MANAGER to prevent
+        // timer interrupt from calling check_timer -> wakeup_task -> add_task
+        // while we hold the TASK_MANAGER lock in fetch_task
+        unsafe {
+            riscv::register::sstatus::clear_sie();
+        }
+
         if let Some(task) = fetch_task() {
+            let mut processor = PROCESSOR.borrow_mut();
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            if DEBUG_SCHED {
+                let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                crate::println!("[idle] switch to tid={}", tid);
+            }
             task_inner.task_status = TaskStatus::Running;
 
             drop(task_inner);
@@ -127,6 +140,12 @@ pub fn idle_task() {
             // release processor manually
             drop(processor);
 
+            // Re-enable interrupts before switching to the task
+            // The task will run with interrupts enabled
+            unsafe {
+                riscv::register::sstatus::set_sie();
+            }
+
             unsafe {
                 switch::switch(
                     idle_task_cx_ptr as *const usize,
@@ -134,8 +153,19 @@ pub fn idle_task() {
                 );
             }
         } else {
-            // No ready tasks - just release lock and continue loop
-            drop(processor);
+            crate::println!("[idle] No tasks, entering wfi...");
+            // No ready tasks - enable interrupts and wait
+            // Use wfi to save power while waiting for timer interrupt
+            // Timer interrupt will call check_timer() to wake up sleeping tasks
+            //
+            // IMPORTANT: We must loop back to check fetch_task() after wfi returns
+            // because the interrupt handler may have woken up a task
+            unsafe {
+                riscv::register::sstatus::set_sie();
+                core::arch::asm!("wfi");
+            }
+            crate::println!("[idle] Woke up from wfi");
+            // Loop back immediately to check for newly ready tasks
         }
     }
 }
@@ -170,6 +200,14 @@ pub fn block_current_and_run_next() {
 
     // ---- access current TCB exclusively
     let mut task_inner = task.borrow_mut();
+    if crate::debug_config::DEBUG_TIMER {
+        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        crate::println!(
+            "[block] tid={} status_before={:?}",
+            tid,
+            task_inner.task_status
+        );
+    }
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     // Change status to Ready
     task_inner.task_status = TaskStatus::Blocked;
@@ -183,6 +221,14 @@ pub fn block_current_and_run_next() {
 }
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     let mut task_inner = task.borrow_mut();
+    if crate::debug_config::DEBUG_TIMER {
+        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        crate::println!(
+            "[wakeup_task] tid={} prev_status={:?}",
+            tid,
+            task_inner.task_status
+        );
+    }
     assert_eq!(task_inner.task_status, TaskStatus::Blocked);
     task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);

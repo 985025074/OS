@@ -5,6 +5,7 @@ pub mod utils;
 extern crate alloc;
 mod config;
 mod console;
+pub mod debug_config;
 mod drivers;
 mod fs;
 mod lang_items;

@@ -1,40 +1,52 @@
-use super::BlockDevice;
 use crate::{
     mm::{
         FrameTracker, PageTable, PhysAddr, PhysPageNum, VirtAddr, frame_alloc, frame_dealloc,
         kernel_token,
     },
     println,
-    utils::RefCellSafe,
 };
 use alloc::vec::Vec;
+use ext4_fs::BlockDevice;
 use lazy_static::*;
+use spin::Mutex;
 use virtio_drivers::{Hal, VirtIOBlk, VirtIOHeader};
 
 #[allow(unused)]
 const VIRTIO0: usize = 0x10001000;
 
-pub struct VirtIOBlock(RefCellSafe<VirtIOBlk<'static, VirtioHal>>);
+pub struct VirtIOBlock(Mutex<VirtIOBlk<'static, VirtioHal>>);
 
 lazy_static! {
-    static ref QUEUE_FRAMES: RefCellSafe<Vec<FrameTracker>> =
-        unsafe { RefCellSafe::new(Vec::new()) };
+    static ref QUEUE_FRAMES: Mutex<Vec<FrameTracker>> = Mutex::new(Vec::new());
 }
 
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-        self.0
-            .borrow_mut()
-            .read_block(block_id, buf)
-            .expect("Error when reading VirtIOBlk");
+        let sectors_per_block = buf.len() / 512;
+        let base_sector = block_id * sectors_per_block;
+
+        let mut blk = self.0.lock();
+        for i in 0..sectors_per_block {
+            let sector_id = base_sector + i;
+            let offset = i * 512;
+            blk.read_block(sector_id, &mut buf[offset..offset + 512])
+                .expect("Error when reading VirtIOBlk");
+        }
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
-        self.0
-            .borrow_mut()
-            .write_block(block_id, buf)
-            .expect("Error when writing VirtIOBlk");
+        let sectors_per_block = buf.len() / 512;
+        let base_sector = block_id * sectors_per_block;
+
+        let mut blk = self.0.lock();
+        for i in 0..sectors_per_block {
+            let sector_id = base_sector + i;
+            let offset = i * 512;
+            blk.write_block(sector_id, &buf[offset..offset + 512])
+                .expect("Error when writing VirtIOBlk");
+        }
     }
 }
+
 #[repr(C)]
 pub struct TestHeader {
     pub magic: u32,
@@ -80,7 +92,7 @@ impl VirtIOBlock {
                     panic!("VirtIOBlk initialization failed");
                 }
             };
-            Self(RefCellSafe::new(inner))
+            Self(Mutex::new(inner))
         };
         println!("VirtIOBlock initialized.");
         result
@@ -98,7 +110,7 @@ impl Hal for VirtioHal {
                 ppn_base = frame.ppn;
             }
             assert_eq!(frame.ppn.0, ppn_base.0 + i);
-            QUEUE_FRAMES.borrow_mut().push(frame);
+            QUEUE_FRAMES.lock().push(frame);
         }
         let pa: PhysAddr = ppn_base.into();
         pa.0

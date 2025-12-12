@@ -3,6 +3,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use lazy_static::*;
 
+use crate::debug_config::DEBUG_SCHED;
 use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
@@ -20,10 +21,67 @@ impl TaskManager {
         }
     }
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+        // Avoid enqueueing the same task multiple times; this can happen if we
+        // preempt a task that is already sitting in the ready queue (e.g., due to
+        // rapid timer interrupts).
+        if self
+            .ready_queue
+            .iter()
+            .any(|t| Arc::ptr_eq(t, &task))
+        {
+            if DEBUG_SCHED {
+                let tid = task
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                crate::println!(
+                    "[sched] skip add duplicate tid={} ready_queue_len={}",
+                    tid,
+                    self.ready_queue.len()
+                );
+            }
+            return;
+        }
+        if DEBUG_SCHED {
+            let tid = task
+                .borrow_mut()
+                .res
+                .as_ref()
+                .map(|r| r.tid)
+                .unwrap_or(usize::MAX);
+            crate::println!(
+                "[sched] add_task tid={} ready_queue_len_before={}",
+                tid,
+                self.ready_queue.len()
+            );
+        }
         self.ready_queue.push_back(task);
+        if DEBUG_SCHED {
+            crate::println!("[sched] ready_queue_len_after={}", self.ready_queue.len());
+        }
     }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let t = self.ready_queue.pop_front();
+        if DEBUG_SCHED {
+            if let Some(ref task) = t {
+                let tid = task
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                crate::println!(
+                    "[sched] fetch_task -> Some(tid={}) remaining_len={}",
+                    tid,
+                    self.ready_queue.len()
+                );
+            } else {
+                crate::println!("[sched] fetch_task -> None (len=0)");
+            }
+        }
+        t
     }
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
         if let Some((id, _)) = self
@@ -45,7 +103,13 @@ lazy_static! {
 }
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
+    // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
+    let prev_sie = riscv::register::sstatus::read().sie();
+    unsafe { riscv::register::sstatus::clear_sie() };
     TASK_MANAGER.borrow_mut().add(task);
+    if prev_sie {
+        unsafe { riscv::register::sstatus::set_sie() };
+    }
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
@@ -56,11 +120,22 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn remove_task(task: Arc<TaskControlBlock>) {
+    let prev_sie = riscv::register::sstatus::read().sie();
+    unsafe { riscv::register::sstatus::clear_sie() };
     TASK_MANAGER.borrow_mut().remove(task);
+    if prev_sie {
+        unsafe { riscv::register::sstatus::set_sie() };
+    }
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    TASK_MANAGER.borrow_mut().fetch()
+    let prev_sie = riscv::register::sstatus::read().sie();
+    unsafe { riscv::register::sstatus::clear_sie() };
+    let t = TASK_MANAGER.borrow_mut().fetch();
+    if prev_sie {
+        unsafe { riscv::register::sstatus::set_sie() };
+    }
+    t
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

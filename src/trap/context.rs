@@ -35,6 +35,10 @@ impl TrapContext {
     ) -> Self {
         let mut sstatus = sstatus::read(); // CSR sstatus
         sstatus.set_spp(SPP::User); //previous privilege mode: user mode
+        // Enable interrupts when we enter user mode for the first time.
+        // Without setting SPIE, S-mode interrupts (timer) stay disabled in U-mode,
+        // so sleeping tasks would never be woken if another runnable task spins.
+        sstatus.set_spie(true);
         let mut cx = Self {
             x: [0; 32],
             sstatus,

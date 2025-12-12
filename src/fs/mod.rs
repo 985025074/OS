@@ -2,7 +2,8 @@
 mod inode;
 mod pipe;
 mod stdio;
-use crate::{mm::UserBuffer, println};
+use crate::mm::UserBuffer;
+
 /// File trait
 pub trait File: Send + Sync {
     /// If readable
@@ -15,17 +16,6 @@ pub trait File: Send + Sync {
     fn write(&self, buf: UserBuffer) -> usize;
 }
 
-use easy_fs::debug::Logger;
 pub use inode::{OSInode, OpenFlags, list_apps, open_file};
 pub use pipe::{Pipe, make_pipe};
 pub use stdio::{Stdin, Stdout};
-struct PrintlnLogger;
-impl Logger for PrintlnLogger {
-    fn log(&self, record: &str) {
-        println!("[EFS DEBUG]: {}", record);
-    }
-}
-pub fn init_fs_debuger() {
-    println!("init fs debuger");
-    easy_fs::debug::set_logger(&PrintlnLogger);
-}

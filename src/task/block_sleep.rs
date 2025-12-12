@@ -2,14 +2,16 @@
 use core::{cmp::Ordering, time};
 
 use crate::{
-    println,
-    task::{manager::wakeup_task, task_block::TaskControlBlock},
+    task::{processor::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
     utils::RefCellSafe,
 };
 use lazy_static::*;
 
 use alloc::{collections::BinaryHeap, sync::Arc};
+
+use crate::debug_config::DEBUG_TIMER;
+use crate::task::process_block::ProcessControlBlock;
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
     pub time_expired: usize,
@@ -46,39 +48,111 @@ lazy_static! {
     pub static ref TIMERS: RefCellSafe<BinaryHeap<TimeWrap>> =
         unsafe { RefCellSafe::new(BinaryHeap::<TimeWrap>::new()) };
 }
-// impl this...
 
 pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
-    let current_ms = get_time_ms();
     let timer = TimeWrap::new(task, time_wait);
-    println!(
-        "[add_timer] Current time: {}ms, will expire at: {}ms",
-        current_ms, timer.time_expired
-    );
+    if DEBUG_TIMER {
+        let tid = timer
+            .task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        crate::println!(
+            "[timer] add tid={} wait_ms={} expire_ms={}",
+            tid,
+            time_wait,
+            timer.time_expired
+        );
+    }
     TIMERS.borrow_mut().push(timer);
 }
+
 pub fn check_timer() {
     let current_ms = get_time_ms();
-    let mut timers = TIMERS.borrow_mut();
 
-    // if let Some(timer) = timers.peek() {
-    //     println!(
-    //         "[check_timer] Current: {}ms, next timer expires at: {}ms",
-    //         current_ms, timer.time_expired
-    //     );
-    // }
+    loop {
+        // Pop one expired timer (if any) while holding the lock, then wake it after releasing.
+        let popped = {
+            let mut timers = TIMERS.borrow_mut();
+            if DEBUG_TIMER {
+                let len = timers.len();
+                if let Some(head) = timers.peek() {
+                    let head_tid = head
+                        .task
+                        .borrow_mut()
+                        .res
+                        .as_ref()
+                        .map(|r| r.tid)
+                        .unwrap_or(usize::MAX);
+                    crate::println!(
+                        "[timer] check now_ms={} timers_len={} head_tid={} head_expire_ms={}",
+                        current_ms,
+                        len,
+                        head_tid,
+                        head.time_expired
+                    );
+                } else {
+                    crate::println!("[timer] check now_ms={} timers_len=0", current_ms);
+                }
+            }
+            if let Some(head) = timers.peek() {
+                let expire = head.time_expired;
+                let head_tid = head
+                    .task
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                if DEBUG_TIMER {
+                    let status = if expire <= current_ms { "ready" } else { "future" };
+                    crate::println!(
+                        "[timer] peek tid={} expire_ms={} now_ms={} status={}",
+                        head_tid,
+                        expire,
+                        current_ms,
+                        status
+                    );
+                }
+                if expire <= current_ms {
+                    Some((head_tid, timers.pop().unwrap()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
 
-    while let Some(timer) = timers.peek() {
-        if timer.time_expired <= current_ms {
-            // println!(
-            //     "[check_timer] Waking up task at {}ms (expired at {}ms)",
-            //     current_ms, timer.time_expired
-            // );
-            let task = timer.task.clone();
-            timers.pop();
-            wakeup_task(task);
-        } else {
-            break;
+        if let Some((head_tid, timer)) = popped {
+            let pid = timer
+                .task
+                .process
+                .upgrade()
+                .map(|p: alloc::sync::Arc<ProcessControlBlock>| p.getpid())
+                .unwrap_or(usize::MAX);
+            if DEBUG_TIMER {
+                crate::println!(
+                    "[timer] pop pid={} tid={} expire_ms={} now_ms={}",
+                    pid,
+                    head_tid,
+                    timer.time_expired,
+                    current_ms
+                );
+                crate::println!(
+                    "[timer] wake pid={} tid={} expire_ms={} now_ms={}",
+                    pid,
+                    head_tid,
+                    timer.time_expired,
+                    current_ms
+                );
+            }
+            wakeup_task(timer.task.clone());
+            // Continue looping in case more timers have expired at the same tick.
+            continue;
         }
+        break;
     }
 }

@@ -89,8 +89,10 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
     let stval = stval::read();
     match scause.cause() {
         Trap::Interrupt(TIME_INTERVAL) => {
+            // crate::println!("[trap_from_kernel] Timer interrupt, checking timers...");
             set_next_trigger();
             check_timer();
+            // crate::println!("[trap_from_kernel] Done checking timers");
             // do not schedule, just return to kernel
         }
         _ => {
@@ -142,8 +144,19 @@ pub fn trap_handler() {
                 (cx.x[17], [cx.x[10], cx.x[11], cx.x[12]])
             }; // cx is dropped here, releasing the borrow
 
-            // Enable S-mode interrupt so timer can fire during syscall
-            enable_supervisor_interrupt();
+            // NOTE: Do NOT enable interrupts during syscall execution.
+            // This is because syscalls may acquire spin::Mutex locks (e.g., heap allocator,
+            // VirtIO block device), and if a timer interrupt fires while a lock is held,
+            // the interrupt handler might try to allocate memory (via wakeup_task -> add_task
+            // -> VecDeque::push_back), causing a deadlock.
+            //
+            // The tradeoff is that long-running syscalls (like exec) won't be preemptible,
+            // but this is acceptable for correctness.
+            //
+            // If you need preemptible syscalls, consider:
+            // 1. Using interrupt-safe allocators
+            // 2. Avoiding memory allocation in interrupt handlers
+            // 3. Selectively enabling interrupts only for syscalls that don't use spin::Mutex
 
             // Execute syscall (may change memory layout via exec)
             let result = syscall(syscall_id, args);

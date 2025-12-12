@@ -3,10 +3,11 @@ mod virtio_blk;
 pub use virtio_blk::VirtIOBlock;
 
 use alloc::sync::Arc;
-use easy_fs::BlockDevice;
+use ext4_fs::BlockDevice;
 use lazy_static::*;
 
 use crate::println;
+
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 
 lazy_static! {

@@ -8,6 +8,7 @@ extern crate alloc;
 use crate::{fs::list_apps, syscall::syscall};
 mod config;
 mod console;
+mod debug_config;
 mod drivers;
 mod fs;
 mod lang_items;
@@ -49,7 +50,6 @@ fn rust_main() {
     trap::init_trap();
     trap::trap::enable_timer_interrupt();
     time::set_next_trigger();
-    fs::init_fs_debuger();
     list_apps();
     task::task_start();
     panic!("shouldn't be here");

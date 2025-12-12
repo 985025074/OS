@@ -83,6 +83,47 @@ debug:KERNEL
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -m 1G \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+
+# ===========================
+# Ext4 Support
+# ===========================
+EXT4_IMG := ../ext4-fs-packer/target/fs.ext4
+
+# Build ext4 image from user apps
+ext4_img: USER_APPS
+	@echo "🔧 Building ext4 filesystem image..."
+	@cd ../ext4-fs-packer && cargo run --release -- \
+		-u ../os/$(APP_DIR) \
+		-t target \
+		-S 64M
+	@echo "✅ Ext4 image created: $(EXT4_IMG)"
+
+# Run with ext4 filesystem
+run_ext4: KERNEL ext4_img
+	@echo "🔍 Running QEMU with ext4 VirtIO block device..."
+	@echo "   ➜ File System Image: $(EXT4_IMG)"
+	qemu-system-riscv64 \
+		-machine virt \
+		-nographic \
+		-bios $(BOOTLOADER) \
+		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+		-m 1G \
+		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+
+# Debug with ext4 filesystem
+debug_ext4: KERNEL ext4_img
+	@echo "🐛 Debugging with ext4 filesystem..."
+	@qemu-system-riscv64 \
+		-machine virt \
+		-nographic \
+		-s -S \
+		-bios $(BOOTLOADER) \
+		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+		-m 1G \
+		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+
 client_gdb:
 	@./elf-gdb \
 		-ex 'file $(KERNEL_ELF)' \
