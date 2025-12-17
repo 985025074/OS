@@ -12,6 +12,10 @@ pub fn syscall_read(_fd: usize, buf: *mut u8, len: usize) -> isize {
                 panic!("sys_read only support len = 1 now!");
             }
             let c = crate::sbi::console_getchar();
+            // SBI returns usize::MAX when no char is available; report 0 bytes read.
+            if c == usize::MAX {
+                return 0;
+            }
             let mut buffers = translated_byte_buffer(get_current_token(), buf, len);
             buffers[0][0] = c as u8;
             1

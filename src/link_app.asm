@@ -121,168 +121,188 @@ app_11_end:
 .section .rodata
 .align 3
 app_12_name:
-    .asciz "init_proc"
+    .asciz "hart_id"
 .align 3
 .section .data
 app_12_start:
-    .incbin "./results/init_proc.bin"
+    .incbin "./results/hart_id.bin"
 .align 3
 app_12_end:
 .section .rodata
 .align 3
 app_13_name:
-    .asciz "mutex_block"
+    .asciz "init_proc"
 .align 3
 .section .data
 app_13_start:
-    .incbin "./results/mutex_block.bin"
+    .incbin "./results/init_proc.bin"
 .align 3
 app_13_end:
 .section .rodata
 .align 3
 app_14_name:
-    .asciz "mutex_spin"
+    .asciz "multicore_test"
 .align 3
 .section .data
 app_14_start:
-    .incbin "./results/mutex_spin.bin"
+    .incbin "./results/multicore_test.bin"
 .align 3
 app_14_end:
 .section .rodata
 .align 3
 app_15_name:
-    .asciz "pipe_test"
+    .asciz "mutex_block"
 .align 3
 .section .data
 app_15_start:
-    .incbin "./results/pipe_test.bin"
+    .incbin "./results/mutex_block.bin"
 .align 3
 app_15_end:
 .section .rodata
 .align 3
 app_16_name:
-    .asciz "producer"
+    .asciz "mutex_spin"
 .align 3
 .section .data
 app_16_start:
-    .incbin "./results/producer.bin"
+    .incbin "./results/mutex_spin.bin"
 .align 3
 app_16_end:
 .section .rodata
 .align 3
 app_17_name:
-    .asciz "semaphore_basic"
+    .asciz "pipe_test"
 .align 3
 .section .data
 app_17_start:
-    .incbin "./results/semaphore_basic.bin"
+    .incbin "./results/pipe_test.bin"
 .align 3
 app_17_end:
 .section .rodata
 .align 3
 app_18_name:
-    .asciz "semaphore_cond"
+    .asciz "producer"
 .align 3
 .section .data
 app_18_start:
-    .incbin "./results/semaphore_cond.bin"
+    .incbin "./results/producer.bin"
 .align 3
 app_18_end:
 .section .rodata
 .align 3
 app_19_name:
-    .asciz "sleep_debug"
+    .asciz "semaphore_basic"
 .align 3
 .section .data
 app_19_start:
-    .incbin "./results/sleep_debug.bin"
+    .incbin "./results/semaphore_basic.bin"
 .align 3
 app_19_end:
 .section .rodata
 .align 3
 app_20_name:
-    .asciz "sleep_simple"
+    .asciz "semaphore_cond"
 .align 3
 .section .data
 app_20_start:
-    .incbin "./results/sleep_simple.bin"
+    .incbin "./results/semaphore_cond.bin"
 .align 3
 app_20_end:
 .section .rodata
 .align 3
 app_21_name:
-    .asciz "sleep_stress"
+    .asciz "sleep_debug"
 .align 3
 .section .data
 app_21_start:
-    .incbin "./results/sleep_stress.bin"
+    .incbin "./results/sleep_debug.bin"
 .align 3
 app_21_end:
 .section .rodata
 .align 3
 app_22_name:
-    .asciz "sleep_test"
+    .asciz "sleep_simple"
 .align 3
 .section .data
 app_22_start:
-    .incbin "./results/sleep_test.bin"
+    .incbin "./results/sleep_simple.bin"
 .align 3
 app_22_end:
 .section .rodata
 .align 3
 app_23_name:
-    .asciz "sync_abc_mutex"
+    .asciz "sleep_stress"
 .align 3
 .section .data
 app_23_start:
-    .incbin "./results/sync_abc_mutex.bin"
+    .incbin "./results/sleep_stress.bin"
 .align 3
 app_23_end:
 .section .rodata
 .align 3
 app_24_name:
-    .asciz "thread"
+    .asciz "sleep_test"
 .align 3
 .section .data
 app_24_start:
-    .incbin "./results/thread.bin"
+    .incbin "./results/sleep_test.bin"
 .align 3
 app_24_end:
 .section .rodata
 .align 3
 app_25_name:
-    .asciz "thread_arg"
+    .asciz "sync_abc_mutex"
 .align 3
 .section .data
 app_25_start:
-    .incbin "./results/thread_arg.bin"
+    .incbin "./results/sync_abc_mutex.bin"
 .align 3
 app_25_end:
 .section .rodata
 .align 3
 app_26_name:
-    .asciz "thread_counter"
+    .asciz "thread"
 .align 3
 .section .data
 app_26_start:
-    .incbin "./results/thread_counter.bin"
+    .incbin "./results/thread.bin"
 .align 3
 app_26_end:
 .section .rodata
 .align 3
 app_27_name:
-    .asciz "thread_lock"
+    .asciz "thread_arg"
 .align 3
 .section .data
 app_27_start:
-    .incbin "./results/thread_lock.bin"
+    .incbin "./results/thread_arg.bin"
 .align 3
 app_27_end:
 .section .rodata
 .align 3
+app_28_name:
+    .asciz "thread_counter"
+.align 3
+.section .data
+app_28_start:
+    .incbin "./results/thread_counter.bin"
+.align 3
+app_28_end:
+.section .rodata
+.align 3
+app_29_name:
+    .asciz "thread_lock"
+.align 3
+.section .data
+app_29_start:
+    .incbin "./results/thread_lock.bin"
+.align 3
+app_29_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 28
+    .quad 30
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -367,3 +387,9 @@ num_user_apps:
     .quad app_27_start
     .quad app_27_end
     .quad app_27_name
+    .quad app_28_start
+    .quad app_28_end
+    .quad app_28_name
+    .quad app_29_start
+    .quad app_29_end
+    .quad app_29_name

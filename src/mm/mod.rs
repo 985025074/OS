@@ -12,12 +12,26 @@ mod heap_allocator;
 mod memory_set;
 mod page_table;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::println;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use address::{StepByOne, VPNRange};
 use alloc::vec::Vec;
 pub use frame_allocator::{FrameTracker, frame_alloc, frame_dealloc};
 pub use memory_set::kernel_token;
+/// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
+static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
+pub fn activate_kernel_space() {
+    let cached = KERNEL_SATP.load(Ordering::SeqCst);
+    if cached != 0 {
+        memory_set::activate_token(cached);
+    } else {
+        let token = memory_set::kernel_token();
+        KERNEL_SATP.store(token, Ordering::SeqCst);
+        memory_set::activate_token(token);
+    }
+}
 pub use memory_set::remap_test;
 pub use memory_set::{KERNEL_SPACE, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable};
@@ -85,5 +99,6 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     println!("[kernel] frame allocator initialized.");
     KERNEL_SPACE.borrow_mut().activate();
+    KERNEL_SATP.store(kernel_token(), Ordering::SeqCst);
     println!("[kernel] kernel space activated.");
 }

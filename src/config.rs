@@ -8,6 +8,8 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 pub const TRAP_CONTEXT: usize = TRAMPOLINE - PAGE_SIZE;
+pub const MAX_HARTS: usize = 4;
+pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
 /// Return (bottom, top) of a kernel stack in kernel space. Bottom is smaller while top is bigger.
 /// and we use top - xx to push data...
 pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {

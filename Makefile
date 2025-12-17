@@ -5,9 +5,19 @@ APP_DIR = ./results
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := kernel_$(MODE).bin
 DISASM_TMP := target/$(TARGET)/$(MODE)/asm
-BOOTLOADER := ../bootloader/rustsbi-qemu.bin
 FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
 KERNEL_ENTRY_PA = 0x80200000
+SMP ?= 4
+MEM ?= 1G
+DISK_IMG ?=
+# Optional OpenSBI fw_dynamic for HSM-enabled boot
+FW_DYNAMIC ?=../firmware/fw_dynamic.bin
+# Only append the extra virtio disk if the file exists
+ifneq (,$(wildcard $(DISK_IMG)))
+DISK_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+else
+DISK_ARGS :=
+endif
 # ===========================
 # VirtIO Support Check
 # ===========================
@@ -62,12 +72,18 @@ run: KERNEL
 	echo "pwd is $(shell pwd)"
 	qemu-system-riscv64 \
 		-machine virt \
+		-kernel $(KERNEL_ELF) \
+		-m $(MEM) \
+		-smp $(SMP) \
 		-nographic \
-		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-m 1G \
+		-bios default \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-device virtio-net-device,netdev=net \
+		-netdev user,id=net \
+		-rtc base=utc \
+		$(DISK_ARGS)
 
 
 
@@ -77,10 +93,12 @@ test:KERNEL
 debug:KERNEL
 	@qemu-system-riscv64 \
 		-machine virt \
+		-kernel $(KERNEL_ELF) \
 		-nographic \
 		-s -S \
-		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -m 1G \
+		-bios default \
+		-m $(MEM) \
+		-smp $(SMP) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
@@ -104,23 +122,48 @@ run_ext4: KERNEL ext4_img
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
 	qemu-system-riscv64 \
 		-machine virt \
+		-kernel $(KERNEL_ELF) \
+		-m $(MEM) \
+		-smp $(SMP) \
 		-nographic \
-		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-m 1G \
+		-bios default \
 		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-device virtio-net-device,netdev=net \
+		-netdev user,id=net \
+		-rtc base=utc \
+		$(DISK_ARGS)
+run_ext4_hsm: KERNEL ext4_img
+	@echo "🔍 Running QEMU with ext4 VirtIO block device..."
+	@echo "   ➜ File System Image: $(EXT4_IMG)"
+	@test -f $(FW_DYNAMIC) || (echo "❌ fw_dynamic not found at $(FW_DYNAMIC). Set FW_DYNAMIC=path/to/fw_dynamic.bin"; exit 1)
+	qemu-system-riscv64 \
+		-machine virt \
+		-kernel $(KERNEL_ELF) \
+		-m $(MEM) \
+		-smp $(SMP) \
+		-nographic \
+		-bios $(FW_DYNAMIC) \
+		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-device virtio-net-device,netdev=net \
+		-netdev user,id=net \
+		-rtc base=utc \
+		$(DISK_ARGS)
 
 # Debug with ext4 filesystem
 debug_ext4: KERNEL ext4_img
 	@echo "🐛 Debugging with ext4 filesystem..."
 	@qemu-system-riscv64 \
 		-machine virt \
+		-kernel $(KERNEL_ELF) \
 		-nographic \
 		-s -S \
-		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-m 1G \
+		-bios default \
+		-m $(MEM) \
+		-smp $(SMP) \
 		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
@@ -130,4 +173,3 @@ client_gdb:
 		-ex 'set arch riscv:rv64' \
 		-ex 'target remote localhost:1234'
 		-ex 'display/10i $pc' 
-

@@ -8,6 +8,7 @@ mod flow;
 mod mutex;
 mod process;
 mod semaphore;
+mod smp;
 mod signal;
 mod thread;
 const SYSCALL_READ: usize = 63;
@@ -41,6 +42,7 @@ const SYSCALL_CONDVAR_CREATE: usize = 1030;
 const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
 const SYSCALL_SLEEP: usize = 101;
+const SYSCALL_GET_HARTID: usize = 998;
 
 pub fn syscall(id: usize, args: [usize; 3]) -> isize {
     // println!(
@@ -86,6 +88,7 @@ pub fn syscall(id: usize, args: [usize; 3]) -> isize {
         SYSCALL_CONDVAR_CREATE => condvar::sys_condvar_create(),
         SYSCALL_CONDVAR_SIGNAL => condvar::sys_condvar_signal(args[0]),
         SYSCALL_CONDVAR_WAIT => condvar::sys_condvar_wait(args[0], args[1]),
+        SYSCALL_GET_HARTID => smp::sys_get_hartid(),
 
         _ => {
             panic!(

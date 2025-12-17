@@ -473,6 +473,13 @@ bitflags! {
 pub fn kernel_token() -> usize {
     KERNEL_SPACE.borrow().token()
 }
+
+pub fn activate_token(token: usize) {
+    unsafe {
+        satp::write(Satp::from_bits(token));
+        asm!("sfence.vma");
+    }
+}
 #[allow(unused)]
 pub fn remap_test() {
     let mut kernel_space = KERNEL_SPACE.borrow_mut();
