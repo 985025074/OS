@@ -1,4 +1,5 @@
 use crate::{
+    config::MAX_HARTS,
     println,
     sbi::shutdown,
     task::{
@@ -12,6 +13,7 @@ use crate::{
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
     },
+    trap::init_trap,
     utils::RefCellSafe,
 };
 
@@ -42,7 +44,7 @@ impl Processor {
     }
 }
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
-    let processor = PROCESSOR.borrow();
+    let processor = local_processor().borrow();
     let task = processor.current();
     drop(processor);
     task
@@ -93,13 +95,13 @@ pub fn current_process_has_child(pid_or_negative: isize, exit_code: &mut i32) ->
 }
 
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    let mut processor = PROCESSOR.borrow_mut();
+    let mut processor = local_processor().borrow_mut();
     let task = processor.take_current_task();
     drop(processor);
     task
 }
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
-    let mut processor = PROCESSOR.borrow_mut();
+    let mut processor = local_processor().borrow_mut();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
     drop(processor);
     // println!(
@@ -115,6 +117,8 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 }
 pub fn idle_task() {
     loop {
+        // Ensure kernel-mode traps use the kernel handler (sscratch points to trap_from_kernel)
+        init_trap();
         // Disable interrupts while accessing TASK_MANAGER to prevent
         // timer interrupt from calling check_timer -> wakeup_task -> add_task
         // while we hold the TASK_MANAGER lock in fetch_task
@@ -123,7 +127,7 @@ pub fn idle_task() {
         }
 
         if let Some(task) = fetch_task() {
-            let mut processor = PROCESSOR.borrow_mut();
+            let mut processor = local_processor().borrow_mut();
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
@@ -169,8 +173,27 @@ pub fn idle_task() {
         }
     }
 }
+
+fn hart_id() -> usize {
+    let mut id: usize;
+    unsafe {
+        core::arch::asm!("mv {}, tp", out(reg) id);
+    }
+    id
+}
+
+fn local_processor() -> &'static RefCellSafe<Processor> {
+    let id = hart_id();
+    if id >= MAX_HARTS {
+        panic!("hart id {} exceeds MAX_HARTS={}", id, MAX_HARTS);
+    }
+    &PROCESSORS[id]
+}
+
 lazy_static! {
-    pub static ref PROCESSOR: RefCellSafe<Processor> = RefCellSafe::new(Processor::new());
+    pub static ref PROCESSORS: Vec<RefCellSafe<Processor>> = (0..MAX_HARTS)
+        .map(|_| unsafe { RefCellSafe::new(Processor::new()) })
+        .collect();
 }
 
 pub fn go_to_first_task() -> ! {

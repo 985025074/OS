@@ -2,7 +2,7 @@ use core::arch::asm;
 
 use crate::config::TRAMPOLINE;
 use crate::task::block_sleep::check_timer;
-use crate::task::processor::{PROCESSOR, exit_current_and_run_next, suspend_current_and_run_next};
+use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
 // use crate::task::signal::{check_if_current_signals_error, handle_signals};
 use crate::time::set_next_trigger;
 use crate::{println, trap::context::TrapContext};
@@ -84,7 +84,7 @@ fn disable_supervisor_interrupt() {
 }
 
 #[unsafe(no_mangle)]
-pub fn trap_from_kernel(_trap_cx: &TrapContext) {
+pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let scause = scause::read();
     let stval = stval::read();
     match scause.cause() {
@@ -94,6 +94,30 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
             check_timer();
             // crate::println!("[trap_from_kernel] Done checking timers");
             // do not schedule, just return to kernel
+        }
+        Trap::Interrupt(_) => {
+            // Clear possible software interrupt and ignore others
+            unsafe { riscv::register::sip::clear_ssoft() };
+        }
+        Trap::Exception(BREAKPOINT) => {
+            // Skip the ebreak
+            trap_cx.sepc += 2;
+        }
+        Trap::Exception(ILLEGAL_INSTRUCTION) => {
+            panic!(
+                "Illegal instruction in kernel: sepc = {:#x}, stval = {:#x}",
+                trap_cx.sepc, stval
+            );
+        }
+        Trap::Exception(INSTRUCTION_PAGE_FAULT)
+        | Trap::Exception(LOAD_PAGE_FAULT)
+        | Trap::Exception(STORE_PAGE_FAULT) => {
+            panic!(
+                "Kernel page fault: cause = {:?}, sepc = {:#x}, stval = {:#x}",
+                scause.cause(),
+                trap_cx.sepc,
+                stval
+            );
         }
         _ => {
             panic!(
@@ -106,9 +130,7 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
 }
 // todo : avoid cloning here..
 fn get_trap_context() -> &'static mut TrapContext {
-    let processor = PROCESSOR.borrow();
-    let now_task_block = processor.current().unwrap();
-    drop(processor);
+    let now_task_block = crate::task::processor::current_task().unwrap();
     let now_task_block_inner = now_task_block.borrow_mut();
     let trap_cx_ppn = now_task_block_inner.trap_cx_ppn;
     // IMPORTANT: Drop the borrow before returning the reference
@@ -120,9 +142,7 @@ fn get_trap_context() -> &'static mut TrapContext {
     trap_cx_ppn.get_mut()
 }
 pub fn get_current_token() -> usize {
-    let processor = PROCESSOR.borrow();
-    let now_task_block = processor.current().unwrap();
-    drop(processor);
+    let now_task_block = crate::task::processor::current_task().unwrap();
     let process = now_task_block.process.upgrade().unwrap();
     let process_inner = process.borrow_mut();
     process_inner.memory_set.token()

@@ -2,7 +2,6 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefMut;
 
 use super::mutex::Mutex;
 use crate::fs::{File, Stdin, Stdout};
@@ -16,12 +15,13 @@ use crate::task::signal::{SignalActions, SignalFlags};
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
-use crate::utils::{RecycleAllocator, RefCellSafe};
+use crate::utils::RecycleAllocator;
+use spin::{Mutex as SpinMutex, MutexGuard};
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
     // mutable
-    inner: RefCellSafe<ProcessControlBlockInner>,
+    inner: SpinMutex<ProcessControlBlockInner>,
 }
 
 // 进程控制块
@@ -80,8 +80,8 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
-    pub fn borrow_mut(&self) -> RefMut<'_, ProcessControlBlockInner> {
-        self.inner.borrow_mut()
+    pub fn borrow_mut(&self) -> MutexGuard<'_, ProcessControlBlockInner> {
+        self.inner.lock()
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -91,32 +91,30 @@ impl ProcessControlBlock {
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
-            inner: unsafe {
-                RefCellSafe::new(ProcessControlBlockInner {
-                    is_zombie: false,
-                    memory_set,
-                    parent: None,
-                    children: Vec::new(),
-                    exit_code: 0,
-                    fd_table: vec![
-                        // 0 -> stdin
-                        Some(Arc::new(Stdin)),
-                        // 1 -> stdout
-                        Some(Arc::new(Stdout)),
-                        // 2 -> stderr
-                        Some(Arc::new(Stdout)),
-                    ],
-                    signals: SignalFlags::empty(),
-                    signals_actions: SignalActions::default(),
-                    signals_masks: SignalFlags::empty(),
-                    handling_signal: -1,
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                })
-            },
+            inner: SpinMutex::new(ProcessControlBlockInner {
+                is_zombie: false,
+                memory_set,
+                parent: None,
+                children: Vec::new(),
+                exit_code: 0,
+                fd_table: vec![
+                    // 0 -> stdin
+                    Some(Arc::new(Stdin)),
+                    // 1 -> stdout
+                    Some(Arc::new(Stdout)),
+                    // 2 -> stderr
+                    Some(Arc::new(Stdout)),
+                ],
+                signals: SignalFlags::empty(),
+                signals_actions: SignalActions::default(),
+                signals_masks: SignalFlags::empty(),
+                handling_signal: -1,
+                tasks: Vec::new(),
+                task_res_allocator: RecycleAllocator::new(),
+                mutex_list: Vec::new(),
+                semaphore_list: Vec::new(),
+                condvar_list: Vec::new(),
+            }),
         });
         // new只会被主线程调用?,反正这里我们要手动创建一个 Task线程
         // NOTE: Pass false for alloc_user_res because from_elf has already
@@ -228,26 +226,24 @@ impl ProcessControlBlock {
         // create child process pcb
         let child = Arc::new(Self {
             pid,
-            inner: unsafe {
-                RefCellSafe::new(ProcessControlBlockInner {
-                    is_zombie: false,
-                    memory_set,
-                    parent: Some(Arc::downgrade(self)),
-                    children: Vec::new(),
-                    exit_code: 0,
-                    fd_table: new_fd_table,
-                    // is right here?
-                    signals: SignalFlags::empty(),
-                    signals_actions: SignalActions::default(),
-                    signals_masks: SignalFlags::empty(),
-                    handling_signal: -1,
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                })
-            },
+            inner: SpinMutex::new(ProcessControlBlockInner {
+                is_zombie: false,
+                memory_set,
+                parent: Some(Arc::downgrade(self)),
+                children: Vec::new(),
+                exit_code: 0,
+                fd_table: new_fd_table,
+                // is right here?
+                signals: SignalFlags::empty(),
+                signals_actions: SignalActions::default(),
+                signals_masks: SignalFlags::empty(),
+                handling_signal: -1,
+                tasks: Vec::new(),
+                task_res_allocator: RecycleAllocator::new(),
+                mutex_list: Vec::new(),
+                semaphore_list: Vec::new(),
+                condvar_list: Vec::new(),
+            }),
         });
         // add child
         parent.children.push(Arc::clone(&child));

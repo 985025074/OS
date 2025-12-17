@@ -49,3 +49,7 @@ pub fn task_start() {
     task_init();
     go_to_first_task();
 }
+/// Start scheduler on secondary harts without re-initializing initproc.
+pub fn task_start_secondary() -> ! {
+    go_to_first_task();
+}

@@ -56,13 +56,13 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     // Activate the page table built by the boot hart so we can safely run in S-mode.
     mm::activate_kernel_space();
     trap::init_trap();
+    trap::trap::enable_timer_interrupt();
+    time::set_next_trigger();
     println!(
-        "[kernel] secondary hart {} online (dtb_pa={:#x}), parking...",
+        "[kernel] secondary hart {} online (dtb_pa={:#x}), entering scheduler...",
         hart_id, dtb_pa
     );
-    loop {
-        unsafe { core::arch::asm!("wfi"); }
-    }
+    task::task_start_secondary();
 }
 
 #[unsafe(no_mangle)]

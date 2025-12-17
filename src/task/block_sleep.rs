@@ -4,9 +4,9 @@ use core::{cmp::Ordering, time};
 use crate::{
     task::{processor::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
-    utils::RefCellSafe,
 };
 use lazy_static::*;
+use spin::Mutex;
 
 use alloc::{collections::BinaryHeap, sync::Arc};
 
@@ -45,8 +45,7 @@ impl Ord for TimeWrap {
 }
 
 lazy_static! {
-    pub static ref TIMERS: RefCellSafe<BinaryHeap<TimeWrap>> =
-        unsafe { RefCellSafe::new(BinaryHeap::<TimeWrap>::new()) };
+    pub static ref TIMERS: Mutex<BinaryHeap<TimeWrap>> = Mutex::new(BinaryHeap::<TimeWrap>::new());
 }
 
 pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
@@ -66,7 +65,7 @@ pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
             timer.time_expired
         );
     }
-    TIMERS.borrow_mut().push(timer);
+    TIMERS.lock().push(timer);
 }
 
 pub fn check_timer() {
@@ -75,7 +74,7 @@ pub fn check_timer() {
     loop {
         // Pop one expired timer (if any) while holding the lock, then wake it after releasing.
         let popped = {
-            let mut timers = TIMERS.borrow_mut();
+            let mut timers = TIMERS.lock();
             if DEBUG_TIMER {
                 let len = timers.len();
                 if let Some(head) = timers.peek() {

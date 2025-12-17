@@ -7,7 +7,7 @@ use crate::debug_config::DEBUG_SCHED;
 use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
-use crate::utils::RefCellSafe;
+use spin::Mutex;
 
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
@@ -96,17 +96,16 @@ impl TaskManager {
 }
 
 lazy_static! {
-    pub static ref TASK_MANAGER: RefCellSafe<TaskManager> =
-        unsafe { RefCellSafe::new(TaskManager::new()) };
-    pub static ref PID2PCB: RefCellSafe<BTreeMap<usize, Arc<ProcessControlBlock>>> =
-        unsafe { RefCellSafe::new(BTreeMap::new()) };
+    pub static ref TASK_MANAGER: Mutex<TaskManager> = Mutex::new(TaskManager::new());
+    pub static ref PID2PCB: Mutex<BTreeMap<usize, Arc<ProcessControlBlock>>> =
+        Mutex::new(BTreeMap::new());
 }
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
     // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
     let prev_sie = riscv::register::sstatus::read().sie();
     unsafe { riscv::register::sstatus::clear_sie() };
-    TASK_MANAGER.borrow_mut().add(task);
+    TASK_MANAGER.lock().add(task);
     if prev_sie {
         unsafe { riscv::register::sstatus::set_sie() };
     }
@@ -122,7 +121,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
 pub fn remove_task(task: Arc<TaskControlBlock>) {
     let prev_sie = riscv::register::sstatus::read().sie();
     unsafe { riscv::register::sstatus::clear_sie() };
-    TASK_MANAGER.borrow_mut().remove(task);
+    TASK_MANAGER.lock().remove(task);
     if prev_sie {
         unsafe { riscv::register::sstatus::set_sie() };
     }
@@ -131,7 +130,7 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let prev_sie = riscv::register::sstatus::read().sie();
     unsafe { riscv::register::sstatus::clear_sie() };
-    let t = TASK_MANAGER.borrow_mut().fetch();
+    let t = TASK_MANAGER.lock().fetch();
     if prev_sie {
         unsafe { riscv::register::sstatus::set_sie() };
     }
@@ -139,23 +138,23 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
-    let map = PID2PCB.borrow_mut();
+    let map = PID2PCB.lock();
     map.get(&pid).map(Arc::clone)
 }
 
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
-    PID2PCB.borrow_mut().insert(pid, process);
+    PID2PCB.lock().insert(pid, process);
 }
 
 pub fn remove_from_pid2process(pid: usize) {
-    let mut map = PID2PCB.borrow_mut();
+    let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
         panic!("cannot find pid {} in pid2task!", pid);
     }
 }
 
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
-    let mut timers = TIMERS.borrow_mut();
+    let mut timers = TIMERS.lock();
     let mut temp = BinaryHeap::<TimeWrap>::new();
     for condvar in timers.drain() {
         if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
