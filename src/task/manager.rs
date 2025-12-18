@@ -63,7 +63,29 @@ impl TaskManager {
         }
     }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        let t = self.ready_queue.pop_front();
+        // Skip stale entries: under SMP, bugs or races can temporarily leave
+        // non-ready tasks (Blocked/Running) in the ready queue. Never schedule them.
+        let mut t = None;
+        while let Some(candidate) = self.ready_queue.pop_front() {
+            let status = candidate.borrow_mut().task_status;
+            if status == TaskStatus::Ready {
+                t = Some(candidate);
+                break;
+            } else if DEBUG_SCHED {
+                let tid = candidate
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                crate::println!(
+                    "[sched] drop stale entry tid={} status={:?} remaining_len={}",
+                    tid,
+                    status,
+                    self.ready_queue.len()
+                );
+            }
+        }
         if DEBUG_SCHED {
             let hart = {
                 let h: usize;
@@ -83,8 +105,6 @@ impl TaskManager {
                     tid,
                     self.ready_queue.len()
                 );
-            } else {
-                crate::println!("[sched] hart={} fetch_task -> None (len=0)", hart);
             }
         }
         t
@@ -119,9 +139,28 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     let mut task_inner = task.borrow_mut();
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
-    add_task(task);
+    // SMP safety: never enqueue a task that is still running on some hart.
+    // This can happen if a wakeup races with the task's "enqueue self then block"
+    // path (e.g. BlockMutex/Semaphore/Condvar). Enqueueing a still-running task
+    // can schedule it concurrently on another hart and corrupt its kernel stack.
+    match task_inner.task_status {
+        TaskStatus::Blocked => {
+            task_inner.task_status = TaskStatus::Ready;
+            drop(task_inner);
+            add_task(task);
+        }
+        TaskStatus::BlockedPending => {
+            task_inner.task_status = TaskStatus::ReadyPending;
+            // Do not enqueue yet; the blocking hart will enqueue safely after switching to idle.
+        }
+        TaskStatus::Running => {
+            task_inner.task_status = TaskStatus::ReadyPending;
+            // Do not enqueue here; the task will yield/block and enqueue itself safely.
+        }
+        TaskStatus::Ready | TaskStatus::ReadyPending => {
+            // Already ready; likely already enqueued.
+        }
+    }
 }
 
 pub fn remove_task(task: Arc<TaskControlBlock>) {

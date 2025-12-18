@@ -38,8 +38,6 @@ alltraps:
     ld t0, 34*8(sp)
     # load trap_handler into t1
     ld t1, 36*8(sp)
-    # set kernel tp to current hart id (avoids stale tp after task migration)
-    csrr tp, mhartid
     # move to kernel_sp
     ld sp, 35*8(sp)
     # switch to kernel space
@@ -60,6 +58,11 @@ restore:
     ld t0, 32*8(sp)
     ld t1, 33*8(sp)
     csrw sstatus, t0
+    # Do not allow interrupts in S-mode before `sret`.
+    # Even if the saved TrapContext has SIE=1 (copied from kernel), we must
+    # keep interrupts disabled while still executing in trampoline with user satp.
+    li t2, 2
+    csrc sstatus, t2
     csrw sepc, t1
     # restore general purpose registers except x0/sp/tp
     ld x1, 1*8(sp)
@@ -69,9 +72,8 @@ restore:
         LOAD_GP %n
         .set n, n+1
     .endr
-    # save kernel tp and restore user tp
+    # save kernel tp; keep tp as hart id in user mode (no TLS support)
     sd tp, 37*8(sp)
-    ld tp, 4*8(sp)
     # back to user stack
     ld sp, 2*8(sp)
     sret

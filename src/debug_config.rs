@@ -7,4 +7,4 @@
 pub const DEBUG_TIMER: bool = false;
 
 /// Verbose scheduler debug logs (ready queue push/pop, idle switches).
-pub const DEBUG_SCHED: bool = true;
+pub const DEBUG_SCHED: bool = false;

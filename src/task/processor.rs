@@ -14,22 +14,32 @@ use crate::{
         task_context::{self, TaskContext},
     },
     trap::init_trap,
-    utils::RefCellSafe,
 };
 
 use alloc::{sync::Arc, task, vec::Vec};
 use lazy_static::lazy_static;
+use spin::Mutex;
 
 use crate::debug_config::DEBUG_SCHED;
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
     idle_task_context: TaskContext,
+    /// A task that should be enqueued after we have switched back to idle.
+    ///
+    /// This avoids a race where we would put the current task back into the global
+    /// ready queue *before* context switching away, letting another hart run the
+    /// same task concurrently on the same kernel stack.
+    pending_ready: Option<Arc<TaskControlBlock>>,
+    /// A task that is transitioning into Blocked state; finalized after switching to idle.
+    pending_blocked: Option<Arc<TaskControlBlock>>,
 }
 impl Processor {
     pub fn new() -> Self {
         Self {
             now_task_block: None,
             idle_task_context: TaskContext::new(),
+            pending_ready: None,
+            pending_blocked: None,
         }
     }
     pub fn get_idle_task_ptr(&mut self) -> *mut TaskContext {
@@ -42,9 +52,25 @@ impl Processor {
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.now_task_block.as_ref().cloned()
     }
+
+    pub fn take_pending_ready(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.pending_ready.take()
+    }
+
+    pub fn set_pending_ready(&mut self, task: Arc<TaskControlBlock>) {
+        self.pending_ready = Some(task);
+    }
+
+    pub fn take_pending_blocked(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.pending_blocked.take()
+    }
+
+    pub fn set_pending_blocked(&mut self, task: Arc<TaskControlBlock>) {
+        self.pending_blocked = Some(task);
+    }
 }
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
-    let processor = local_processor().borrow();
+    let processor = local_processor().lock();
     let task = processor.current();
     drop(processor);
     task
@@ -95,13 +121,13 @@ pub fn current_process_has_child(pid_or_negative: isize, exit_code: &mut i32) ->
 }
 
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    let mut processor = local_processor().borrow_mut();
+    let mut processor = local_processor().lock();
     let task = processor.take_current_task();
     drop(processor);
     task
 }
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
-    let mut processor = local_processor().borrow_mut();
+    let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
     drop(processor);
     // println!(
@@ -126,8 +152,51 @@ pub fn idle_task() {
             riscv::register::sstatus::clear_sie();
         }
 
+        // Finalize a task that just switched away and wanted to become Blocked.
+        // If it was woken in the transition window, it will be ReadyPending instead.
+        if let Some(task) = local_processor().lock().take_pending_blocked() {
+            let mut should_enqueue = false;
+            {
+                let mut inner = task.borrow_mut();
+                match inner.task_status {
+                    TaskStatus::BlockedPending => {
+                        inner.task_status = TaskStatus::Blocked;
+                    }
+                    TaskStatus::ReadyPending => {
+                        inner.task_status = TaskStatus::Ready;
+                        should_enqueue = true;
+                    }
+                    TaskStatus::Blocked => {
+                        // Already finalized; nothing to do.
+                    }
+                    TaskStatus::Ready => {
+                        should_enqueue = true;
+                    }
+                    TaskStatus::Running => {
+                        panic!("task cannot be Running in pending_blocked");
+                    }
+                }
+            }
+            if should_enqueue {
+                add_task(task);
+            }
+        }
+
+        // Enqueue a task that was marked runnable by this hart *before* it switched
+        // to idle. This makes the task visible to other harts only after we are
+        // no longer running on its kernel stack.
+        if let Some(task) = local_processor().lock().take_pending_ready() {
+            // This task is no longer running on this hart's kernel stack, so it is now safe
+            // to mark it Ready and make it visible to other harts.
+            {
+                let mut inner = task.borrow_mut();
+                inner.task_status = TaskStatus::Ready;
+            }
+            add_task(task);
+        }
+
         if let Some(task) = fetch_task() {
-            let mut processor = local_processor().borrow_mut();
+            let mut processor = local_processor().lock();
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
@@ -192,7 +261,7 @@ fn hart_id() -> usize {
     id
 }
 
-fn local_processor() -> &'static RefCellSafe<Processor> {
+fn local_processor() -> &'static Mutex<Processor> {
     let id = hart_id();
     if id >= MAX_HARTS {
         panic!("hart id {} exceeds MAX_HARTS={}", id, MAX_HARTS);
@@ -201,8 +270,8 @@ fn local_processor() -> &'static RefCellSafe<Processor> {
 }
 
 lazy_static! {
-    pub static ref PROCESSORS: Vec<RefCellSafe<Processor>> = (0..MAX_HARTS)
-        .map(|_| unsafe { RefCellSafe::new(Processor::new()) })
+    pub static ref PROCESSORS: Vec<Mutex<Processor>> = (0..MAX_HARTS)
+        .map(|_| Mutex::new(Processor::new()))
         .collect();
 }
 
@@ -217,13 +286,18 @@ pub fn suspend_current_and_run_next() {
     // ---- access current TCB exclusively
     let mut task_inner = task.borrow_mut();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
+    // Runnable, but do NOT mark Ready until we've switched back to idle.
+    task_inner.task_status = TaskStatus::ReadyPending;
     drop(task_inner);
     // ---- release current PCB
 
-    // push back to ready queue.
-    add_task(task);
+    // Do NOT push back to the global ready queue here: another hart could pick
+    // it up and run it while we are still executing on this task's kernel stack
+    // inside the trap handler/syscall path.
+    //
+    // Instead, stash it on this hart and let `idle_task()` enqueue it after the
+    // context switch completes.
+    local_processor().lock().set_pending_ready(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }
@@ -242,13 +316,33 @@ pub fn block_current_and_run_next() {
         );
     }
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Blocked;
+    // Transition to BlockedPending while still running on this hart. This closes
+    // the window where another hart could wake us and enqueue us before we actually
+    // context-switch away.
+    let should_block = match task_inner.task_status {
+        TaskStatus::Blocked | TaskStatus::BlockedPending => {
+            task_inner.task_status = TaskStatus::BlockedPending;
+            true
+        }
+        TaskStatus::Running => {
+            task_inner.task_status = TaskStatus::BlockedPending;
+            true
+        }
+        TaskStatus::Ready | TaskStatus::ReadyPending => {
+            task_inner.task_status = TaskStatus::ReadyPending;
+            false
+        }
+    };
     drop(task_inner);
     // ---- release current PCB
 
-    // we dont need to add block task here;
-    // add_task(task);
+    if should_block {
+        local_processor().lock().set_pending_blocked(task);
+    } else {
+        // Behave like a yield: enqueue after we have switched back to idle
+        // to avoid "run on two harts".
+        local_processor().lock().set_pending_ready(task);
+    }
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }
@@ -262,10 +356,31 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
             task_inner.task_status
         );
     }
-    assert_eq!(task_inner.task_status, TaskStatus::Blocked);
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
-    add_task(task);
+    // Important for SMP: do NOT enqueue a task that is still running on some hart.
+    // That can lead to the same TCB being scheduled on two harts concurrently,
+    // corrupting its kernel stack and context.
+    //
+    // If the task is in the middle of "about to block" (still Running), we only
+    // mark it Ready; the blocking path will notice and yield, then enqueue it
+    // after switching back to idle (via pending_ready).
+    match task_inner.task_status {
+        TaskStatus::Blocked => {
+            task_inner.task_status = TaskStatus::Ready;
+            drop(task_inner);
+            add_task(task);
+        }
+        TaskStatus::BlockedPending => {
+            // Woken while still on another hart's kernel stack: mark runnable but do not enqueue.
+            task_inner.task_status = TaskStatus::ReadyPending;
+        }
+        TaskStatus::Running => {
+            task_inner.task_status = TaskStatus::ReadyPending;
+            // Do not enqueue here.
+        }
+        TaskStatus::Ready | TaskStatus::ReadyPending => {
+            // Already ready (possibly already enqueued); nothing to do.
+        }
+    }
 }
 
 /// pid of usertests app in make run TEST=1
@@ -277,8 +392,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
 
-    // Extract tid in a separate scope to release the borrow early
-    let tid = {
+    // Extract tid in a separate scope to release the borrow early.
+    // Also drop TaskUserRes *after* releasing the TCB lock to avoid deadlocks with sys_waittid.
+    let (tid, res_to_drop) = {
         let mut task_inner = task.borrow_mut();
         task_inner.exit_code = Some(exit_code);
         let tid = task_inner
@@ -286,10 +402,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             .as_ref()
             .expect("task user resource should exist before exit")
             .tid;
-        // drop 自动释放
-        task_inner.res = None;
-        tid
-    }; // task_inner is dropped here, releasing the borrow
+        let res_to_drop = task_inner.res.take();
+        (tid, res_to_drop)
+    }; // task_inner dropped here
+    drop(res_to_drop);
 
     crate::println!(
         "[exit] pid={} tid={} exit_code={}",
@@ -329,6 +445,18 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         process_inner.is_zombie = true;
         // record exit code of main process
         process_inner.exit_code = exit_code;
+
+        // Wake parent waiters (waitpid). Do it after marking zombie, and without holding the
+        // parent PCB lock while waking tasks.
+        if let Some(parent) = process_inner.parent.as_ref().and_then(|p| p.upgrade()) {
+            let waiters = {
+                let mut parent_inner = parent.borrow_mut();
+                parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
+            };
+            for waiter in waiters {
+                wakeup_task(waiter);
+            }
+        }
 
         // 非 系统进程,执行之前的 将 子进程 交给 initproc 进程  过程
         {

@@ -6,14 +6,13 @@ use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE};
 use crate::println;
-use crate::utils::RefCellSafe;
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::arch::asm;
 use lazy_static::*;
 use riscv::register::satp::{self, Satp};
+use spin::Mutex;
 unsafe extern "C" {
     safe fn stext();
     safe fn etext();
@@ -29,8 +28,7 @@ unsafe extern "C" {
 
 lazy_static! {
     /// a memory set instance through lazy_static! managing kernel space
-    pub static ref KERNEL_SPACE: Arc<RefCellSafe<MemorySet>> =
-        Arc::new(unsafe { RefCellSafe::new(MemorySet::new_kernel()) });
+    pub static ref KERNEL_SPACE: Mutex<MemorySet> = Mutex::new(MemorySet::new_kernel());
 }
 
 /// memory set structure, controls virtual-memory space
@@ -471,7 +469,7 @@ bitflags! {
     }
 }
 pub fn kernel_token() -> usize {
-    KERNEL_SPACE.borrow().token()
+    KERNEL_SPACE.lock().token()
 }
 
 pub fn activate_token(token: usize) {
@@ -482,7 +480,7 @@ pub fn activate_token(token: usize) {
 }
 #[allow(unused)]
 pub fn remap_test() {
-    let mut kernel_space = KERNEL_SPACE.borrow_mut();
+    let mut kernel_space = KERNEL_SPACE.lock();
     let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
     let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
     let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();

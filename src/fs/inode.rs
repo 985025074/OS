@@ -4,40 +4,24 @@ use super::File;
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::println;
-use crate::utils::RefCellSafe;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
 use ext4_fs::{Ext4FileSystem, Inode};
 use lazy_static::*;
-use riscv::register::sstatus;
+use spin::Mutex;
 
-/// Disable interrupts and return previous state
-fn disable_interrupts() -> bool {
-    let was_enabled = sstatus::read().sie();
-    unsafe {
-        sstatus::clear_sie();
-    }
-    was_enabled
-}
-
-/// Restore interrupt state
-fn restore_interrupts(was_enabled: bool) {
-    if was_enabled {
-        unsafe {
-            sstatus::set_sie();
-        }
-    }
-}
+/// Serialize ext4 operations across harts.
+static EXT4_LOCK: Mutex<()> = Mutex::new(());
 
 /// A wrapper around a filesystem inode to implement File trait
 pub struct OSInode {
     readable: bool,
     writable: bool,
-    inner: RefCellSafe<OSInodeInner>,
+    inner: Mutex<OSInodeInner>,
 }
 
-/// The OS inode inner in 'RefCellSafe'
+/// The OS inode inner
 pub struct OSInodeInner {
     offset: usize,
     inode: Arc<Inode>,
@@ -49,16 +33,14 @@ impl OSInode {
         Self {
             readable,
             writable,
-            inner: unsafe { RefCellSafe::new(OSInodeInner { offset: 0, inode }) },
+            inner: Mutex::new(OSInodeInner { offset: 0, inode }),
         }
     }
 
     /// Read all data inside an inode into vector
     pub fn read_all(&self) -> Vec<u8> {
-        // Disable interrupts while accessing ext4
-        let int_enabled = disable_interrupts();
-
-        let mut inner = self.inner.borrow_mut();
+        let _fs_guard = EXT4_LOCK.lock();
+        let mut inner = self.inner.lock();
         let file_size = inner.inode.size() as usize;
 
         let mut buffer = [0u8; 4096]; // Use larger buffer for ext4 (4K blocks)
@@ -79,8 +61,6 @@ impl OSInode {
             }
         }
 
-        drop(inner);
-        restore_interrupts(int_enabled);
         v
     }
 }
@@ -100,6 +80,7 @@ lazy_static! {
 
 /// List all files in the filesystem
 pub fn list_apps() {
+    let _fs_guard = EXT4_LOCK.lock();
     println!("/**** APPS ****");
     for app in USER_INODE.ls() {
         println!("{}", app);
@@ -147,8 +128,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         return None;
     }
 
-    // Disable interrupts while accessing ext4 to prevent deadlock with spin::Mutex
-    let int_enabled = disable_interrupts();
+    let _fs_guard = EXT4_LOCK.lock();
 
     // Look for file in /user directory
     let inode = USER_INODE.find(name).or_else(|| {
@@ -156,9 +136,6 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         let name_with_bin = alloc::format!("{}.bin", name);
         USER_INODE.find(&name_with_bin)
     });
-
-    // Restore interrupts
-    restore_interrupts(int_enabled);
 
     inode.map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
 }
@@ -173,10 +150,8 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
-        // Disable interrupts while accessing ext4
-        let int_enabled = disable_interrupts();
-
-        let mut inner = self.inner.borrow_mut();
+        let _fs_guard = EXT4_LOCK.lock();
+        let mut inner = self.inner.lock();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
             let read_size = inner.inode.read_at(inner.offset, *slice);
@@ -186,8 +161,6 @@ impl File for OSInode {
             inner.offset += read_size;
             total_read_size += read_size;
         }
-        drop(inner);
-        restore_interrupts(int_enabled);
         total_read_size
     }
 

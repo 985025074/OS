@@ -14,12 +14,20 @@ use crate::debug_config::DEBUG_TIMER;
 use crate::task::process_block::ProcessControlBlock;
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
+    pub tid: usize,
     pub time_expired: usize,
 }
 impl TimeWrap {
     fn new(task: Arc<TaskControlBlock>, time_wait: usize) -> Self {
+        let tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
         Self {
             task,
+            tid,
             time_expired: get_time_ms() + time_wait,
         }
     }
@@ -51,16 +59,9 @@ lazy_static! {
 pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
     let timer = TimeWrap::new(task, time_wait);
     if DEBUG_TIMER {
-        let tid = timer
-            .task
-            .borrow_mut()
-            .res
-            .as_ref()
-            .map(|r| r.tid)
-            .unwrap_or(usize::MAX);
         crate::println!(
             "[timer] add tid={} wait_ms={} expire_ms={}",
-            tid,
+            timer.tid,
             time_wait,
             timer.time_expired
         );
@@ -78,18 +79,11 @@ pub fn check_timer() {
             if DEBUG_TIMER {
                 let len = timers.len();
                 if let Some(head) = timers.peek() {
-                    let head_tid = head
-                        .task
-                        .borrow_mut()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(usize::MAX);
                     crate::println!(
                         "[timer] check now_ms={} timers_len={} head_tid={} head_expire_ms={}",
                         current_ms,
                         len,
-                        head_tid,
+                        head.tid,
                         head.time_expired
                     );
                 } else {
@@ -98,25 +92,18 @@ pub fn check_timer() {
             }
             if let Some(head) = timers.peek() {
                 let expire = head.time_expired;
-                let head_tid = head
-                    .task
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .map(|r| r.tid)
-                    .unwrap_or(usize::MAX);
                 if DEBUG_TIMER {
                     let status = if expire <= current_ms { "ready" } else { "future" };
                     crate::println!(
                         "[timer] peek tid={} expire_ms={} now_ms={} status={}",
-                        head_tid,
+                        head.tid,
                         expire,
                         current_ms,
                         status
                     );
                 }
                 if expire <= current_ms {
-                    Some((head_tid, timers.pop().unwrap()))
+                    Some(timers.pop().unwrap())
                 } else {
                     None
                 }
@@ -125,7 +112,7 @@ pub fn check_timer() {
             }
         };
 
-        if let Some((head_tid, timer)) = popped {
+        if let Some(timer) = popped {
             let pid = timer
                 .task
                 .process
@@ -136,14 +123,14 @@ pub fn check_timer() {
                 crate::println!(
                     "[timer] pop pid={} tid={} expire_ms={} now_ms={}",
                     pid,
-                    head_tid,
+                    timer.tid,
                     timer.time_expired,
                     current_ms
                 );
                 crate::println!(
                     "[timer] wake pid={} tid={} expire_ms={} now_ms={}",
                     pid,
-                    head_tid,
+                    timer.tid,
                     timer.time_expired,
                     current_ms
                 );

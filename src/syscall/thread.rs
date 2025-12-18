@@ -18,33 +18,45 @@ use crate::debug_config::DEBUG_TIMER;
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
+    let ustack_base = task.borrow_mut().res.as_ref().unwrap().ustack_base;
     // create a new thread
     let new_task = Arc::new(TaskControlBlock::new(
         Arc::clone(&process),
-        task.borrow_mut().res.as_ref().unwrap().ustack_base,
+        ustack_base,
         true,
     ));
+
+    // Fully initialize the new thread (PCB slot + TrapContext) *before* enqueueing it.
+    // Otherwise, another hart might schedule it and jump to user with an uninitialized TrapContext.
+    let new_task_tid = {
+        let mut new_task_inner = new_task.borrow_mut();
+        let new_task_res = new_task_inner.res.as_ref().unwrap();
+        let new_task_tid = new_task_res.tid;
+
+        // add new thread to current process
+        {
+            let mut process_inner = process.borrow_mut();
+            let tasks = &mut process_inner.tasks;
+            while tasks.len() < new_task_tid + 1 {
+                tasks.push(None);
+            }
+            tasks[new_task_tid] = Some(Arc::clone(&new_task));
+        }
+
+        let new_task_trap_cx = new_task_inner.get_trap_cx();
+        *new_task_trap_cx = TrapContext::app_init_context(
+            entry,
+            new_task_res.ustack_top(),
+            kernel_token(),
+            new_task.kstack.get_top(),
+            trap_handler as usize,
+        );
+        (*new_task_trap_cx).x[10] = arg;
+        new_task_tid
+    };
+
     // add new task to scheduler
     add_task(Arc::clone(&new_task));
-    let new_task_inner = new_task.borrow_mut();
-    let new_task_res = new_task_inner.res.as_ref().unwrap();
-    let new_task_tid = new_task_res.tid;
-    let mut process_inner = process.borrow_mut();
-    // add new thread to current process
-    let tasks = &mut process_inner.tasks;
-    while tasks.len() < new_task_tid + 1 {
-        tasks.push(None);
-    }
-    tasks[new_task_tid] = Some(Arc::clone(&new_task));
-    let new_task_trap_cx = new_task_inner.get_trap_cx();
-    *new_task_trap_cx = TrapContext::app_init_context(
-        entry,
-        new_task_res.ustack_top(),
-        kernel_token(),
-        new_task.kstack.get_top(),
-        trap_handler as usize,
-    );
-    (*new_task_trap_cx).x[10] = arg;
     new_task_tid as isize
 }
 
@@ -64,25 +76,43 @@ pub fn sys_gettid() -> isize {
 pub fn sys_waittid(tid: usize) -> i32 {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let task_inner = task.borrow_mut();
-    let mut process_inner = process.borrow_mut();
+
+    // Get current tid without holding locks across other borrows.
+    let self_tid = {
+        let task_inner = task.borrow_mut();
+        task_inner.res.as_ref().unwrap().tid
+    };
     // a thread cannot wait for itself
-    if task_inner.res.as_ref().unwrap().tid == tid {
+    if self_tid == tid {
         return -1;
     }
-    let mut exit_code: Option<i32> = None;
-    let waited_task = process_inner.tasks[tid].as_ref();
-    if let Some(waited_task) = waited_task {
-        if let Some(waited_exit_code) = waited_task.borrow_mut().exit_code {
-            exit_code = Some(waited_exit_code);
-        }
-    } else {
-        // waited thread does not exist
-        return -1;
-    }
+
+    // Clone the waited task Arc while holding the PCB lock, then drop the PCB lock
+    // before borrowing the waited task's TCB. This avoids a deadlock where:
+    // - waiter holds PCB lock and wants waited TCB lock
+    // - waited thread holds its TCB lock and drops TaskUserRes (needs PCB lock)
+    let waited_task = {
+        let process_inner = process.borrow_mut();
+        process_inner.tasks.get(tid).and_then(|t| t.as_ref()).cloned()
+    };
+    let waited_task = match waited_task {
+        Some(t) => t,
+        None => return -1, // waited thread does not exist
+    };
+
+    // Check exit code by locking only the waited task TCB.
+    let exit_code = waited_task.borrow_mut().exit_code;
     if let Some(exit_code) = exit_code {
-        // dealloc the exited thread
-        process_inner.tasks[tid] = None;
+        // Dealloc the exited thread entry in PCB.
+        let mut process_inner = process.borrow_mut();
+        if let Some(slot) = process_inner.tasks.get_mut(tid) {
+            // Only clear if it still points to the same TCB.
+            if let Some(existing) = slot.as_ref() {
+                if Arc::ptr_eq(existing, &waited_task) {
+                    *slot = None;
+                }
+            }
+        }
         exit_code
     } else {
         // waited thread has not exited
@@ -113,11 +143,10 @@ pub fn sys_sleep(time_ms: usize) -> isize {
         );
     }
     // Prevent "lost wakeup": make the enqueue+block sequence atomic w.r.t. timer interrupts.
-    // If an interrupt fires after we enqueue but before we are actually blocked, the wakeup can
-    // be lost and the task may sleep forever.
-    unsafe {
-        riscv::register::sstatus::clear_sie();
-    }
+    // Keep interrupts disabled in kernel code paths; restore the previous SIE state after we
+    // resume from sleep. (The trap return path controls interrupt enabling for user mode.)
+    let prev_sie = riscv::register::sstatus::read().sie();
+    unsafe { riscv::register::sstatus::clear_sie() };
     {
         let mut inner = task.borrow_mut();
         inner.task_status = crate::task::task_block::TaskStatus::Blocked;
@@ -125,8 +154,8 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     add_timer(Arc::clone(&task), time_ms);
     // This will take the task out of PROCESSOR and switch to idle, letting the scheduler run.
     block_current_and_run_next();
-    unsafe {
-        riscv::register::sstatus::set_sie();
+    if prev_sie {
+        unsafe { riscv::register::sstatus::set_sie() };
     }
     if DEBUG_TIMER {
         let tid = task

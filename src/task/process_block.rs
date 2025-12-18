@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -45,6 +46,8 @@ pub struct ProcessControlBlockInner {
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Tasks waiting in `waitpid(-1/...)` for this process's children.
+    pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl ProcessControlBlockInner {
@@ -114,6 +117,7 @@ impl ProcessControlBlock {
                 mutex_list: Vec::new(),
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
+                wait_queue: VecDeque::new(),
             }),
         });
         // new只会被主线程调用?,反正这里我们要手动创建一个 Task线程
@@ -133,7 +137,7 @@ impl ProcessControlBlock {
         *trap_cx = TrapContext::app_init_context(
             entry_point,
             ustack_top,
-            KERNEL_SPACE.borrow_mut().token(),
+            KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
         );
@@ -204,7 +208,7 @@ impl ProcessControlBlock {
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
-            KERNEL_SPACE.borrow_mut().token(),
+            KERNEL_SPACE.lock().token(),
             task.kstack.get_top(),
             trap_handler as usize,
         );
@@ -250,6 +254,7 @@ impl ProcessControlBlock {
                 mutex_list: Vec::new(),
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
+                wait_queue: VecDeque::new(),
             }),
         });
         // add child

@@ -92,6 +92,16 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let stval = stval::read();
     match scause.cause() {
         Trap::Interrupt(TIME_INTERVAL) => {
+            let hart = {
+                let h: usize;
+                unsafe { asm!("mv {}, tp", out(reg) h) };
+                h
+            };
+            static KERNEL_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
+            let kcnt = KERNEL_TIMER_LOG.fetch_add(1, Ordering::SeqCst);
+            if kcnt < 4 {
+                println!("[trap_from_kernel] hart={} timer interrupt", hart);
+            }
             // crate::println!("[trap_from_kernel] Timer interrupt, checking timers...");
             set_next_trigger();
             check_timer();

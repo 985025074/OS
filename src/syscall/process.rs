@@ -5,8 +5,9 @@ use crate::{
     fs::{OpenFlags, open_file},
     mm::{translated_single_address, translated_str},
     task::processor::{
-        current_process, current_process_has_child, current_task, suspend_current_and_run_next,
+        current_process, current_task,
     },
+    task::processor::block_current_and_run_next,
     trap::get_current_token,
 };
 pub fn syscall_fork() -> isize {
@@ -22,8 +23,35 @@ pub fn syscall_fork() -> isize {
 pub fn syscall_waitpid(pid_or_ne: isize, exit_code_ptr: *mut i32) -> isize {
     let mut temp_exit_code: i32 = 0;
     loop {
-        if let Some(pid) = current_process_has_child(pid_or_ne, &mut temp_exit_code) {
-            // no child process
+        // Check children status under the current process lock.
+        let cur_process = current_process();
+        let (has_any_child, zombie_pid) = {
+            let mut process_inner = cur_process.borrow_mut();
+            if process_inner.children.is_empty() {
+                (false, None)
+            } else {
+                // Find a zombie child that matches pid_or_ne, remove it from the children list,
+                // and return its pid/exit_code.
+                let mut found: Option<(usize, usize)> = None; // (index, pid)
+                for (index, child) in process_inner.children.iter().enumerate() {
+                    let child_inner = child.borrow_mut();
+                    let matches = pid_or_ne == -1 || child.pid.0 == pid_or_ne as usize;
+                    if matches && child_inner.is_zombie {
+                        temp_exit_code = child_inner.exit_code;
+                        found = Some((index, child.pid.0));
+                        break;
+                    }
+                }
+                if let Some((index, pid)) = found {
+                    process_inner.children.remove(index);
+                    (true, Some(pid))
+                } else {
+                    (true, None)
+                }
+            }
+        };
+
+        if let Some(pid) = zombie_pid {
             let target_ptr =
                 translated_single_address(get_current_token(), exit_code_ptr as *const u8);
             unsafe {
@@ -31,9 +59,21 @@ pub fn syscall_waitpid(pid_or_ne: isize, exit_code_ptr: *mut i32) -> isize {
             }
 
             return pid as isize;
-        } else {
-            suspend_current_and_run_next();
         }
+
+        // No child at all.
+        if !has_any_child {
+            return -1;
+        }
+
+        // Block until a child exits, to avoid spinning in kernel with interrupts disabled.
+        // The child exit path will wake tasks in this wait queue.
+        {
+            let task = current_task().unwrap();
+            let mut process_inner = cur_process.borrow_mut();
+            process_inner.wait_queue.push_back(task);
+        }
+        block_current_and_run_next();
     }
 }
 

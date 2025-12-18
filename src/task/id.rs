@@ -4,28 +4,27 @@ use crate::{
     config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
     mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
     task::{lazy_static, process_block::ProcessControlBlock},
-    utils::{RecycleAllocator, RefCellSafe},
+    utils::RecycleAllocator,
 };
+use spin::Mutex;
 
 lazy_static! {
-    static ref PID_ALLOCATOR: RefCellSafe<RecycleAllocator> =
-        unsafe { RefCellSafe::new(RecycleAllocator::new()) };
+    static ref PID_ALLOCATOR: Mutex<RecycleAllocator> = Mutex::new(RecycleAllocator::new());
 }
 
 pub struct PidHandle(pub usize);
 
 pub fn pid_alloc() -> PidHandle {
-    PidHandle(PID_ALLOCATOR.borrow_mut().alloc())
+    PidHandle(PID_ALLOCATOR.lock().alloc())
 }
 
 impl Drop for PidHandle {
     fn drop(&mut self) {
-        PID_ALLOCATOR.borrow_mut().dealloc(self.0);
+        PID_ALLOCATOR.lock().dealloc(self.0);
     }
 }
 lazy_static! {
-    static ref KSTACK_ALLOCATOR: RefCellSafe<RecycleAllocator> =
-        unsafe { RefCellSafe::new(RecycleAllocator::new()) };
+    static ref KSTACK_ALLOCATOR: Mutex<RecycleAllocator> = Mutex::new(RecycleAllocator::new());
 }
 pub struct KernelStack(pub usize);
 
@@ -43,9 +42,9 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 }
 
 pub fn kstack_alloc() -> KernelStack {
-    let kstack_id = KSTACK_ALLOCATOR.borrow_mut().alloc();
+    let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    KERNEL_SPACE.borrow_mut().insert_framed_area(
+    KERNEL_SPACE.lock().insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
@@ -59,9 +58,9 @@ impl Drop for KernelStack {
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         let kernel_stack_top_va: VirtAddr = kernel_stack_top.into();
         KERNEL_SPACE
-            .borrow_mut()
+            .lock()
             .remove_area(kernel_stack_bottom_va.into(), kernel_stack_top_va.into());
-        KSTACK_ALLOCATOR.borrow_mut().dealloc(self.0);
+        KSTACK_ALLOCATOR.lock().dealloc(self.0);
     }
 }
 

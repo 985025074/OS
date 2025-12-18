@@ -1,16 +1,16 @@
 use alloc::{collections::vec_deque::VecDeque, sync::Arc};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     task::{
         manager::wakeup_task,
         processor::{
             block_current_and_run_next, current_task, suspend_current_and_run_next,
-            take_current_task,
         },
         task_block::TaskControlBlock,
     },
-    utils::RefCellSafe,
 };
+use spin::Mutex as SpinLock;
 
 // this is needed for multi thread(or error )
 pub trait Mutex: Sync + Send {
@@ -21,7 +21,7 @@ pub trait Mutex: Sync + Send {
 // because things in arc cant be changed we need inner part here.
 
 pub struct BlockMutex {
-    inner: RefCellSafe<BlockMutexInner>,
+    inner: SpinLock<BlockMutexInner>,
 }
 pub struct BlockMutexInner {
     is_blocked: bool,
@@ -31,7 +31,7 @@ pub struct BlockMutexInner {
 impl BlockMutex {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: RefCellSafe::new(BlockMutexInner {
+            inner: SpinLock::new(BlockMutexInner {
                 is_blocked: false,
                 wait_queue: VecDeque::new(),
             }),
@@ -40,7 +40,7 @@ impl BlockMutex {
 }
 impl Mutex for BlockMutex {
     fn lock(&self) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         match inner.is_blocked {
             false => {
                 inner.is_blocked = true;
@@ -54,7 +54,7 @@ impl Mutex for BlockMutex {
         }
     }
     fn unlock(&self) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         assert!(inner.is_blocked);
         if let Some(task) = inner.wait_queue.pop_front() {
             // everytime we just wake one
@@ -66,32 +66,28 @@ impl Mutex for BlockMutex {
 }
 
 pub struct SpinMutex {
-    locked: RefCellSafe<bool>,
+    locked: AtomicBool,
 }
 impl SpinMutex {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            locked: RefCellSafe::new(false),
+            locked: AtomicBool::new(false),
         })
     }
 }
 impl Mutex for SpinMutex {
     fn lock(&self) {
         loop {
-            let mut locked = self.locked.borrow_mut();
-            if *locked {
-                drop(locked);
+            if self.locked.swap(true, Ordering::Acquire) {
                 suspend_current_and_run_next();
                 continue;
             } else {
-                *locked = true;
                 return;
             }
         }
     }
 
     fn unlock(&self) {
-        let mut locked = self.locked.borrow_mut();
-        *locked = false;
+        self.locked.store(false, Ordering::Release);
     }
 }

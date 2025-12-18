@@ -13,7 +13,6 @@ use crate::{
         task_context::TaskContext,
     },
     trap::{context::TrapContext, trap::restore},
-    utils::RefCellSafe,
 };
 use alloc::sync::Arc;
 use lazy_static::lazy_static;

@@ -80,6 +80,11 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
 
 #[unsafe(no_mangle)]
 fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
+    // Avoid timer interrupts preempting early-boot code that may hold spin::Mutex locks
+    // (e.g., heap allocator, ext4, ready queue). We'll re-enable interrupts in the
+    // scheduler/idle loop and on sret back to user.
+    unsafe { riscv::register::sstatus::clear_sie() };
+
     unsafe extern "C" {
         fn num_user_apps();
     }

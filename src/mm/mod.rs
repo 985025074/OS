@@ -98,7 +98,7 @@ pub fn init() {
     println!("[kernel] heap initialized.");
     frame_allocator::init_frame_allocator();
     println!("[kernel] frame allocator initialized.");
-    KERNEL_SPACE.borrow_mut().activate();
+    KERNEL_SPACE.lock().activate();
     KERNEL_SATP.store(kernel_token(), Ordering::SeqCst);
     println!("[kernel] kernel space activated.");
 }

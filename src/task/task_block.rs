@@ -340,7 +340,7 @@
 // // }
 
 use alloc::sync::{Arc, Weak};
-use core::cell::RefMut;
+use spin::{Mutex, MutexGuard};
 
 use crate::{
     mm::PhysPageNum,
@@ -350,7 +350,6 @@ use crate::{
         task_context::TaskContext,
     },
     trap::{context::TrapContext, trap_handler, trap_return},
-    utils::RefCellSafe,
 };
 
 pub struct TaskControlBlock {
@@ -359,12 +358,12 @@ pub struct TaskControlBlock {
     pub process: Weak<ProcessControlBlock>,
     pub kstack: KernelStack,
     // mutable
-    inner: RefCellSafe<TaskControlBlockInner>,
+    inner: Mutex<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
-    pub fn borrow_mut(&self) -> RefMut<'_, TaskControlBlockInner> {
-        self.inner.borrow_mut()
+    pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
+        self.inner.lock()
     }
 
     pub fn get_user_token(&self) -> usize {
@@ -415,15 +414,13 @@ impl TaskControlBlock {
         Self {
             process: Arc::downgrade(&process),
             kstack,
-            inner: unsafe {
-                RefCellSafe::new(TaskControlBlockInner {
-                    res: Some(res),
-                    trap_cx_ppn,
-                    task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
-                    task_status: TaskStatus::Ready,
-                    exit_code: None,
-                })
-            },
+            inner: Mutex::new(TaskControlBlockInner {
+                res: Some(res),
+                trap_cx_ppn,
+                task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
+                task_status: TaskStatus::Ready,
+                exit_code: None,
+            }),
         }
     }
 }
@@ -431,6 +428,16 @@ impl TaskControlBlock {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum TaskStatus {
     Ready,
+    /// Runnable, but must not be enqueued yet (still running on some hart's kernel stack).
+    ///
+    /// Used to avoid scheduling the same task concurrently on multiple harts when a wakeup
+    /// races with the task's "enqueue self then block" path.
+    ReadyPending,
     Running,
+    /// About to block, but has not switched away from this hart's kernel stack yet.
+    ///
+    /// A wakeup racing in this window must not enqueue the task, otherwise it can
+    /// be scheduled concurrently on another hart.
+    BlockedPending,
     Blocked,
 }
