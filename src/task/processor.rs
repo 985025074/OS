@@ -117,7 +117,7 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 }
 pub fn idle_task() {
     loop {
-        // Ensure kernel-mode traps use the kernel handler (sscratch points to trap_from_kernel)
+        // Ensure kernel-mode traps use the kernel handler (stvec points to alltraps_k)
         init_trap();
         // Disable interrupts while accessing TASK_MANAGER to prevent
         // timer interrupt from calling check_timer -> wakeup_task -> add_task
@@ -134,7 +134,13 @@ pub fn idle_task() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             if DEBUG_SCHED {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-                crate::println!("[idle] switch to tid={}", tid);
+                crate::println!(
+                    "[idle] hart={} switch to tid={} ra={:#x} sp={:#x}",
+                    hart_id(),
+                    tid,
+                    task_inner.task_cx.ra,
+                    task_inner.task_cx.sp
+                );
             }
             task_inner.task_status = TaskStatus::Running;
 
@@ -144,20 +150,18 @@ pub fn idle_task() {
             // release processor manually
             drop(processor);
 
-            // Re-enable interrupts before switching to the task
-            // The task will run with interrupts enabled
-            unsafe {
-                riscv::register::sstatus::set_sie();
-            }
-
+            // Keep interrupts disabled while resuming kernel context; sret will enable them for user.
             unsafe {
                 switch::switch(
                     idle_task_cx_ptr as *const usize,
                     next_task_cx_ptr as *const usize,
                 );
             }
+            if DEBUG_SCHED {
+                crate::println!("[idle] hart={} switch returned to idle", hart_id());
+            }
         } else {
-            crate::println!("[idle] No tasks, entering wfi...");
+            // crate::println!("[idle] No tasks, entering wfi...");
             // No ready tasks - enable interrupts and wait
             // Use wfi to save power while waiting for timer interrupt
             // Timer interrupt will call check_timer() to wake up sleeping tasks
@@ -168,10 +172,16 @@ pub fn idle_task() {
                 riscv::register::sstatus::set_sie();
                 core::arch::asm!("wfi");
             }
-            crate::println!("[idle] Woke up from wfi");
+            // crate::println!("[idle] Woke up from wfi");
             // Loop back immediately to check for newly ready tasks
         }
     }
+}
+
+// ...existing code...
+#[inline(always)]
+pub fn set_tp(hart_id: usize) {
+    unsafe { core::arch::asm!("mv tp, {}", in(reg) hart_id) };
 }
 
 fn hart_id() -> usize {
@@ -280,6 +290,13 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         task_inner.res = None;
         tid
     }; // task_inner is dropped here, releasing the borrow
+
+    crate::println!(
+        "[exit] pid={} tid={} exit_code={}",
+        process.getpid(),
+        tid,
+        exit_code
+    );
 
     // 已经从current_task拿走了 所以 对于一般的 线程,可以了.
     //  对于主线程,我们需要处理一些 清理工作

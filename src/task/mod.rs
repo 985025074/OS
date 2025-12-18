@@ -41,9 +41,9 @@ lazy_static! {
     };
 }
 pub fn task_init() {
-    //现在这个过程 在new 内部
-    // add_task(INITPROC.clone());
-    INITPROC.clone();
+    // Force INITPROC initialization in release builds.
+    lazy_static::initialize(&INITPROC);
+    crate::println!("[kernel] INITPROC initialized and enqueued");
 }
 pub fn task_start() {
     task_init();

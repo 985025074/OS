@@ -28,6 +28,12 @@ global_asm!(include_str!("link_app.asm"));
 // bootstrap hart marks initialization as done.
 #[unsafe(link_section = ".data")]
 static BOOT_HART_INITED: AtomicBool = AtomicBool::new(false);
+// Secondary harts must not touch .bss-backed globals before the boot hart clears .bss.
+#[unsafe(link_section = ".data")]
+static BOOT_BSS_CLEARED: AtomicBool = AtomicBool::new(false);
+// Secondary harts must not enter the scheduler before the boot hart finishes global init.
+#[unsafe(link_section = ".data")]
+static BOOT_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
 fn clear_bss() {
     unsafe extern "C" {
@@ -53,6 +59,13 @@ fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
 }
 
 fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
+    // Wait until the boot hart clears .bss and completes global initialization.
+    while !BOOT_BSS_CLEARED.load(Ordering::SeqCst) {
+        core::hint::spin_loop();
+    }
+    while !BOOT_GLOBAL_INIT_DONE.load(Ordering::SeqCst) {
+        core::hint::spin_loop();
+    }
     // Activate the page table built by the boot hart so we can safely run in S-mode.
     mm::activate_kernel_space();
     trap::init_trap();
@@ -75,6 +88,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         .is_ok()
     {
         clear_bss();
+        BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(
             "Number of user apps: {}, from adress {}",
@@ -87,6 +101,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         mm::init();
         mm::remap_test();
         println!("[kernel] memory management initialized.");
+        BOOT_GLOBAL_INIT_DONE.store(true, Ordering::SeqCst);
         start_other_harts(hart_id, dtb_pa);
         trap::init_trap();
         trap::trap::enable_timer_interrupt();

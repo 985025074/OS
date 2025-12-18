@@ -1,4 +1,4 @@
-use core::arch::asm;
+use core::{arch::asm, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 use crate::config::TRAMPOLINE;
 use crate::task::block_sleep::check_timer;
@@ -9,10 +9,7 @@ use crate::{println, trap::context::TrapContext};
 pub mod context;
 pub mod trap;
 use crate::syscall::syscall;
-use riscv::{
-    interrupt::Trap,
-    register::{scause, sscratch, sstatus, stval},
-};
+use riscv::{interrupt::Trap, register::{scause, sstatus, stval}};
 
 #[allow(unused)]
 fn log_for_trap_context(context: &TrapContext) {
@@ -39,6 +36,13 @@ const LOAD_PAGE_FAULT: usize = 13;
 const STORE_PAGE_FAULT: usize = 15;
 const TIME_INTERVAL: usize = 5;
 
+/// Log only the first trap_return to see initial user entry.
+static FIRST_TRAP_RETURN_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Count trap_return invocations for debugging.
+static TRAP_RETURN_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Count trap_handler invocations for debugging.
+static TRAP_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 pub fn init_trap() {
     set_kernel_trap_entry();
 }
@@ -50,14 +54,13 @@ fn set_kernel_trap_entry() {
         fn alltraps();
         fn alltraps_k();
     }
-    let alltraps_k_va = alltraps_k as usize - alltraps as usize + TRAMPOLINE;
+    let alltraps_k_va = alltraps_k as usize;
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
             alltraps_k_va,
             riscv::register::stvec::TrapMode::Direct,
         );
         riscv::register::stvec::write(to_write);
-        sscratch::write(trap_from_kernel as usize);
     }
 }
 
@@ -149,6 +152,21 @@ pub fn get_current_token() -> usize {
 }
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
+    let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
+    if idx < 6 {
+        let hart = {
+            let h: usize;
+            unsafe { asm!("mv {}, tp", out(reg) h) };
+            h
+        };
+        println!(
+            "[trap_handler#{}] hart={} scause={:?} stval={:#x}",
+            idx,
+            hart,
+            scause::read().cause(),
+            stval::read()
+        );
+    }
     // now is kernel space
     set_kernel_trap_entry();
     let scause = scause::read();
@@ -229,16 +247,14 @@ fn exception_name(code: usize) -> &'static str {
 }
 
 fn handle_user_exception(code: usize, stval: usize) {
-    {
-        let cx = get_trap_context();
-        println!(
-            "[kernel] Unhandled user trap: {} (code = {}), sepc = {:#x}, stval = {:#x}",
-            exception_name(code),
-            code,
-            cx.sepc,
-            stval
-        );
-    }
+    let cx = get_trap_context();
+    println!(
+        "[user_exn] code={} ({}) sepc={:#x} stval={:#x}",
+        code,
+        exception_name(code),
+        cx.sepc,
+        stval
+    );
     exit_current_and_run_next(-1);
 }
 
@@ -247,6 +263,24 @@ fn handle_user_exception(code: usize, stval: usize) {
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
+    let entered = TRAP_RETURN_COUNT.load(Ordering::SeqCst);
+    if entered < 4 {
+        let hart = {
+            let h: usize;
+            unsafe { asm!("mv {}, tp", out(reg) h) };
+            h
+        };
+        println!(
+            "[trap_return entry#{}] hart={} sp={:#x}",
+            entered,
+            hart,
+            {
+                let s: usize;
+                unsafe { asm!("mv {}, sp", out(reg) s) };
+                s
+            }
+        );
+    }
     // this shouln't be interrupted
     disable_supervisor_interrupt();
     set_user_trap_entry();
@@ -258,6 +292,37 @@ pub fn trap_return() -> ! {
     drop(task_inner);
 
     let user_satp = get_current_token();
+
+    let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
+    if cnt < 4 {
+        let hart = {
+            let h: usize;
+            unsafe { asm!("mv {}, tp", out(reg) h) };
+            h
+        };
+        if !FIRST_TRAP_RETURN_LOGGED.swap(true, Ordering::SeqCst) {
+            let cx = get_trap_context();
+            let tp_kernel: usize;
+            unsafe { asm!("mv {}, tp", out(reg) tp_kernel) };
+            println!(
+                "[trap_return#{}] hart={} trap_cx_ptr={:#x} sepc={:#x} user_satp={:#x} tp={:#x}",
+                cnt,
+                hart,
+                trap_cx_ptr,
+                cx.sepc,
+                user_satp,
+                tp_kernel
+            );
+        } else {
+            println!(
+                "[trap_return#{}] hart={} trap_cx_ptr={:#x} user_satp={:#x}",
+                cnt,
+                hart,
+                trap_cx_ptr,
+                user_satp,
+            );
+        }
+    }
 
     unsafe extern "C" {
         fn alltraps();

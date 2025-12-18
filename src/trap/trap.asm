@@ -18,7 +18,8 @@ alltraps:
     sd x1, 1*8(sp)
     # skip sp(x2), we will save it later
     sd x3, 3*8(sp)
-    # skip tp(x4), application does not use it
+    # save tp(x4) for user-space tls
+    sd x4, 4*8(sp)
     # save x5~x31
     .set n, 5
     .rept 27
@@ -37,6 +38,8 @@ alltraps:
     ld t0, 34*8(sp)
     # load trap_handler into t1
     ld t1, 36*8(sp)
+    # set kernel tp to current hart id (avoids stale tp after task migration)
+    csrr tp, mhartid
     # move to kernel_sp
     ld sp, 35*8(sp)
     # switch to kernel space
@@ -66,13 +69,18 @@ restore:
         LOAD_GP %n
         .set n, n+1
     .endr
+    # save kernel tp and restore user tp
+    sd tp, 37*8(sp)
+    ld tp, 4*8(sp)
     # back to user stack
     ld sp, 2*8(sp)
     sret
 
+    .section .text
     .align 2
 alltraps_k:
-    addi sp, sp, -34*8
+    # Reserve full TrapContext size (38*8) to match Rust TrapContext layout
+    addi sp, sp, -38*8
     sd x1, 1*8(sp)
     sd x3, 3*8(sp)
     .set n, 5
@@ -84,9 +92,13 @@ alltraps_k:
     csrr t1, sepc
     sd t0, 32*8(sp)
     sd t1, 33*8(sp)
+    # Optional: fill kernel_satp/kernel_sp/trap_handler/kernel_tp slots with zeros
+    sd x0, 34*8(sp)
+    sd x0, 35*8(sp)
+    sd x0, 36*8(sp)
+    sd x0, 37*8(sp)
     mv a0, sp
-    csrr t2, sscratch
-    jalr t2
+    call trap_from_kernel
 
 restore_k:
     ld t0, 32*8(sp)
@@ -100,5 +112,6 @@ restore_k:
         LOAD_GP %n
         .set n, n+1
     .endr
-    addi sp, sp, 34*8
+    # Pop the entire TrapContext-sized frame
+    addi sp, sp, 38*8
     sret

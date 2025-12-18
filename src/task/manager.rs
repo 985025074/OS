@@ -65,6 +65,11 @@ impl TaskManager {
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         let t = self.ready_queue.pop_front();
         if DEBUG_SCHED {
+            let hart = {
+                let h: usize;
+                unsafe { core::arch::asm!("mv {}, tp", out(reg) h) };
+                h
+            };
             if let Some(ref task) = t {
                 let tid = task
                     .borrow_mut()
@@ -73,12 +78,13 @@ impl TaskManager {
                     .map(|r| r.tid)
                     .unwrap_or(usize::MAX);
                 crate::println!(
-                    "[sched] fetch_task -> Some(tid={}) remaining_len={}",
+                    "[sched] hart={} fetch_task -> Some(tid={}) remaining_len={}",
+                    hart,
                     tid,
                     self.ready_queue.len()
                 );
             } else {
-                crate::println!("[sched] fetch_task -> None (len=0)");
+                crate::println!("[sched] hart={} fetch_task -> None (len=0)", hart);
             }
         }
         t

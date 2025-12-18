@@ -1,5 +1,6 @@
 //! Implementation of [`TrapContext`]
 
+use core::arch::asm;
 use riscv::register::sstatus::{self, SPP, Sstatus};
 
 #[derive(Clone, Copy)]
@@ -18,6 +19,8 @@ pub struct TrapContext {
     pub kernel_sp: usize,
     /// Addr of trap_handler function
     pub trap_handler: usize,
+    /// Kernel tp (hart id) saved when returning to user
+    pub kernel_tp: usize,
 }
 
 impl TrapContext {
@@ -46,10 +49,18 @@ impl TrapContext {
             kernel_satp,  // addr of page table
             kernel_sp,    // kernel stack
             trap_handler, // addr of trap_handler function
+            kernel_tp: read_tp(),
         };
         cx.set_sp(sp); // app's user stack pointer
         cx // return initial Trap Context of app
     }
+}
+
+#[inline(always)]
+fn read_tp() -> usize {
+    let tp: usize;
+    unsafe { asm!("mv {}, tp", out(reg) tp) };
+    tp
 }
 pub fn push_trap_context_at(dst: usize, cx: &TrapContext) {
     unsafe {

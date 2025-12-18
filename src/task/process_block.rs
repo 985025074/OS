@@ -147,6 +147,13 @@ impl ProcessControlBlock {
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // add main thread to scheduler
+        crate::println!(
+            "[proc] init main thread pid={} tid=0 entry={:#x} ustack_top={:#x} kstack_top={:#x}",
+            process.getpid(),
+            entry_point,
+            ustack_top,
+            kstack_top
+        );
         add_task(task);
         process
     }
