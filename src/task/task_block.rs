@@ -340,6 +340,7 @@
 // // }
 
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
 use crate::{
@@ -357,11 +358,27 @@ pub struct TaskControlBlock {
     // 对于所有的线程,共享一个父进程
     pub process: Weak<ProcessControlBlock>,
     pub kstack: KernelStack,
+    /// The hart id currently running this task, or OFF_CPU if none.
+    pub on_cpu: AtomicUsize,
+    /// Set by a waker if it tried to wake while the task was still on_cpu.
+    pub wakeup_pending: AtomicBool,
     // mutable
     inner: Mutex<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
+    pub const OFF_CPU: usize = usize::MAX;
+
+    pub fn mark_on_cpu(&self, hart_id: usize) {
+        self.on_cpu.store(hart_id, Ordering::Release);
+        // Once running, no wakeup should be pending.
+        self.wakeup_pending.store(false, Ordering::Release);
+    }
+
+    pub fn clear_on_cpu(&self) {
+        self.on_cpu.store(Self::OFF_CPU, Ordering::Release);
+    }
+
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
     }
@@ -414,6 +431,8 @@ impl TaskControlBlock {
         Self {
             process: Arc::downgrade(&process),
             kstack,
+            on_cpu: AtomicUsize::new(Self::OFF_CPU),
+            wakeup_pending: AtomicBool::new(false),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -428,16 +447,6 @@ impl TaskControlBlock {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum TaskStatus {
     Ready,
-    /// Runnable, but must not be enqueued yet (still running on some hart's kernel stack).
-    ///
-    /// Used to avoid scheduling the same task concurrently on multiple harts when a wakeup
-    /// races with the task's "enqueue self then block" path.
-    ReadyPending,
     Running,
-    /// About to block, but has not switched away from this hart's kernel stack yet.
-    ///
-    /// A wakeup racing in this window must not enqueue the task, otherwise it can
-    /// be scheduled concurrently on another hart.
-    BlockedPending,
     Blocked,
 }

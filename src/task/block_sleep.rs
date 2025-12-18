@@ -2,7 +2,7 @@
 use core::{cmp::Ordering, time};
 
 use crate::{
-    task::{processor::wakeup_task, task_block::TaskControlBlock},
+    task::{manager::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
 };
 use lazy_static::*;

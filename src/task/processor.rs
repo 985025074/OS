@@ -7,6 +7,7 @@ use crate::{
         id::TaskUserRes,
         manager::{
             TASK_MANAGER, add_task, fetch_task, remove_from_pid2process, remove_inactive_task,
+            wakeup_task,
         },
         process_block::ProcessControlBlock,
         switch,
@@ -153,31 +154,13 @@ pub fn idle_task() {
         }
 
         // Finalize a task that just switched away and wanted to become Blocked.
-        // If it was woken in the transition window, it will be ReadyPending instead.
         if let Some(task) = local_processor().lock().take_pending_blocked() {
-            let mut should_enqueue = false;
-            {
+            // The task is now off CPU on this hart.
+            task.clear_on_cpu();
+            if task.wakeup_pending.swap(false, core::sync::atomic::Ordering::AcqRel) {
                 let mut inner = task.borrow_mut();
-                match inner.task_status {
-                    TaskStatus::BlockedPending => {
-                        inner.task_status = TaskStatus::Blocked;
-                    }
-                    TaskStatus::ReadyPending => {
-                        inner.task_status = TaskStatus::Ready;
-                        should_enqueue = true;
-                    }
-                    TaskStatus::Blocked => {
-                        // Already finalized; nothing to do.
-                    }
-                    TaskStatus::Ready => {
-                        should_enqueue = true;
-                    }
-                    TaskStatus::Running => {
-                        panic!("task cannot be Running in pending_blocked");
-                    }
-                }
-            }
-            if should_enqueue {
+                inner.task_status = TaskStatus::Ready;
+                drop(inner);
                 add_task(task);
             }
         }
@@ -186,12 +169,7 @@ pub fn idle_task() {
         // to idle. This makes the task visible to other harts only after we are
         // no longer running on its kernel stack.
         if let Some(task) = local_processor().lock().take_pending_ready() {
-            // This task is no longer running on this hart's kernel stack, so it is now safe
-            // to mark it Ready and make it visible to other harts.
-            {
-                let mut inner = task.borrow_mut();
-                inner.task_status = TaskStatus::Ready;
-            }
+            task.clear_on_cpu();
             add_task(task);
         }
 
@@ -211,6 +189,7 @@ pub fn idle_task() {
                     task_inner.task_cx.sp
                 );
             }
+            task.mark_on_cpu(hart_id());
             task_inner.task_status = TaskStatus::Running;
 
             drop(task_inner);
@@ -286,8 +265,7 @@ pub fn suspend_current_and_run_next() {
     // ---- access current TCB exclusively
     let mut task_inner = task.borrow_mut();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Runnable, but do NOT mark Ready until we've switched back to idle.
-    task_inner.task_status = TaskStatus::ReadyPending;
+    task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
     // ---- release current PCB
 
@@ -316,23 +294,13 @@ pub fn block_current_and_run_next() {
         );
     }
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Transition to BlockedPending while still running on this hart. This closes
-    // the window where another hart could wake us and enqueue us before we actually
-    // context-switch away.
     let should_block = match task_inner.task_status {
-        TaskStatus::Blocked | TaskStatus::BlockedPending => {
-            task_inner.task_status = TaskStatus::BlockedPending;
-            true
-        }
-        TaskStatus::Running => {
-            task_inner.task_status = TaskStatus::BlockedPending;
-            true
-        }
-        TaskStatus::Ready | TaskStatus::ReadyPending => {
-            task_inner.task_status = TaskStatus::ReadyPending;
-            false
-        }
+        TaskStatus::Ready => false,
+        TaskStatus::Running | TaskStatus::Blocked => true,
     };
+    if should_block {
+        task_inner.task_status = TaskStatus::Blocked;
+    }
     drop(task_inner);
     // ---- release current PCB
 
@@ -345,42 +313,6 @@ pub fn block_current_and_run_next() {
     }
     // jump to scheduling cycle
     schedule(task_cx_ptr);
-}
-pub fn wakeup_task(task: Arc<TaskControlBlock>) {
-    let mut task_inner = task.borrow_mut();
-    if crate::debug_config::DEBUG_TIMER {
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-        crate::println!(
-            "[wakeup_task] tid={} prev_status={:?}",
-            tid,
-            task_inner.task_status
-        );
-    }
-    // Important for SMP: do NOT enqueue a task that is still running on some hart.
-    // That can lead to the same TCB being scheduled on two harts concurrently,
-    // corrupting its kernel stack and context.
-    //
-    // If the task is in the middle of "about to block" (still Running), we only
-    // mark it Ready; the blocking path will notice and yield, then enqueue it
-    // after switching back to idle (via pending_ready).
-    match task_inner.task_status {
-        TaskStatus::Blocked => {
-            task_inner.task_status = TaskStatus::Ready;
-            drop(task_inner);
-            add_task(task);
-        }
-        TaskStatus::BlockedPending => {
-            // Woken while still on another hart's kernel stack: mark runnable but do not enqueue.
-            task_inner.task_status = TaskStatus::ReadyPending;
-        }
-        TaskStatus::Running => {
-            task_inner.task_status = TaskStatus::ReadyPending;
-            // Do not enqueue here.
-        }
-        TaskStatus::Ready | TaskStatus::ReadyPending => {
-            // Already ready (possibly already enqueued); nothing to do.
-        }
-    }
 }
 
 /// pid of usertests app in make run TEST=1

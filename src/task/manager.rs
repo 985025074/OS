@@ -138,28 +138,19 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
+    // If the task is still on some hart's kernel stack (yield/block in-flight),
+    // never enqueue it. Just record a pending wakeup for that hart to handle
+    // after the context switch completes.
+    if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
+        task.wakeup_pending
+            .store(true, core::sync::atomic::Ordering::Release);
+        return;
+    }
     let mut task_inner = task.borrow_mut();
-    // SMP safety: never enqueue a task that is still running on some hart.
-    // This can happen if a wakeup races with the task's "enqueue self then block"
-    // path (e.g. BlockMutex/Semaphore/Condvar). Enqueueing a still-running task
-    // can schedule it concurrently on another hart and corrupt its kernel stack.
-    match task_inner.task_status {
-        TaskStatus::Blocked => {
-            task_inner.task_status = TaskStatus::Ready;
-            drop(task_inner);
-            add_task(task);
-        }
-        TaskStatus::BlockedPending => {
-            task_inner.task_status = TaskStatus::ReadyPending;
-            // Do not enqueue yet; the blocking hart will enqueue safely after switching to idle.
-        }
-        TaskStatus::Running => {
-            task_inner.task_status = TaskStatus::ReadyPending;
-            // Do not enqueue here; the task will yield/block and enqueue itself safely.
-        }
-        TaskStatus::Ready | TaskStatus::ReadyPending => {
-            // Already ready; likely already enqueued.
-        }
+    if task_inner.task_status == TaskStatus::Blocked {
+        task_inner.task_status = TaskStatus::Ready;
+        drop(task_inner);
+        add_task(task);
     }
 }
 
