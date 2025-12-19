@@ -9,12 +9,10 @@ pub mod debug_config;
 mod drivers;
 mod fs;
 mod lang_items;
+mod log;
 mod mm;
 mod sbi;
 mod syscall;
 mod task;
 mod time;
 mod trap;
-pub fn test() -> i32 {
-    1
-}

@@ -19,10 +19,10 @@ pub fn select_hart_for_new_task() -> usize {
 }
 
 pub fn dump_system_state() {
-    crate::println!("==== [watchdog] system state dump ====");
+    log::warn!("==== [watchdog] system state dump ====");
     let mgr = TASK_MANAGER.lock();
     let total_ready: usize = mgr.ready_queues.iter().map(|q| q.len()).sum();
-    crate::println!(
+    log::warn!(
         "[watchdog] ready_queues_total_len={} per_hart={:?}",
         total_ready,
         mgr.ready_queues.iter().map(|q| q.len()).collect::<alloc::vec::Vec<_>>()
@@ -31,10 +31,10 @@ pub fn dump_system_state() {
     let map = PID2PCB.lock();
     for (pid, pcb) in map.iter() {
         let Some(process_inner) = pcb.try_borrow_mut() else {
-            crate::println!("[watchdog] pid={} pcb_lock=BUSY", pid);
+            log::warn!("[watchdog] pid={} pcb_lock=BUSY", pid);
             continue;
         };
-        crate::println!(
+        log::warn!(
             "[watchdog] pid={} zombie={} tasks_len={} children_len={} sems_len={}",
             pid,
             process_inner.is_zombie,
@@ -57,7 +57,7 @@ pub fn dump_system_state() {
             } else {
                 (None, None)
             };
-            crate::println!(
+            log::warn!(
                 "[watchdog]  tid={} status={:?} on_cpu={} in_rq={} wakeup_pending={} exit_code={:?}",
                 tid,
                 status,
@@ -71,10 +71,10 @@ pub fn dump_system_state() {
         for (sid, sem) in process_inner.semaphore_list.iter().enumerate() {
             let Some(sem) = sem else { continue };
             let Some(guard) = sem.inner.try_lock() else {
-                crate::println!("[watchdog]  sem[{}] lock=BUSY", sid);
+                log::warn!("[watchdog]  sem[{}] lock=BUSY", sid);
                 continue;
             };
-            crate::println!(
+            log::warn!(
                 "[watchdog]  sem[{}] count={} waiters={}",
                 sid,
                 guard.count,
@@ -84,13 +84,13 @@ pub fn dump_system_state() {
         // Mutexes
         for (mid, m) in process_inner.mutex_list.iter().enumerate() {
             if m.is_some() {
-                crate::println!("[watchdog]  mutex[{}]=Some(..)", mid);
+                log::warn!("[watchdog]  mutex[{}]=Some(..)", mid);
             }
         }
         drop(process_inner);
     }
     drop(map);
-    crate::println!("==== [watchdog] end ====");
+    log::warn!("==== [watchdog] end ====");
 }
 
 pub struct TaskManager {
@@ -119,7 +119,7 @@ impl TaskManager {
                 .as_ref()
                 .map(|r| r.tid)
                 .unwrap_or(usize::MAX);
-            crate::println!(
+            log::debug!(
                 "[sched] add_task tid={} hart={} ready_queue_len_before={}",
                 tid,
                 hart_id,
@@ -128,7 +128,7 @@ impl TaskManager {
         }
         self.ready_queues[hart_id].push_back(task);
         if DEBUG_SCHED {
-            crate::println!(
+            log::debug!(
                 "[sched] hart={} ready_queue_len_after={}",
                 hart_id,
                 self.ready_queues[hart_id].len()
@@ -154,7 +154,7 @@ impl TaskManager {
                     .as_ref()
                     .map(|r| r.tid)
                     .unwrap_or(usize::MAX);
-                crate::println!(
+                log::debug!(
                     "[sched] drop stale entry tid={} hart={} status={:?} remaining_len={}",
                     tid,
                     hart_id,
@@ -171,7 +171,7 @@ impl TaskManager {
                     .as_ref()
                     .map(|r| r.tid)
                     .unwrap_or(usize::MAX);
-                crate::println!(
+                log::debug!(
                     "[sched] hart={} fetch_task -> Some(tid={}) remaining_len={}",
                     hart_id,
                     tid,

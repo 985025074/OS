@@ -2,6 +2,7 @@
 
 use log::{self, Level, LevelFilter, Log, Metadata, Record};
 
+use crate::debug_config::{DEBUG_LOG_TEST, DEFAULT_LOG_LEVEL};
 use crate::println;
 /// a simple logger
 struct SimpleLogger;
@@ -42,12 +43,16 @@ pub fn init() {
         Some("info") => LevelFilter::Info,
         Some("debug") => LevelFilter::Debug,
         Some("trace") => LevelFilter::Trace,
-        _ => LevelFilter::Off,
+        Some("off") => LevelFilter::Off,
+        _ => DEFAULT_LOG_LEVEL,
     });
-    // println!(
-    //     "[kernel] logger initialized with LOG={:?}",
-    //     option_env!("LOG")
-    // );
+    if DEBUG_LOG_TEST {
+        println!(
+            "[kernel] logger initialized with LOG={:?} (default={:?})",
+            option_env!("LOG"),
+            DEFAULT_LOG_LEVEL
+        );
+    }
 }
 #[macro_export]
 macro_rules! log_if {

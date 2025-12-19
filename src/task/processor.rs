@@ -189,7 +189,7 @@ pub fn idle_task() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             if DEBUG_SCHED {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-                crate::println!(
+                log::debug!(
                     "[idle] hart={} switch to tid={} ra={:#x} sp={:#x}",
                     hart_id(),
                     tid,
@@ -214,7 +214,7 @@ pub fn idle_task() {
                 );
             }
             if DEBUG_SCHED {
-                crate::println!("[idle] hart={} switch returned to idle", hart_id());
+                log::debug!("[idle] hart={} switch returned to idle", hart_id());
             }
         } else {
             if crate::debug_config::DEBUG_WATCHDOG {
@@ -301,11 +301,7 @@ pub fn block_current_and_run_next() {
     let mut task_inner = task.borrow_mut();
     if crate::debug_config::DEBUG_TIMER {
         let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-        crate::println!(
-            "[block] tid={} status_before={:?}",
-            tid,
-            task_inner.task_status
-        );
+        log::debug!("[block] tid={} status_before={:?}", tid, task_inner.task_status);
     }
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     let should_block = match task_inner.task_status {

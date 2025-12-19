@@ -107,7 +107,9 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         mm::init();
         mm::remap_test();
         log::init();
-        log::test();
+        if debug_config::DEBUG_LOG_TEST {
+            log::test();
+        }
         println!("[kernel] memory management initialized.");
         BOOT_GLOBAL_INIT_DONE.store(true, Ordering::SeqCst);
         start_other_harts(hart_id, dtb_pa);

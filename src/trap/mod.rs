@@ -1,6 +1,7 @@
 use core::{arch::asm, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 use crate::config::TRAMPOLINE;
+use crate::debug_config::DEBUG_TRAP;
 use crate::task::block_sleep::check_timer;
 use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
 // use crate::task::signal::{check_if_current_signals_error, handle_signals};
@@ -100,8 +101,8 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             };
             static KERNEL_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
             let kcnt = KERNEL_TIMER_LOG.fetch_add(1, Ordering::SeqCst);
-            if kcnt < 4 {
-                println!("[trap_from_kernel] hart={} timer interrupt", hart);
+            if DEBUG_TRAP && kcnt < 4 {
+                log::debug!("[trap_from_kernel] hart={} timer interrupt", hart);
             }
             // crate::println!("[trap_from_kernel] Timer interrupt, checking timers...");
             set_next_trigger();
@@ -164,13 +165,13 @@ pub fn get_current_token() -> usize {
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
     let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
-    if idx < 6 {
+    if DEBUG_TRAP && idx < 6 {
         let hart = {
             let h: usize;
             unsafe { asm!("mv {}, tp", out(reg) h) };
             h
         };
-        println!(
+        log::debug!(
             "[trap_handler#{}] hart={} scause={:?} stval={:#x}",
             idx,
             hart,
@@ -263,7 +264,7 @@ fn exception_name(code: usize) -> &'static str {
 
 fn handle_user_exception(code: usize, stval: usize) {
     let cx = get_trap_context();
-    println!(
+    log::warn!(
         "[user_exn] code={} ({}) sepc={:#x} stval={:#x}",
         code,
         exception_name(code),
@@ -279,13 +280,13 @@ fn handle_user_exception(code: usize, stval: usize) {
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
     let entered = TRAP_RETURN_COUNT.load(Ordering::SeqCst);
-    if entered < 4 {
+    if DEBUG_TRAP && entered < 4 {
         let hart = {
             let h: usize;
             unsafe { asm!("mv {}, tp", out(reg) h) };
             h
         };
-        println!(
+        log::debug!(
             "[trap_return entry#{}] hart={} sp={:#x}",
             entered,
             hart,
@@ -309,7 +310,7 @@ pub fn trap_return() -> ! {
     let user_satp = get_current_token();
 
     let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
-    if cnt < 4 {
+    if DEBUG_TRAP && cnt < 4 {
         let hart = {
             let h: usize;
             unsafe { asm!("mv {}, tp", out(reg) h) };
@@ -319,7 +320,7 @@ pub fn trap_return() -> ! {
             let cx = get_trap_context();
             let tp_kernel: usize;
             unsafe { asm!("mv {}, tp", out(reg) tp_kernel) };
-            println!(
+            log::debug!(
                 "[trap_return#{}] hart={} trap_cx_ptr={:#x} sepc={:#x} user_satp={:#x} tp={:#x}",
                 cnt,
                 hart,
@@ -329,7 +330,7 @@ pub fn trap_return() -> ! {
                 tp_kernel
             );
         } else {
-            println!(
+            log::debug!(
                 "[trap_return#{}] hart={} trap_cx_ptr={:#x} user_satp={:#x}",
                 cnt,
                 hart,
