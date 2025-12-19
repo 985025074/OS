@@ -1,41 +1,104 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 
 use crate::{
-    fs::{OpenFlags, open_file},
-    mm::{translated_single_address, translated_str},
-    task::processor::{
-        current_process, current_task,
-    },
-    task::processor::block_current_and_run_next,
+    fs::ROOT_INODE,
+    mm::{translated_mutref, translated_single_address, translated_str},
+    task::processor::{block_current_and_run_next, current_process, current_task},
     trap::get_current_token,
 };
-pub fn syscall_fork() -> isize {
-    let now_process = current_process();
-    let child_task = now_process.fork();
-    let pid = child_task.pid.0;
-    // task has been added into pid2process in fork function
-    // add_task(child_task);
 
-    return pid as isize;
+fn normalize_path(cwd: &str, path: &str) -> String {
+    let mut parts = Vec::new();
+    let absolute = path.starts_with('/');
+    if !absolute {
+        for seg in cwd.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                parts.pop();
+                continue;
+            }
+            parts.push(seg);
+        }
+    }
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            parts.pop();
+            continue;
+        }
+        parts.push(seg);
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    out
 }
 
-pub fn syscall_waitpid(pid_or_ne: isize, exit_code_ptr: *mut i32) -> isize {
+fn read_usize_user(token: usize, ptr: usize) -> usize {
+    let mut raw = [0u8; size_of::<usize>()];
+    for (i, byte) in raw.iter_mut().enumerate() {
+        *byte = *translated_single_address(token, (ptr + i) as *const u8);
+    }
+    usize::from_ne_bytes(raw)
+}
+
+fn load_elf_from_path(token: usize, path: &str) -> Option<Vec<u8>> {
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let abs = normalize_path(&cwd, path);
+
+    if let Some(inode) = ROOT_INODE.find_path(&abs) {
+        if inode.is_file() {
+            return Some(inode.read_all());
+        }
+    }
+    if !abs.ends_with(".bin") {
+        let mut with_bin = abs.clone();
+        with_bin.push_str(".bin");
+        if let Some(inode) = ROOT_INODE.find_path(&with_bin) {
+            if inode.is_file() {
+                return Some(inode.read_all());
+            }
+        }
+    }
+    None
+}
+
+pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+    let process = current_process();
+    let child = process.fork();
+
+    // If userspace provided a stack, set child's user sp to it.
+    if stack != 0 {
+        let task = child.borrow_mut().get_task(0);
+        let mut task_inner = task.borrow_mut();
+        let trap_cx = task_inner.get_trap_cx();
+        trap_cx.x[2] = stack;
+    }
+
+    // TODO: support clone flags beyond fork-like behavior.
+    let _ = flags;
+    child.getpid() as isize
+}
+
+pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {
+    let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
     loop {
-        // Check children status under the current process lock.
         let cur_process = current_process();
         let (has_any_child, zombie_pid) = {
             let mut process_inner = cur_process.borrow_mut();
             if process_inner.children.is_empty() {
                 (false, None)
             } else {
-                // Find a zombie child that matches pid_or_ne, remove it from the children list,
-                // and return its pid/exit_code.
                 let mut found: Option<(usize, usize)> = None; // (index, pid)
                 for (index, child) in process_inner.children.iter().enumerate() {
                     let child_inner = child.borrow_mut();
-                    let matches = pid_or_ne == -1 || child.pid.0 == pid_or_ne as usize;
+                    let matches = pid == -1 || child.pid.0 == pid as usize;
                     if matches && child_inner.is_zombie {
                         temp_exit_code = child_inner.exit_code;
                         found = Some((index, child.pid.0));
@@ -52,22 +115,17 @@ pub fn syscall_waitpid(pid_or_ne: isize, exit_code_ptr: *mut i32) -> isize {
         };
 
         if let Some(pid) = zombie_pid {
-            let target_ptr =
-                translated_single_address(get_current_token(), exit_code_ptr as *const u8);
-            unsafe {
-                *(target_ptr as *mut u8 as *mut i32) = temp_exit_code;
+            if wstatus_ptr != 0 {
+                *translated_mutref(token, wstatus_ptr as *mut i32) = temp_exit_code;
             }
-
             return pid as isize;
         }
 
-        // No child at all.
         if !has_any_child {
             return -1;
         }
 
-        // Block until a child exits, to avoid spinning in kernel with interrupts disabled.
-        // The child exit path will wake tasks in this wait queue.
+        // Block until a child exits.
         {
             let task = current_task().unwrap();
             let mut process_inner = cur_process.borrow_mut();
@@ -77,46 +135,38 @@ pub fn syscall_waitpid(pid_or_ne: isize, exit_code_ptr: *mut i32) -> isize {
     }
 }
 
-pub fn syscall_exec(path: usize, args_addr: usize) -> isize {
-    let now_process = current_process();
+pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isize {
     let token = get_current_token();
-    // println!(
-    //     "[kernel] Execing new program at path {:x} for PID {}",
-    //     path, now_task.pid.0
-    // );
+    let path = translated_str(token, path_ptr as *const u8);
 
     let mut args_vec: Vec<String> = Vec::new();
-    if args_addr != 0 {
-        let mut argv_ptr = args_addr;
-        let ptr_size = size_of::<usize>();
+    if argv_ptr != 0 {
+        let mut i = 0usize;
         loop {
-            let mut raw = [0u8; size_of::<usize>()];
-            for (i, byte) in raw.iter_mut().enumerate() {
-                *byte = *translated_single_address(token, (argv_ptr + i) as *const u8);
-            }
-            let arg_ptr = usize::from_ne_bytes(raw);
+            let arg_ptr = read_usize_user(token, argv_ptr + i * size_of::<usize>());
             if arg_ptr == 0 {
                 break;
             }
             args_vec.push(translated_str(token, arg_ptr as *const u8));
-            // println!(
-            //     "[kernel] Exec arg for PID {} : {}",
-            //     now_task.pid.0,
-            //     args_vec.last().unwrap()
-            // );
-            argv_ptr += ptr_size;
+            i += 1;
         }
     }
-    let app_name = translated_str(token, path as *const u8);
-    let file = open_file(&app_name, OpenFlags::RDONLY);
-    if file.is_none() {
+
+    let Some(app_data) = load_elf_from_path(token, &path) else {
         return -1;
-    }
-    let app_data = file.unwrap().read_all();
-    now_process.exec(&app_data, args_vec);
+    };
+
+    let process = current_process();
+    process.exec(&app_data, args_vec);
     0
 }
+
 pub fn syscall_getpid() -> isize {
-    let now_task = current_task().unwrap();
-    now_task.process.upgrade().unwrap().getpid() as isize
+    current_task()
+        .unwrap()
+        .process
+        .upgrade()
+        .unwrap()
+        .getpid() as isize
 }
+

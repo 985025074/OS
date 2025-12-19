@@ -3,6 +3,7 @@ mod inode;
 mod pipe;
 mod stdio;
 use crate::mm::UserBuffer;
+use core::any::Any;
 
 /// File trait
 pub trait File: Send + Sync {
@@ -14,8 +15,9 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// Write `UserBuffer` to file
     fn write(&self, buf: UserBuffer) -> usize;
+    fn as_any(&self) -> &dyn Any;
 }
 
-pub use inode::{OSInode, OpenFlags, list_apps, open_file};
+pub use inode::{OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub use pipe::{Pipe, make_pipe};
 pub use stdio::{Stdin, Stdout};

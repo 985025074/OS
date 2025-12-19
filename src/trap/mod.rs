@@ -191,7 +191,10 @@ pub fn trap_handler() {
             let (syscall_id, args) = {
                 let cx = get_trap_context();
                 cx.sepc += 4;
-                (cx.x[17], [cx.x[10], cx.x[11], cx.x[12]])
+                (
+                    cx.x[17],
+                    [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
+                )
             }; // cx is dropped here, releasing the borrow
 
             // NOTE: Do NOT enable interrupts during syscall execution.

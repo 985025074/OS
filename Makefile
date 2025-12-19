@@ -18,28 +18,9 @@ DISK_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk
 else
 DISK_ARGS :=
 endif
-# ===========================
-# VirtIO Support Check
-# ===========================
-
-check_virtio:
-	@echo "🔍 Checking VirtIO device support in QEMU..."
-	@VIRTIO_MMIO=$$(qemu-system-riscv64 -device help | grep -c virtio-mmio); \
-	VIRTIO_BLK=$$(qemu-system-riscv64 -device help | grep -c virtio-blk-device); \
-	if [ $$VIRTIO_MMIO -eq 0 ]; then \
-		echo "\033[31m[ERROR]\033[0m QEMU missing 'virtio-mmio' support!"; \
-		echo "  ➜ Please ensure you installed 'qemu-system-riscv64' with VirtIO support."; \
-		exit 1; \
-	fi; \
-	if [ $$VIRTIO_BLK -eq 0 ]; then \
-		echo "\033[31m[ERROR]\033[0m QEMU missing 'virtio-blk-device' support!"; \
-		echo "  ➜ Use: sudo apt install qemu-system-misc  (on Ubuntu/Debian)"; \
-		exit 1; \
-	fi; \
-	echo "\033[32m[SUCCESS]\033[0m VirtIO support detected: virtio-mmio & virtio-blk-device are available."
 
 # build kernel and copy it to save_dir 
-KERNEL:USER_APPS FILE_IMAGHE
+KERNEL:USER_APPS 
 	@cargo build --$(MODE)
 	@# `rust-objcopy` is optional; QEMU boots the ELF directly.
 	@OBJCOPY=$$(command -v rust-objcopy || command -v llvm-objcopy || true); \
@@ -51,8 +32,6 @@ KERNEL:USER_APPS FILE_IMAGHE
 	fi
 	@cp $(KERNEL_ELF) kernel_$(MODE).elf
 
-FILE_IMAGHE: USER_APPS
-	@cd ../easy-fs-fuse && cargo run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/
 # find all excutable in the user's target dir strip it and copy to the os_str
 USER_APPS:
 	@cd ../user  && cargo build --$(MODE)

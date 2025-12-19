@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use super::mutex::Mutex;
 use crate::fs::{File, Stdin, Stdout};
+use crate::config::USER_STACK_SIZE;
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_mutref};
 use crate::println;
 use crate::task::condvar::Condvar;
@@ -35,6 +36,11 @@ pub struct ProcessControlBlockInner {
     pub exit_code: i32,
     //
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub cwd: String,
+    pub heap_start: usize,
+    pub brk: usize,
+    pub mmap_next: usize,
+    pub mmap_areas: Vec<(usize, usize)>,
     pub signals: SignalFlags,
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
@@ -94,6 +100,7 @@ impl ProcessControlBlock {
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let heap_start = ustack_base + USER_STACK_SIZE;
         // allocate a pid
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -112,6 +119,11 @@ impl ProcessControlBlock {
                     // 2 -> stderr
                     Some(Arc::new(Stdout)),
                 ],
+                cwd: String::from("/user"),
+                heap_start,
+                brk: heap_start,
+                mmap_next: 0x4000_0000,
+                mmap_areas: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
@@ -174,8 +186,16 @@ impl ProcessControlBlock {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
         let new_token = memory_set.token();
+        let heap_start = ustack_base + USER_STACK_SIZE;
         // substitute memory_set
-        self.borrow_mut().memory_set = memory_set;
+        {
+            let mut inner = self.borrow_mut();
+            inner.memory_set = memory_set;
+            inner.heap_start = heap_start;
+            inner.brk = heap_start;
+            inner.mmap_next = 0x4000_0000;
+            inner.mmap_areas.clear();
+        }
         // then we need to update the task's user resource
         // Note: from_elf already created both the user stack and trap_cx area,
         // so we don't call alloc_user_res() which would cause double-mapping
@@ -185,31 +205,41 @@ impl ProcessControlBlock {
         res.ustack_base = ustack_base;
         // Update trap_cx_ppn from the new memory_set
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
-        // push arguments on user stack
+        // Build a Linux-like initial stack layout so both:
+        // - C runtime can read argc/argv from `sp` (as in oscomp ulib), and
+        // - Rust runtime can read argc/argv from a0/a1.
+        let argc = args.len();
+        let ptr_size = core::mem::size_of::<usize>();
         let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
-        user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
-        let argv_base = user_sp;
-        let mut argv: Vec<_> = (0..=args.len())
-            .map(|arg| {
-                translated_mutref(
-                    new_token,
-                    (argv_base + arg * core::mem::size_of::<usize>()) as *mut usize,
-                )
-            })
-            .collect();
-        *argv[args.len()] = 0;
-        for i in 0..args.len() {
-            user_sp -= args[i].len() + 1;
-            *argv[i] = user_sp;
+
+        // Push argument strings (top-down).
+        let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
+        for arg in args.iter().rev() {
+            user_sp -= arg.len() + 1;
             let mut p = user_sp;
-            for c in args[i].as_bytes() {
+            for c in arg.as_bytes() {
                 *translated_mutref(new_token, p as *mut u8) = *c;
                 p += 1;
             }
             *translated_mutref(new_token, p as *mut u8) = 0;
+            arg_ptrs.push(user_sp);
         }
-        // make the user_sp aligned to 8B for k210 platform
-        user_sp -= user_sp % core::mem::size_of::<usize>();
+        arg_ptrs.reverse();
+
+        // Align.
+        user_sp -= user_sp % ptr_size;
+
+        // Push argv pointers array (argc + 1) with trailing NULL.
+        user_sp -= (argc + 1) * ptr_size;
+        let argv_base = user_sp;
+        for i in 0..argc {
+            *translated_mutref(new_token, (argv_base + i * ptr_size) as *mut usize) = arg_ptrs[i];
+        }
+        *translated_mutref(new_token, (argv_base + argc * ptr_size) as *mut usize) = 0;
+
+        // Push argc.
+        user_sp -= ptr_size;
+        *translated_mutref(new_token, user_sp as *mut usize) = argc;
         // initialize trap_cx
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -218,7 +248,7 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        trap_cx.x[10] = args.len();
+        trap_cx.x[10] = argc;
         trap_cx.x[11] = argv_base;
         *task_inner.get_trap_cx() = trap_cx;
     }
@@ -250,6 +280,11 @@ impl ProcessControlBlock {
                 children: Vec::new(),
                 exit_code: 0,
                 fd_table: new_fd_table,
+                cwd: parent.cwd.clone(),
+                heap_start: parent.heap_start,
+                brk: parent.brk,
+                mmap_next: parent.mmap_next,
+                mmap_areas: parent.mmap_areas.clone(),
                 // is right here?
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),

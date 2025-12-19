@@ -63,6 +63,18 @@ impl OSInode {
 
         v
     }
+
+    pub fn ext4_inode(&self) -> Arc<Inode> {
+        self.inner.lock().inode.clone()
+    }
+
+    pub fn offset(&self) -> usize {
+        self.inner.lock().offset
+    }
+
+    pub fn set_offset(&self, offset: usize) {
+        self.inner.lock().offset = offset;
+    }
 }
 
 lazy_static! {
@@ -122,22 +134,47 @@ impl OpenFlags {
 /// Files are located in /user directory
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let (readable, writable) = flags.read_write();
+    let _fs_guard = EXT4_LOCK.lock();
 
-    // ext4 is read-only, so CREATE is not supported
-    if flags.contains(OpenFlags::CREATE) {
+    let raw = name.trim_matches('\0');
+    if raw.is_empty() {
         return None;
     }
 
-    let _fs_guard = EXT4_LOCK.lock();
+    // Default: resolve relative paths from /user to keep exec() behavior.
+    let base_dir: &Arc<Inode> = if raw.starts_with('/') {
+        &ROOT_INODE
+    } else {
+        &USER_INODE
+    };
 
-    // Look for file in /user directory
-    let inode = USER_INODE.find(name).or_else(|| {
-        // Try adding .bin suffix if not found
-        let name_with_bin = alloc::format!("{}.bin", name);
-        USER_INODE.find(&name_with_bin)
-    });
+    let mut inode = base_dir.find_path(raw);
 
-    inode.map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
+    // Keep compatibility: exec("foo") can omit ".bin".
+    if inode.is_none() && !raw.contains('/') && !raw.ends_with(".bin") {
+        let name_with_bin = alloc::format!("{}.bin", raw);
+        inode = base_dir.find_path(&name_with_bin);
+    }
+
+    // CREATE: create the file if it does not exist.
+    if inode.is_none() && flags.contains(OpenFlags::CREATE) {
+        let (parent_path, file_name) = split_parent_and_name(raw)?;
+        let parent = if parent_path.is_empty() {
+            Arc::clone(base_dir)
+        } else {
+            base_dir.find_path(parent_path)?
+        };
+        inode = parent.create_file(file_name).ok();
+    }
+
+    let inode = inode?;
+
+    // TRUNC: clear file contents.
+    if flags.contains(OpenFlags::TRUNC) {
+        let _ = inode.clear();
+    }
+
+    Some(Arc::new(OSInode::new(readable, writable, inode)))
 }
 
 impl File for OSInode {
@@ -165,8 +202,46 @@ impl File for OSInode {
     }
 
     fn write(&self, _buf: UserBuffer) -> usize {
-        // ext4 is read-only
-        println!("[ext4] Warning: write not supported (read-only fs)");
-        0
+        let _fs_guard = EXT4_LOCK.lock();
+        let mut inner = self.inner.lock();
+        let mut total_write_size = 0usize;
+        for slice in _buf.buffers.iter() {
+            match inner.inode.write_at(inner.offset, &*slice) {
+                Ok(write_size) => {
+                    if write_size == 0 {
+                        break;
+                    }
+                    inner.offset += write_size;
+                    total_write_size += write_size;
+                    if write_size < slice.len() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    println!("[ext4] Warning: write failed");
+                    break;
+                }
+            }
+        }
+        total_write_size
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(pos) => {
+            let (parent, name) = trimmed.split_at(pos);
+            let name = &name[1..];
+            Some((parent, name))
+        }
+        None => Some(("", trimmed)),
     }
 }

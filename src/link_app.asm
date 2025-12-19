@@ -300,9 +300,19 @@ app_29_start:
 app_29_end:
 .section .rodata
 .align 3
+app_30_name:
+    .asciz "ls"
+.align 3
+.section .data
+app_30_start:
+    .incbin "./results/ls.bin"
+.align 3
+app_30_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 30
+    .quad 31
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -393,3 +403,6 @@ num_user_apps:
     .quad app_29_start
     .quad app_29_end
     .quad app_29_name
+    .quad app_30_start
+    .quad app_30_end
+    .quad app_30_name
