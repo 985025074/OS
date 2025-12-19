@@ -13,6 +13,7 @@ mod debug_config;
 mod drivers;
 mod fs;
 mod lang_items;
+mod log;
 mod mm;
 mod sbi;
 mod syscall;
@@ -105,6 +106,8 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         );
         mm::init();
         mm::remap_test();
+        log::init();
+        log::test();
         println!("[kernel] memory management initialized.");
         BOOT_GLOBAL_INIT_DONE.store(true, Ordering::SeqCst);
         start_other_harts(hart_id, dtb_pa);

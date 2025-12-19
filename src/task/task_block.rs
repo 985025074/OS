@@ -340,6 +340,7 @@
 // // }
 
 use alloc::sync::{Arc, Weak};
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
@@ -358,10 +359,17 @@ pub struct TaskControlBlock {
     // 对于所有的线程,共享一个父进程
     pub process: Weak<ProcessControlBlock>,
     pub kstack: KernelStack,
+    /// Preferred CPU (hart) to run this task on.
+    ///
+    /// This is used by the scheduler to decide which per-hart run queue the task should be
+    /// enqueued into when it becomes runnable.
+    pub cpu_id: AtomicUsize,
     /// The hart id currently running this task, or OFF_CPU if none.
     pub on_cpu: AtomicUsize,
     /// Set by a waker if it tried to wake while the task was still on_cpu.
     pub wakeup_pending: AtomicBool,
+    /// Whether this task is currently enqueued in the global ready queue.
+    pub in_ready_queue: AtomicBool,
     // mutable
     inner: Mutex<TaskControlBlockInner>,
 }
@@ -369,7 +377,16 @@ pub struct TaskControlBlock {
 impl TaskControlBlock {
     pub const OFF_CPU: usize = usize::MAX;
 
+    pub fn set_cpu_id(&self, cpu_id: usize) {
+        self.cpu_id.store(cpu_id, Ordering::Release);
+    }
+
+    pub fn get_cpu_id(&self) -> usize {
+        self.cpu_id.load(Ordering::Acquire)
+    }
+
     pub fn mark_on_cpu(&self, hart_id: usize) {
+        self.cpu_id.store(hart_id, Ordering::Release);
         self.on_cpu.store(hart_id, Ordering::Release);
         // Once running, no wakeup should be pending.
         self.wakeup_pending.store(false, Ordering::Release);
@@ -381,6 +398,10 @@ impl TaskControlBlock {
 
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
+    }
+
+    pub fn try_borrow_mut(&self) -> Option<MutexGuard<'_, TaskControlBlockInner>> {
+        self.inner.try_lock()
     }
 
     pub fn get_user_token(&self) -> usize {
@@ -397,6 +418,7 @@ pub struct TaskControlBlockInner {
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
     pub exit_code: Option<i32>,
+    pub join_waiters: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl TaskControlBlockInner {
@@ -431,14 +453,17 @@ impl TaskControlBlock {
         Self {
             process: Arc::downgrade(&process),
             kstack,
+            cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
+            in_ready_queue: AtomicBool::new(false),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
                 task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
                 task_status: TaskStatus::Ready,
                 exit_code: None,
+                join_waiters: VecDeque::new(),
             }),
         }
     }

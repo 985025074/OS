@@ -41,9 +41,15 @@ check_virtio:
 # build kernel and copy it to save_dir 
 KERNEL:USER_APPS FILE_IMAGHE
 	@cargo build --$(MODE)
-	@rust-objcopy --strip-all $(KERNEL_ELF) -O binary $(KERNEL_BIN)
+	@# `rust-objcopy` is optional; QEMU boots the ELF directly.
+	@OBJCOPY=$$(command -v rust-objcopy || command -v llvm-objcopy || true); \
+	if [ -n "$$OBJCOPY" ]; then \
+		$$OBJCOPY --strip-all $(KERNEL_ELF) -O binary $(KERNEL_BIN); \
+		echo "Build $(KERNEL_BIN) successfully."; \
+	else \
+		echo "⚠️  No objcopy found; skip generating $(KERNEL_BIN) (QEMU uses ELF)."; \
+	fi
 	@cp $(KERNEL_ELF) kernel_$(MODE).elf
-	@echo "Build $(KERNEL_BIN) successfully."
 
 FILE_IMAGHE: USER_APPS
 	@cd ../easy-fs-fuse && cargo run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/

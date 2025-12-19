@@ -7,7 +7,7 @@ use crate::{
     time::get_time_ms,
     task::{
         block_sleep::add_timer,
-        manager::add_task,
+        manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_task},
         task_block::TaskControlBlock,
     },
@@ -25,6 +25,8 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         ustack_base,
         true,
     ));
+    // Spread newly created threads across harts (Linux-like: task has a target cpu).
+    new_task.set_cpu_id(select_hart_for_new_task());
 
     // Fully initialize the new thread (PCB slot + TrapContext) *before* enqueueing it.
     // Otherwise, another hart might schedule it and jump to user with an uninitialized TrapContext.
@@ -100,23 +102,29 @@ pub fn sys_waittid(tid: usize) -> i32 {
         None => return -1, // waited thread does not exist
     };
 
-    // Check exit code by locking only the waited task TCB.
-    let exit_code = waited_task.borrow_mut().exit_code;
-    if let Some(exit_code) = exit_code {
-        // Dealloc the exited thread entry in PCB.
-        let mut process_inner = process.borrow_mut();
-        if let Some(slot) = process_inner.tasks.get_mut(tid) {
-            // Only clear if it still points to the same TCB.
-            if let Some(existing) = slot.as_ref() {
-                if Arc::ptr_eq(existing, &waited_task) {
-                    *slot = None;
+    loop {
+        // Check exit code (and enqueue ourselves as a join waiter) by locking only the waited TCB.
+        {
+            let mut waited_inner = waited_task.borrow_mut();
+            if let Some(exit_code) = waited_inner.exit_code {
+                // Dealloc the exited thread entry in PCB.
+                let mut process_inner = process.borrow_mut();
+                if let Some(slot) = process_inner.tasks.get_mut(tid) {
+                    // Only clear if it still points to the same TCB.
+                    if let Some(existing) = slot.as_ref() {
+                        if Arc::ptr_eq(existing, &waited_task) {
+                            *slot = None;
+                        }
+                    }
                 }
+                return exit_code;
             }
-        }
-        exit_code
-    } else {
-        // waited thread has not exited
-        -2
+            waited_inner.join_waiters.push_back(task.clone());
+        } // drop waited_inner
+
+        // Block until the waited thread exits and wakes us.
+        block_current_and_run_next();
+        // After waking, loop and re-check exit_code.
     }
 }
 

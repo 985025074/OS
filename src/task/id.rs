@@ -174,7 +174,11 @@ impl TaskUserRes {
 
 impl Drop for TaskUserRes {
     fn drop(&mut self) {
-        self.dealloc_tid();
+        // IMPORTANT: unmap user resources before releasing tid back to the allocator.
+        // Otherwise, another thread may reuse the same tid and try to map the same
+        // ustack/trap_cx region while it is still mapped, causing a "vpn is mapped"
+        // panic (or worse, use-after-unmap).
         self.dealloc_user_res();
+        self.dealloc_tid();
     }
 }

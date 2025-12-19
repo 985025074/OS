@@ -143,6 +143,9 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     }
 }
 pub fn idle_task() {
+    #[allow(dead_code)]
+    static EMPTY_SPINS: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
     loop {
         // Ensure kernel-mode traps use the kernel handler (stvec points to alltraps_k)
         init_trap();
@@ -170,10 +173,15 @@ pub fn idle_task() {
         // no longer running on its kernel stack.
         if let Some(task) = local_processor().lock().take_pending_ready() {
             task.clear_on_cpu();
+            task.wakeup_pending
+                .store(false, core::sync::atomic::Ordering::Release);
             add_task(task);
         }
 
         if let Some(task) = fetch_task() {
+            if crate::debug_config::DEBUG_WATCHDOG {
+                EMPTY_SPINS.store(0, core::sync::atomic::Ordering::Relaxed);
+            }
             let mut processor = local_processor().lock();
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
             // access coming task TCB exclusively
@@ -209,6 +217,12 @@ pub fn idle_task() {
                 crate::println!("[idle] hart={} switch returned to idle", hart_id());
             }
         } else {
+            if crate::debug_config::DEBUG_WATCHDOG {
+                let c = EMPTY_SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if c == 1_000 {
+                    crate::task::manager::dump_system_state();
+                }
+            }
             // crate::println!("[idle] No tasks, entering wfi...");
             // No ready tasks - enable interrupts and wait
             // Use wfi to save power while waiting for timer interrupt
@@ -232,7 +246,7 @@ pub fn set_tp(hart_id: usize) {
     unsafe { core::arch::asm!("mv tp, {}", in(reg) hart_id) };
 }
 
-fn hart_id() -> usize {
+pub fn hart_id() -> usize {
     let mut id: usize;
     unsafe {
         core::arch::asm!("mv {}, tp", out(reg) id);
@@ -322,11 +336,13 @@ pub const IDLE_PID: usize = 0;
 pub fn exit_current_and_run_next(exit_code: i32) {
     // 标记线程状态,
     let task = take_current_task().unwrap();
+    // This task will never be scheduled again; ensure it is considered off CPU.
+    task.clear_on_cpu();
     let process = task.process.upgrade().unwrap();
 
     // Extract tid in a separate scope to release the borrow early.
     // Also drop TaskUserRes *after* releasing the TCB lock to avoid deadlocks with sys_waittid.
-    let (tid, res_to_drop) = {
+    let (tid, res_to_drop, join_waiters) = {
         let mut task_inner = task.borrow_mut();
         task_inner.exit_code = Some(exit_code);
         let tid = task_inner
@@ -335,9 +351,13 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             .expect("task user resource should exist before exit")
             .tid;
         let res_to_drop = task_inner.res.take();
-        (tid, res_to_drop)
+        let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
+        (tid, res_to_drop, join_waiters)
     }; // task_inner dropped here
     drop(res_to_drop);
+    for waiter in join_waiters {
+        wakeup_task(waiter);
+    }
 
     crate::println!(
         "[exit] pid={} tid={} exit_code={}",
@@ -372,23 +392,26 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             }
         }
         remove_from_pid2process(pid);
-        let mut process_inner = process.borrow_mut();
-        // mark this process as a zombie process
-        process_inner.is_zombie = true;
-        // record exit code of main process
-        process_inner.exit_code = exit_code;
+        // Mark zombie and capture parent pointer first...
+        let parent = {
+            let mut process_inner = process.borrow_mut();
+            process_inner.is_zombie = true;
+            process_inner.exit_code = exit_code;
+            process_inner.parent.as_ref().and_then(|p| p.upgrade())
+        }; // drop child PCB lock before touching parent to avoid lock inversion
 
-        // Wake parent waiters (waitpid). Do it after marking zombie, and without holding the
-        // parent PCB lock while waking tasks.
-        if let Some(parent) = process_inner.parent.as_ref().and_then(|p| p.upgrade()) {
+        // ...then wake parent waiters (waitpid) without holding the child PCB lock.
+        if let Some(parent) = parent {
             let waiters = {
                 let mut parent_inner = parent.borrow_mut();
                 parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
-            };
+            }; // drop parent lock
             for waiter in waiters {
                 wakeup_task(waiter);
             }
         }
+
+        let mut process_inner = process.borrow_mut();
 
         // 非 系统进程,执行之前的 将 子进程 交给 initproc 进程  过程
         {

@@ -12,6 +12,7 @@ const SBI_SHUTDOWN: usize = 8;
 const SBI_EXT_HSM: usize = 0x48534d;
 const SBI_EXT_HSM_HART_START: usize = 0;
 use core::arch::{asm, global_asm};
+use spin::Mutex;
 
 fn sbi_call(which: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
     let mut ret;
@@ -52,6 +53,27 @@ pub fn console_putchar(c: usize) {
 
 pub fn console_getchar() -> usize {
     sbi_call(SBI_CONSOLE_GETCHAR, 0, 0, 0)
+}
+
+static IPI_LOCK: Mutex<()> = Mutex::new(());
+static mut IPI_HART_MASK: usize = 0;
+
+/// Send an IPI (Supervisor Software Interrupt) to a single hart to wake it from `wfi`.
+///
+/// This uses legacy SBI `SBI_SEND_IPI` which expects a pointer to a hart mask in memory.
+/// The mask is stored in `.bss` so the address is a low, identity-mapped physical address.
+pub fn send_ipi(hart_id: usize) {
+    if hart_id >= usize::BITS as usize {
+        return;
+    }
+    let _g = IPI_LOCK.lock();
+    unsafe {
+        IPI_HART_MASK = 1usize << hart_id;
+        let mask_ptr = &raw const IPI_HART_MASK as usize;
+        // hart_mask_base = 0
+        sbi_call(SBI_SEND_IPI, mask_ptr, 0, 0);
+        IPI_HART_MASK = 0;
+    }
 }
 
 pub fn shutdown() -> ! {

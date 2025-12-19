@@ -10,7 +10,7 @@ use crate::mm::{KERNEL_SPACE, MemorySet, translated_mutref};
 use crate::println;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
-use crate::task::manager::{add_task, insert_into_pid2process};
+use crate::task::manager::{add_task, insert_into_pid2process, select_hart_for_new_task};
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{SignalActions, SignalFlags};
 use crate::task::task_block::TaskControlBlock;
@@ -87,6 +87,10 @@ impl ProcessControlBlock {
         self.inner.lock()
     }
 
+    pub fn try_borrow_mut(&self) -> Option<MutexGuard<'_, ProcessControlBlockInner>> {
+        self.inner.try_lock()
+    }
+
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
@@ -158,6 +162,8 @@ impl ProcessControlBlock {
             ustack_top,
             kstack_top
         );
+        // Bootstrap initproc onto hart 0 for determinism.
+        task.set_cpu_id(0);
         add_task(task);
         process
     }
@@ -273,6 +279,8 @@ impl ProcessControlBlock {
             // but mention that we allocate a new kstack here
             false,
         ));
+        // Distribute child processes across harts.
+        task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
         let mut child_inner = child.borrow_mut();
         child_inner.tasks.push(Some(Arc::clone(&task)));

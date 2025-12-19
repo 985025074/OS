@@ -35,6 +35,7 @@ const INSTRUCTION_PAGE_FAULT: usize = 12;
 const LOAD_PAGE_FAULT: usize = 13;
 const STORE_PAGE_FAULT: usize = 15;
 const TIME_INTERVAL: usize = 5;
+const SOFTWARE_INTERRUPT: usize = 1;
 
 /// Log only the first trap_return to see initial user entry.
 static FIRST_TRAP_RETURN_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -220,6 +221,10 @@ pub fn trap_handler() {
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
+        }
+        Trap::Interrupt(SOFTWARE_INTERRUPT) => {
+            // Used as an IPI to wake up harts from `wfi` (e.g., when a remote hart enqueues a task).
+            unsafe { riscv::register::sip::clear_ssoft() };
         }
         Trap::Interrupt(interrupt) => {
             panic!(

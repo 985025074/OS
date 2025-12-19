@@ -8,3 +8,6 @@ pub const DEBUG_TIMER: bool = false;
 
 /// Verbose scheduler debug logs (ready queue push/pop, idle switches).
 pub const DEBUG_SCHED: bool = false;
+
+/// Print a periodic diagnostic dump when the system has no runnable tasks.
+pub const DEBUG_WATCHDOG: bool = false;
