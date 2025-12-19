@@ -2,7 +2,8 @@
 
 pub const USER_STACK_SIZE: usize = 4096 * 2;
 pub const KERNEL_STACK_SIZE: usize = 4096 * 16;  // Increased from 4 to 16 pages (64KB)
-pub const KERNEL_HEAP_SIZE: usize = 0x30_0000;
+// Kernel heap must be large enough to buffer big user ELFs (e.g. glibc tests).
+pub const KERNEL_HEAP_SIZE: usize = 0x200_0000; // 32 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 

@@ -190,10 +190,11 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
     inner.fd_table[write_fd] = Some(pipe_write);
     drop(inner);
 
-    let p0 = translated_mutref(token, pipefd as *mut usize);
-    let p1 = translated_mutref(token, (pipefd + core::mem::size_of::<usize>()) as *mut usize);
-    *p0 = read_fd;
-    *p1 = write_fd;
+    // Linux ABI: pipefd points to `int pipefd[2]` (i32).
+    let p0 = translated_mutref(token, pipefd as *mut i32);
+    let p1 = translated_mutref(token, (pipefd + core::mem::size_of::<i32>()) as *mut i32);
+    *p0 = read_fd as i32;
+    *p1 = write_fd as i32;
     0
 }
 

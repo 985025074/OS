@@ -91,14 +91,15 @@ debug:KERNEL
 # Ext4 Support
 # ===========================
 EXT4_IMG := ../ext4-fs-packer/target/fs.ext4
-
+EXT4_SIZE?= 4G 
 # Build ext4 image from user apps
 ext4_img: USER_APPS
 	@echo "🔧 Building ext4 filesystem image..."
 	@cd ../ext4-fs-packer && cargo run --release -- \
 		-u ../os/$(APP_DIR) \
+		-e extra \
 		-t target \
-		-S 64M
+		-S $(EXT4_SIZE) 
 	@echo "✅ Ext4 image created: $(EXT4_IMG)"
 
 # Run with ext4 filesystem

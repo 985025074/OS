@@ -310,9 +310,19 @@ app_30_start:
 app_30_end:
 .section .rodata
 .align 3
+app_31_name:
+    .asciz "testcode_runner"
+.align 3
+.section .data
+app_31_start:
+    .incbin "./results/testcode_runner.bin"
+.align 3
+app_31_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 31
+    .quad 32
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -406,3 +416,6 @@ num_user_apps:
     .quad app_30_start
     .quad app_30_end
     .quad app_30_name
+    .quad app_31_start
+    .quad app_31_end
+    .quad app_31_name
