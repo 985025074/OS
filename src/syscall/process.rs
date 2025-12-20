@@ -181,7 +181,15 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
 
         if let Some(pid) = zombie_pid {
             if wstatus_ptr != 0 {
-                *translated_mutref(token, wstatus_ptr as *mut i32) = temp_exit_code;
+                // Linux wait status encoding:
+                // - normal exit: (code & 0xff) << 8
+                // - signaled: signal number in low 7 bits
+                let status = if temp_exit_code >= 0 {
+                    (temp_exit_code & 0xff) << 8
+                } else {
+                    (-temp_exit_code) & 0x7f
+                };
+                *translated_mutref(token, wstatus_ptr as *mut i32) = status;
             }
             return pid as isize;
         }

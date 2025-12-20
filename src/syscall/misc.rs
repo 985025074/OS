@@ -68,6 +68,29 @@ pub fn syscall_getppid() -> isize {
     parent.map(|p| p.getpid() as isize).unwrap_or(0)
 }
 
+/// Linux `setpgid(2)` (syscall 154 on riscv64).
+///
+/// Process groups are not modeled; accept and return success for compatibility.
+pub fn syscall_setpgid(_pid: usize, _pgid: usize) -> isize {
+    0
+}
+
+/// Linux `getsid(2)` (syscall 156 on riscv64).
+pub fn syscall_getsid(pid: usize) -> isize {
+    if pid == 0 {
+        current_process().getpid() as isize
+    } else {
+        pid as isize
+    }
+}
+
+/// Linux `setsid(2)` (syscall 157 on riscv64).
+///
+/// We don't model sessions; treat the process PID as SID and return it.
+pub fn syscall_setsid() -> isize {
+    current_process().getpid() as isize
+}
+
 /// Linux `set_tid_address(2)` (syscall 96 on riscv64).
 ///
 /// We currently run a single-threaded process model for glibc apps; we accept the

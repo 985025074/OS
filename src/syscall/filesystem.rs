@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 
 use crate::{
-    fs::{File, OSInode, ROOT_INODE, make_pipe},
+    fs::{File, OSInode, PseudoFile, ROOT_INODE, make_pipe},
     mm::{UserBuffer, translated_byte_buffer, translated_mutref, translated_str},
     task::processor::current_process,
     trap::get_current_token,
@@ -88,6 +88,18 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         return -1;
     }
 
+    // Pseudo files for minimal proc/sys/dev compatibility.
+    if path.starts_with("/sys/") || path.starts_with("/proc/") || path.starts_with("/dev/") {
+        if let Some(pf) = open_pseudo(&path) {
+            let file: alloc::sync::Arc<dyn File + Send + Sync> = alloc::sync::Arc::new(pf);
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            let fd = inner.alloc_fd();
+            inner.fd_table[fd] = Some(file);
+            return fd as isize;
+        }
+    }
+
     let (readable, writable) = match flags & O_ACCMODE {
         O_RDONLY => (true, false),
         O_WRONLY => (false, true),
@@ -142,6 +154,53 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     let fd = inner.alloc_fd();
     inner.fd_table[fd] = Some(os_inode);
     fd as isize
+}
+
+fn open_pseudo(path: &str) -> Option<PseudoFile> {
+    // /sys/devices/system/cpu/*
+    if path == "/sys/devices/system/cpu/possible"
+        || path == "/sys/devices/system/cpu/present"
+        || path == "/sys/devices/system/cpu/online"
+    {
+        let n = crate::config::MAX_HARTS;
+        let s = if n == 0 {
+            String::from("\n")
+        } else if n == 1 {
+            String::from("0\n")
+        } else {
+            alloc::format!("0-{}\n", n - 1)
+        };
+        return Some(PseudoFile::new_static(&s));
+    }
+    if path == "/sys/devices/system/cpu/kernel_max" {
+        let n = crate::config::MAX_HARTS;
+        let s = if n == 0 {
+            String::from("0\n")
+        } else {
+            alloc::format!("{}\n", n - 1)
+        };
+        return Some(PseudoFile::new_static(&s));
+    }
+    // /sys/devices/system/node/*
+    if path == "/sys/devices/system/node/online" || path == "/sys/devices/system/node/possible" {
+        return Some(PseudoFile::new_static("0\n"));
+    }
+    // /proc/loadavg
+    if path == "/proc/loadavg" {
+        return Some(PseudoFile::new_static("0.00 0.00 0.00 1/1 1\n"));
+    }
+    // /dev/*
+    if path == "/dev/null" {
+        return Some(PseudoFile::new_null());
+    }
+    if path == "/dev/zero" {
+        return Some(PseudoFile::new_zero());
+    }
+    if path == "/dev/urandom" || path == "/dev/random" {
+        let seed = (crate::time::get_time() as u64) ^ ((crate::task::processor::hart_id() as u64) << 32);
+        return Some(PseudoFile::new_urandom(seed));
+    }
+    None
 }
 
 pub fn syscall_close(fd: usize) -> isize {

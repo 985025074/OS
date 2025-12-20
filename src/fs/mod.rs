@@ -2,6 +2,7 @@
 mod inode;
 mod pipe;
 mod stdio;
+mod pseudo;
 use crate::mm::UserBuffer;
 use core::any::Any;
 
@@ -21,3 +22,4 @@ pub trait File: Send + Sync {
 pub use inode::{OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub use pipe::{Pipe, make_pipe};
 pub use stdio::{Stdin, Stdout};
+pub use pseudo::PseudoFile;

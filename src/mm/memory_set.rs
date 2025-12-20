@@ -415,20 +415,24 @@ impl MapArea {
         }
     }
     /// map _one 两种映射类型.其中恒等映射 本人是不持有 frame 的.
-    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
         let ppn: PhysPageNum;
         match self.map_type {
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
             }
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
+                let Some(frame) = frame_alloc() else {
+                    crate::println!("[mm] OOM: frame_alloc failed for vpn={:?}", vpn);
+                    return false;
+                };
                 ppn = frame.ppn;
                 self.data_frames.insert(vpn, frame);
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
+        true
     }
     #[allow(unused)]
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -441,7 +445,9 @@ impl MapArea {
     /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
-            self.map_one(page_table, vpn);
+            if !self.map_one(page_table, vpn) {
+                break;
+            }
         }
     }
     #[allow(unused)]
@@ -460,7 +466,9 @@ impl MapArea {
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
-            self.map_one(page_table, vpn)
+            if !self.map_one(page_table, vpn) {
+                break;
+            }
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
