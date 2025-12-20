@@ -4,7 +4,7 @@ use crate::config::TRAMPOLINE;
 use crate::debug_config::DEBUG_TRAP;
 use crate::task::block_sleep::check_timer;
 use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
-// use crate::task::signal::{check_if_current_signals_error, handle_signals};
+use crate::task::signal::check_if_current_signals_error;
 use crate::time::set_next_trigger;
 use crate::{println, trap::context::TrapContext};
 pub mod context;
@@ -240,10 +240,10 @@ pub fn trap_handler() {
     // println!("handle siganl");
     // handle_signals();
 
-    // if let Some((errno, msg)) = check_if_current_signals_error() {
-    //     println!("[kernel] {}", msg);
-    //     exit_current_and_run_next(errno);
-    // }
+    if let Some((errno, msg)) = check_if_current_signals_error() {
+        println!("[kernel] {}", msg);
+        exit_current_and_run_next(errno);
+    }
     trap_return();
 }
 

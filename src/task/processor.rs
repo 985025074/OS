@@ -1,5 +1,6 @@
 use crate::{
     config::MAX_HARTS,
+    mm::translated_mutref,
     println,
     sbi::shutdown,
     task::{
@@ -338,7 +339,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     // Extract tid in a separate scope to release the borrow early.
     // Also drop TaskUserRes *after* releasing the TCB lock to avoid deadlocks with sys_waittid.
-    let (tid, res_to_drop, join_waiters) = {
+    let (tid, res_to_drop, join_waiters, clear_child_tid) = {
         let mut task_inner = task.borrow_mut();
         task_inner.exit_code = Some(exit_code);
         let tid = task_inner
@@ -347,9 +348,21 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             .expect("task user resource should exist before exit")
             .tid;
         let res_to_drop = task_inner.res.take();
+        let clear_child_tid = task_inner.clear_child_tid.take();
         let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
-        (tid, res_to_drop, join_waiters)
+        (tid, res_to_drop, join_waiters, clear_child_tid)
     }; // task_inner dropped here
+
+    // Linux pthreads expect CLONE_CHILD_CLEARTID/set_tid_address semantics:
+    // clear *ctid to 0 and wake any futex waiters.
+    if let Some(ctid) = clear_child_tid {
+        let token = {
+            let inner = process.borrow_mut();
+            inner.memory_set.token()
+        };
+        *translated_mutref(token, ctid as *mut i32) = 0;
+        let _ = crate::syscall::futex::futex_wake(process.getpid(), ctid, 1);
+    }
     drop(res_to_drop);
     for waiter in join_waiters {
         wakeup_task(waiter);

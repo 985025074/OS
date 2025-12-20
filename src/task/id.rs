@@ -69,6 +69,7 @@ pub struct TaskUserRes {
     pub tid: usize,
     pub ustack_base: usize,
     pub process: Weak<ProcessControlBlock>,
+    owns_ustack: bool,
 }
 
 // 现在 顶部映射的 有多个 trap_cx , 每个线程一个
@@ -92,6 +93,7 @@ impl TaskUserRes {
             tid,
             ustack_base,
             process: Arc::downgrade(&process),
+            owns_ustack: true,
         };
         if alloc_user_res {
             task_user_res.alloc_user_res();
@@ -99,19 +101,49 @@ impl TaskUserRes {
         task_user_res
     }
 
+    /// Allocate only a per-thread TrapContext page (no kernel-managed user stack).
+    ///
+    /// This is used to host Linux/glibc `clone(CLONE_VM|...)` threads whose stacks are
+    /// allocated by userspace via `mmap`.
+    pub fn new_trap_cx_only(process: Arc<ProcessControlBlock>) -> Self {
+        let tid = process.borrow_mut().alloc_tid();
+        let task_user_res = Self {
+            tid,
+            ustack_base: 0,
+            process: Arc::downgrade(&process),
+            owns_ustack: false,
+        };
+        task_user_res.alloc_trap_cx_only();
+        task_user_res
+    }
+
+    fn alloc_trap_cx_only(&self) {
+        let process = self.process.upgrade().unwrap();
+        let mut process_inner = process.borrow_mut();
+        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+        process_inner.memory_set.insert_framed_area(
+            trap_cx_bottom.into(),
+            trap_cx_top.into(),
+            MapPermission::R | MapPermission::W,
+        );
+    }
+
     // 具体的 插入 用户资源 ,如 用户栈 和 trap_cx
     pub fn alloc_user_res(&self) {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.borrow_mut();
-        // alloc user stack
-        let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
-        let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        // insert the user resource into the program memory space
-        process_inner.memory_set.insert_framed_area(
-            ustack_bottom.into(),
-            ustack_top.into(),
-            MapPermission::R | MapPermission::W | MapPermission::U,
-        );
+        if self.owns_ustack {
+            // alloc user stack
+            let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
+            let ustack_top = ustack_bottom + USER_STACK_SIZE;
+            // insert the user resource into the program memory space
+            process_inner.memory_set.insert_framed_area(
+                ustack_bottom.into(),
+                ustack_top.into(),
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            );
+        }
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
@@ -126,11 +158,14 @@ impl TaskUserRes {
         // dealloc tid
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.borrow_mut();
-        // dealloc ustack manually
-        let ustack_bottom_va: VirtAddr = ustack_bottom_from_tid(self.ustack_base, self.tid).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(ustack_bottom_va.into());
+        if self.owns_ustack {
+            // dealloc ustack manually
+            let ustack_bottom_va: VirtAddr =
+                ustack_bottom_from_tid(self.ustack_base, self.tid).into();
+            process_inner
+                .memory_set
+                .remove_area_with_start_vpn(ustack_bottom_va.into());
+        }
         // dealloc trap_cx manually
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
         process_inner

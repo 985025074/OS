@@ -5,7 +5,10 @@ use crate::{
     mm::{translated_mutref, translated_single_address},
     println,
     task::processor::current_process,
-    task::{manager::pid2process, processor::suspend_current_and_run_next},
+    task::{
+        manager::{pid2process, wakeup_task},
+        processor::suspend_current_and_run_next,
+    },
     trap::{context::TrapContext, get_current_token},
 };
 
@@ -154,33 +157,70 @@ pub fn set_signal(
 
 // insert the bit flag.. if already set  return -1
 pub fn kill(pid: usize, signum: i32) -> isize {
-    let process = pid2process(pid).unwrap();
-    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-        // insert the signal if legal
-        let mut process_ref = process.borrow_mut();
-        if process_ref.signals.contains(flag) {
-            return -1;
-        }
-        process_ref.signals.insert(flag);
-        0
-    } else {
-        -1
+    let Some(process) = pid2process(pid) else {
+        return -3; // ESRCH
+    };
+    if signum == 0 {
+        return 0;
     }
+    if signum < 0 || signum as usize > MAX_SIG {
+        return -22; // EINVAL
+    }
+    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
+        return -22; // EINVAL
+    };
+    let (tasks, child_pids) = {
+        let mut process_ref = process.borrow_mut();
+        process_ref.signals.insert(flag);
+        let tasks = process_ref
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>();
+        let child_pids = if signum == 2 || signum == 9 {
+            process_ref
+                .children
+                .iter()
+                .map(|c| c.getpid())
+                .collect::<alloc::vec::Vec<_>>()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        (tasks, child_pids)
+    };
+    for t in tasks {
+        wakeup_task(t);
+    }
+    for child_pid in child_pids {
+        let _ = kill(child_pid, signum);
+    }
+    0
 }
 
 pub fn kill_current(signum: i32) -> isize {
     let process = current_process();
-    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-        // insert the signal if legal
-        let mut process_ref = process.borrow_mut();
-        if process_ref.signals.contains(flag) {
-            return -1;
-        }
-        process_ref.signals.insert(flag);
-        0
-    } else {
-        -1
+    if signum == 0 {
+        return 0;
     }
+    if signum < 0 || signum as usize > MAX_SIG {
+        return -22; // EINVAL
+    }
+    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
+        return -22; // EINVAL
+    };
+    let tasks = {
+        let mut process_ref = process.borrow_mut();
+        process_ref.signals.insert(flag);
+        process_ref
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    for t in tasks {
+        wakeup_task(t);
+    }
+    0
 }
 
 // fn check_pending_signals() {

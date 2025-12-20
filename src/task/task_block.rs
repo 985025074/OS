@@ -419,6 +419,8 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     pub exit_code: Option<i32>,
     pub join_waiters: VecDeque<Arc<TaskControlBlock>>,
+    /// Linux `CLONE_CHILD_CLEARTID`/`set_tid_address` target address (user VA).
+    pub clear_child_tid: Option<usize>,
 }
 
 impl TaskControlBlockInner {
@@ -464,6 +466,31 @@ impl TaskControlBlock {
                 task_status: TaskStatus::Ready,
                 exit_code: None,
                 join_waiters: VecDeque::new(),
+                clear_child_tid: None,
+            }),
+        }
+    }
+
+    pub fn new_linux_thread(process: Arc<ProcessControlBlock>) -> Self {
+        let res = TaskUserRes::new_trap_cx_only(Arc::clone(&process));
+        let trap_cx_ppn = res.trap_cx_ppn();
+        let kstack = kstack_alloc();
+        let kstack_top = kstack.get_top();
+        Self {
+            process: Arc::downgrade(&process),
+            kstack,
+            cpu_id: AtomicUsize::new(0),
+            on_cpu: AtomicUsize::new(Self::OFF_CPU),
+            wakeup_pending: AtomicBool::new(false),
+            in_ready_queue: AtomicBool::new(false),
+            inner: Mutex::new(TaskControlBlockInner {
+                res: Some(res),
+                trap_cx_ppn,
+                task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
+                task_status: TaskStatus::Ready,
+                exit_code: None,
+                join_waiters: VecDeque::new(),
+                clear_child_tid: None,
             }),
         }
     }

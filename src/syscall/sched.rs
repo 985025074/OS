@@ -1,0 +1,170 @@
+use alloc::sync::Arc;
+
+use crate::{
+    config::MAX_HARTS,
+    mm::{translated_byte_buffer, translated_mutref},
+    task::{manager::pid2process, processor::current_process, ProcessControlBlock},
+    trap::get_current_token,
+};
+
+const ESRCH: isize = -3;
+const EINVAL: isize = -22;
+
+const SCHED_OTHER: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SchedParam {
+    sched_priority: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimeSpec {
+    tv_sec: isize,
+    tv_nsec: isize,
+}
+
+fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
+    let cur = current_process();
+    if pid == 0 || pid == cur.getpid() {
+        Some(cur)
+    } else {
+        pid2process(pid)
+    }
+}
+
+fn check_policy(policy: i32) -> bool {
+    matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR)
+}
+
+pub fn syscall_sched_getscheduler(pid: usize) -> isize {
+    let Some(process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    let inner = process.borrow_mut();
+    inner.sched_policy as isize
+}
+
+pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
+    if param_ptr == 0 {
+        return EINVAL;
+    }
+    let Some(process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    let prio = {
+        let inner = process.borrow_mut();
+        inner.sched_priority
+    };
+    let token = get_current_token();
+    *translated_mutref(token, param_ptr as *mut SchedParam) = SchedParam { sched_priority: prio };
+    0
+}
+
+pub fn syscall_sched_setparam(pid: usize, param_ptr: usize) -> isize {
+    if param_ptr == 0 {
+        return EINVAL;
+    }
+    let Some(process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    let token = get_current_token();
+    let prio = (*translated_mutref(token, param_ptr as *mut SchedParam)).sched_priority;
+    let mut inner = process.borrow_mut();
+    inner.sched_priority = prio;
+    0
+}
+
+pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -> isize {
+    if param_ptr == 0 {
+        return EINVAL;
+    }
+    let Some(process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    let policy = policy as i32;
+    if !check_policy(policy) {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let prio = (*translated_mutref(token, param_ptr as *mut SchedParam)).sched_priority;
+    let mut inner = process.borrow_mut();
+    inner.sched_policy = policy;
+    inner.sched_priority = prio;
+    0
+}
+
+pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
+    if mask_ptr == 0 || cpusetsize == 0 {
+        return EINVAL;
+    }
+    let Some(_process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    let required = (MAX_HARTS + 7) / 8;
+    if cpusetsize < required {
+        return EINVAL;
+    }
+    let mut tmp = alloc::vec![0u8; cpusetsize];
+    let max_bits = cpusetsize * 8;
+    for cpu in 0..MAX_HARTS {
+        if cpu >= max_bits {
+            break;
+        }
+        tmp[cpu / 8] |= 1u8 << (cpu % 8);
+    }
+    let token = get_current_token();
+    let bufs = translated_byte_buffer(token, mask_ptr as *mut u8, cpusetsize);
+    let mut off = 0usize;
+    for b in bufs {
+        let n = core::cmp::min(b.len(), cpusetsize - off);
+        b[..n].copy_from_slice(&tmp[off..off + n]);
+        off += n;
+        if off == cpusetsize {
+            break;
+        }
+    }
+    0
+}
+
+pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
+    if mask_ptr == 0 || cpusetsize == 0 {
+        return EINVAL;
+    }
+    let Some(_process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    // Best-effort: accept and ignore. The scheduler is FIFO and does not yet enforce affinity.
+    0
+}
+
+pub fn syscall_sched_get_priority_max(policy: usize) -> isize {
+    match policy as i32 {
+        SCHED_FIFO | SCHED_RR => 99,
+        SCHED_OTHER => 0,
+        _ => EINVAL,
+    }
+}
+
+pub fn syscall_sched_get_priority_min(policy: usize) -> isize {
+    match policy as i32 {
+        SCHED_FIFO | SCHED_RR => 1,
+        SCHED_OTHER => 0,
+        _ => EINVAL,
+    }
+}
+
+pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
+    if interval_ptr == 0 {
+        return EINVAL;
+    }
+    let Some(_process) = resolve_process(pid) else {
+        return ESRCH;
+    };
+    let token = get_current_token();
+    *translated_mutref(token, interval_ptr as *mut TimeSpec) = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    0
+}

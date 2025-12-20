@@ -162,6 +162,9 @@ pub struct ProcessControlBlockInner {
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
     pub handling_signal: i32,
+    /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
+    pub sched_policy: i32,
+    pub sched_priority: i32,
     // TaskControlBlock实际上现在是线程
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     // 进程控制块 有一个分配 线程ID的分配器
@@ -255,6 +258,8 @@ impl ProcessControlBlock {
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
+                sched_policy: 0,
+                sched_priority: 0,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
@@ -364,6 +369,8 @@ impl ProcessControlBlock {
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.borrow_mut();
         assert_eq!(parent.thread_count(), 1);
+        let sched_policy = parent.sched_policy;
+        let sched_priority = parent.sched_priority;
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
         // alloc a pid
@@ -397,6 +404,8 @@ impl ProcessControlBlock {
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
+                sched_policy,
+                sched_priority,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),

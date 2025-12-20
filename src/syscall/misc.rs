@@ -1,6 +1,6 @@
 use crate::{
     mm::translated_mutref,
-    task::processor::current_process,
+    task::processor::{current_process, current_task},
     trap::get_current_token,
 };
 
@@ -73,7 +73,12 @@ pub fn syscall_getppid() -> isize {
 /// We currently run a single-threaded process model for glibc apps; we accept the
 /// pointer and return a Linux-like TID (use PID as TID).
 pub fn syscall_set_tid_address(_tidptr: usize) -> isize {
-    current_process().getpid() as isize
+    let task = current_task().unwrap();
+    if _tidptr != 0 {
+        let mut inner = task.borrow_mut();
+        inner.clear_child_tid = Some(_tidptr);
+    }
+    task.borrow_mut().res.as_ref().unwrap().tid as isize
 }
 
 pub fn syscall_getuid() -> isize {
@@ -91,7 +96,7 @@ pub fn syscall_getegid() -> isize {
 
 /// Linux `gettid(2)` (syscall 178 on riscv64).
 pub fn syscall_gettid_linux() -> isize {
-    current_process().getpid() as isize
+    current_task().unwrap().borrow_mut().res.as_ref().unwrap().tid as isize
 }
 
 /// Linux `set_robust_list(2)` (syscall 99 on riscv64).

@@ -3,9 +3,13 @@ use core::mem::size_of;
 
 use crate::{
     fs::ROOT_INODE,
-    mm::{translated_mutref, translated_single_address, translated_str},
-    task::processor::{block_current_and_run_next, current_process, current_task},
-    trap::get_current_token,
+    mm::{kernel_token, translated_mutref, translated_single_address, translated_str},
+    task::{
+        manager::{add_task, select_hart_for_new_task},
+        processor::{block_current_and_run_next, current_process, current_task},
+        task_block::TaskControlBlock,
+    },
+    trap::{get_current_token, trap_handler},
 };
 
 fn normalize_path(cwd: &str, path: &str) -> String {
@@ -69,6 +73,70 @@ fn load_elf_from_path(token: usize, path: &str) -> Option<Vec<u8>> {
 }
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+    const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_SETTLS: usize = 0x0008_0000;
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+    const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+    const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+
+    // Thread-like clone: share address space (glibc pthreads).
+    if (flags & CLONE_VM) != 0 {
+        let task = current_task().unwrap();
+        let parent_cx = {
+            let inner = task.borrow_mut();
+            *inner.get_trap_cx()
+        };
+        let process = current_process();
+        let new_task = Arc::new(TaskControlBlock::new_linux_thread(Arc::clone(&process)));
+        new_task.set_cpu_id(select_hart_for_new_task());
+
+        let tid = {
+            let mut new_inner = new_task.borrow_mut();
+            let res = new_inner.res.as_ref().unwrap();
+            let tid = res.tid;
+
+            // Attach to process thread table.
+            {
+                let mut process_inner = process.borrow_mut();
+                let tasks = &mut process_inner.tasks;
+                while tasks.len() < tid + 1 {
+                    tasks.push(None);
+                }
+                tasks[tid] = Some(Arc::clone(&new_task));
+            }
+
+            let trap_cx = new_inner.get_trap_cx();
+            *trap_cx = parent_cx;
+            trap_cx.x[10] = 0; // child returns 0 from syscall
+            if stack != 0 {
+                trap_cx.x[2] = stack;
+            }
+            if (flags & CLONE_SETTLS) != 0 {
+                trap_cx.x[4] = _tls; // tp (TLS)
+            }
+            trap_cx.kernel_satp = kernel_token();
+            trap_cx.kernel_sp = new_task.kstack.get_top();
+            trap_cx.trap_handler = trap_handler as usize;
+            if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
+                new_inner.clear_child_tid = Some(_ctid);
+            }
+            tid
+        };
+
+        // Parent/child tid pointers live in the shared address space.
+        let token = get_current_token();
+        if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
+            *translated_mutref(token, _ptid as *mut i32) = tid as i32;
+        }
+        if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
+            *translated_mutref(token, _ctid as *mut i32) = tid as i32;
+        }
+
+        add_task(new_task);
+        return tid as isize;
+    }
+
+    // Fork-like clone (process).
     let process = current_process();
     let child = process.fork();
 
@@ -79,9 +147,6 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.x[2] = stack;
     }
-
-    // TODO: support clone flags beyond fork-like behavior.
-    let _ = flags;
     child.getpid() as isize
 }
 

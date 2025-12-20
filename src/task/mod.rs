@@ -8,7 +8,6 @@ use crate::{
     println,
     task::{
         manager::{TASK_MANAGER, add_task},
-        process_block::ProcessControlBlock,
         processor::{current_task, go_to_first_task},
         task_context::TaskContext,
     },
@@ -26,6 +25,7 @@ mod id;
 pub mod manager;
 pub mod mutex;
 mod process_block;
+pub(crate) use process_block::ProcessControlBlock;
 pub mod processor;
 pub mod semaphore;
 pub mod signal;

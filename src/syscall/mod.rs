@@ -12,6 +12,8 @@ mod thread;
 mod memory;
 mod misc;
 mod time_sys;
+mod sched;
+pub(crate) mod futex;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
@@ -32,9 +34,19 @@ const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
+const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_SCHED_SETPARAM: usize = 118;
+const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
+const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
+const SYSCALL_SCHED_GETPARAM: usize = 121;
+const SYSCALL_SCHED_SETAFFINITY: usize = 122;
+const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 const SYSCALL_YIELD: usize = 124;
+const SYSCALL_SCHED_GET_PRIORITY_MAX: usize = 125;
+const SYSCALL_SCHED_GET_PRIORITY_MIN: usize = 126;
+const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
@@ -119,9 +131,19 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit(args[0]),
         SYSCALL_SET_TID_ADDRESS => misc::syscall_set_tid_address(args[0]),
+        SYSCALL_FUTEX => futex::syscall_futex(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_SET_ROBUST_LIST => misc::syscall_set_robust_list(args[0], args[1]),
         SYSCALL_NANOSLEEP => time_sys::syscall_nanosleep(args[0], args[1]),
+        SYSCALL_SCHED_SETPARAM => sched::syscall_sched_setparam(args[0], args[1]),
+        SYSCALL_SCHED_SETSCHEDULER => sched::syscall_sched_setscheduler(args[0], args[1], args[2]),
+        SYSCALL_SCHED_GETSCHEDULER => sched::syscall_sched_getscheduler(args[0]),
+        SYSCALL_SCHED_GETPARAM => sched::syscall_sched_getparam(args[0], args[1]),
+        SYSCALL_SCHED_SETAFFINITY => sched::syscall_sched_setaffinity(args[0], args[1], args[2]),
+        SYSCALL_SCHED_GETAFFINITY => sched::syscall_sched_getaffinity(args[0], args[1], args[2]),
         SYSCALL_YIELD => flow::syscall_yield(),
+        SYSCALL_SCHED_GET_PRIORITY_MAX => sched::syscall_sched_get_priority_max(args[0]),
+        SYSCALL_SCHED_GET_PRIORITY_MIN => sched::syscall_sched_get_priority_min(args[0]),
+        SYSCALL_SCHED_RR_GET_INTERVAL => sched::syscall_sched_rr_get_interval(args[0], args[1]),
         SYSCALL_TIMES => time_sys::syscall_times(args[0]),
         SYSCALL_UNAME => misc::syscall_uname(args[0]),
         SYSCALL_GETTIMEOFDAY => time_sys::syscall_gettimeofday(args[0], args[1]),
