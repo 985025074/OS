@@ -36,8 +36,10 @@ pub fn syscall_uname(buf: usize) -> isize {
     };
     write_cstr(&mut un.sysname, "CongCore");
     write_cstr(&mut un.nodename, "localhost");
-    write_cstr(&mut un.release, "0.1");
-    write_cstr(&mut un.version, "0.1");
+    // glibc/busybox may abort early if the reported kernel release is "too old".
+    // Report a modern Linux-like release string for compatibility.
+    write_cstr(&mut un.release, "5.15.0");
+    write_cstr(&mut un.version, "CongCore");
     write_cstr(&mut un.machine, "riscv64");
     write_cstr(&mut un.domainname, "localdomain");
 
@@ -66,3 +68,36 @@ pub fn syscall_getppid() -> isize {
     parent.map(|p| p.getpid() as isize).unwrap_or(0)
 }
 
+/// Linux `set_tid_address(2)` (syscall 96 on riscv64).
+///
+/// We currently run a single-threaded process model for glibc apps; we accept the
+/// pointer and return a Linux-like TID (use PID as TID).
+pub fn syscall_set_tid_address(_tidptr: usize) -> isize {
+    current_process().getpid() as isize
+}
+
+pub fn syscall_getuid() -> isize {
+    0
+}
+pub fn syscall_geteuid() -> isize {
+    0
+}
+pub fn syscall_getgid() -> isize {
+    0
+}
+pub fn syscall_getegid() -> isize {
+    0
+}
+
+/// Linux `gettid(2)` (syscall 178 on riscv64).
+pub fn syscall_gettid_linux() -> isize {
+    current_process().getpid() as isize
+}
+
+/// Linux `set_robust_list(2)` (syscall 99 on riscv64).
+///
+/// glibc uses this for mutex robustness; we don't implement robust futexes yet,
+/// but returning success keeps single-threaded apps progressing.
+pub fn syscall_set_robust_list(_head: usize, _len: usize) -> isize {
+    0
+}

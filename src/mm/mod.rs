@@ -33,7 +33,7 @@ pub fn activate_kernel_space() {
     }
 }
 pub use memory_set::remap_test;
-pub use memory_set::{KERNEL_SPACE, MapPermission, MemorySet};
+pub use memory_set::{ElfAux, KERNEL_SPACE, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable};
 pub use page_table::{
     PageTableEntry, translated_byte_buffer, translated_mutref, translated_single_address,

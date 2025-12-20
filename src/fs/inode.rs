@@ -24,6 +24,7 @@ pub struct OSInode {
 /// The OS inode inner
 pub struct OSInodeInner {
     offset: usize,
+    dir_offset: usize,
     inode: Arc<Inode>,
 }
 
@@ -33,7 +34,11 @@ impl OSInode {
         Self {
             readable,
             writable,
-            inner: Mutex::new(OSInodeInner { offset: 0, inode }),
+            inner: Mutex::new(OSInodeInner {
+                offset: 0,
+                dir_offset: 0,
+                inode,
+            }),
         }
     }
 
@@ -74,6 +79,14 @@ impl OSInode {
 
     pub fn set_offset(&self, offset: usize) {
         self.inner.lock().offset = offset;
+    }
+
+    pub fn dir_offset(&self) -> usize {
+        self.inner.lock().dir_offset
+    }
+
+    pub fn set_dir_offset(&self, offset: usize) {
+        self.inner.lock().dir_offset = offset;
     }
 }
 

@@ -36,7 +36,7 @@ impl File for Stdin {
         1
     }
     fn write(&self, _user_buf: UserBuffer) -> usize {
-        panic!("Cannot write to stdin!");
+        0
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -52,7 +52,7 @@ impl File for Stdout {
         true
     }
     fn read(&self, _user_buf: UserBuffer) -> usize {
-        panic!("Cannot read from stdout!");
+        0
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         for buffer in user_buf.buffers.iter() {

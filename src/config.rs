@@ -1,6 +1,7 @@
 //! Constants used in rCore
 
-pub const USER_STACK_SIZE: usize = 4096 * 2;
+// Linux userland (busybox/glibc) expects a large initial stack.
+pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
 pub const KERNEL_STACK_SIZE: usize = 4096 * 16;  // Increased from 4 to 16 pages (64KB)
 // Kernel heap must be large enough to buffer big user ELFs (e.g. glibc tests).
 pub const KERNEL_HEAP_SIZE: usize = 0x200_0000; // 32 MiB

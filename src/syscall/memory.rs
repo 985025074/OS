@@ -142,3 +142,12 @@ pub fn syscall_munmap(addr: usize, _len: usize) -> isize {
     }
     -1
 }
+
+/// Linux `mprotect` (syscall 226).
+///
+/// Many glibc programs call this during startup to set guard pages / adjust
+/// permissions. We currently do not enforce per-page user permissions strictly,
+/// so accept the call and return success.
+pub fn syscall_mprotect(_addr: usize, _len: usize, _prot: usize) -> isize {
+    0
+}

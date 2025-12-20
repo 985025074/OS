@@ -158,6 +158,9 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return -1;
     };
+    if !file.readable() {
+        return -1;
+    }
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -170,6 +173,9 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return -1;
     };
+    if !file.writable() {
+        return -1;
+    }
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -433,14 +439,20 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     if !inode.is_dir() {
         return -1;
     };
-
-    let entries = inode.dir_entries();
     let token = get_current_token();
 
-    let mut index = os_inode.offset();
+    // Keep a separate per-fd index to avoid interfering with file read offsets.
+    let entries = inode.dir_entries();
+    let mut index = os_inode.dir_offset();
     if index >= entries.len() {
         return 0;
     }
+
+    if len == 0 {
+        return 0;
+    }
+
+    let mut kbuf = alloc::vec![0u8; len];
     let mut written = 0usize;
     while index < entries.len() {
         let (name, ino, ftype) = &entries[index];
@@ -450,32 +462,30 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
             break;
         }
 
-        let base = dirp + written;
-        write_bytes_user(token, base, &(*ino as u64).to_le_bytes());
-        write_bytes_user(token, base + 8, &((index + 1) as i64).to_le_bytes());
-        write_bytes_user(token, base + 16, &(reclen as u16).to_le_bytes());
-        write_bytes_user(token, base + 18, &[dt_type_from_ext4(*ftype)]);
-        write_bytes_user(token, base + 19, name_bytes);
-        write_bytes_user(token, base + 19 + name_bytes.len(), &[0]);
-
-        let pad = reclen - (19 + name_bytes.len() + 1);
-        if pad > 0 {
-            let zeros = [0u8; 8];
-            let mut off = 0usize;
-            while off < pad {
-                let n = min(pad - off, zeros.len());
-                write_bytes_user(token, base + 19 + name_bytes.len() + 1 + off, &zeros[..n]);
-                off += n;
-            }
+        let base = written;
+        kbuf[base..base + 8].copy_from_slice(&(*ino as u64).to_le_bytes());
+        kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
+        kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        kbuf[base + 18] = dt_type_from_ext4(*ftype);
+        kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+        kbuf[base + 19 + name_bytes.len()] = 0;
+        for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
+            *b = 0;
         }
 
         written += reclen;
         index += 1;
     }
 
-    os_inode.set_offset(index);
-    if written == 0 && index < entries.len() {
-        return -1;
+    // Copy back to user buffer with per-page translation, avoiding per-byte translation overhead.
+    let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written);
+    let mut src_off = 0usize;
+    for ub in user_bufs {
+        let end = src_off + ub.len();
+        ub.copy_from_slice(&kbuf[src_off..end]);
+        src_off = end;
     }
+
+    os_inode.set_dir_offset(index);
     written as isize
 }

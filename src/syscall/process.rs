@@ -151,6 +151,9 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
             i += 1;
         }
     }
+    if args_vec.is_empty() {
+        args_vec.push(path.clone());
+    }
 
     let Some(app_data) = load_elf_from_path(token, &path) else {
         return -1;
@@ -169,4 +172,3 @@ pub fn syscall_getpid() -> isize {
         .unwrap()
         .getpid() as isize
 }
-

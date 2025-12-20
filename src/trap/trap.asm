@@ -20,6 +20,8 @@ alltraps:
     sd x3, 3*8(sp)
     # save tp(x4) for user-space tls
     sd x4, 4*8(sp)
+    # switch tp to kernel tp (hart id) saved in TrapContext
+    ld tp, 37*8(sp)
     # save x5~x31
     .set n, 5
     .rept 27
@@ -72,8 +74,10 @@ restore:
         LOAD_GP %n
         .set n, n+1
     .endr
-    # save kernel tp; keep tp as hart id in user mode (no TLS support)
+    # save kernel tp (hart id) for the next trap entry
     sd tp, 37*8(sp)
+    # restore user tp (TLS)
+    ld x4, 4*8(sp)
     # back to user stack
     ld sp, 2*8(sp)
     sret

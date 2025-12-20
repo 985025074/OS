@@ -19,6 +19,123 @@ use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
 use spin::{Mutex as SpinMutex, MutexGuard};
+
+const AT_NULL: usize = 0;
+const AT_PHDR: usize = 3;
+const AT_PHENT: usize = 4;
+const AT_PHNUM: usize = 5;
+const AT_PAGESZ: usize = 6;
+const AT_ENTRY: usize = 9;
+const AT_UID: usize = 11;
+const AT_EUID: usize = 12;
+const AT_GID: usize = 13;
+const AT_EGID: usize = 14;
+const AT_SECURE: usize = 23;
+const AT_RANDOM: usize = 25;
+
+fn build_linux_stack(
+    token: usize,
+    mut sp: usize,
+    args: &[String],
+    envs: &[String],
+    elf_aux: crate::mm::ElfAux,
+    entry_point: usize,
+) -> (usize, usize, usize) {
+    fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            *translated_mutref(token, (addr + i) as *mut u8) = *b;
+        }
+    }
+
+    fn push_usize(token: usize, sp: &mut usize, value: usize) {
+        *sp -= core::mem::size_of::<usize>();
+        *translated_mutref(token, *sp as *mut usize) = value;
+    }
+
+    let argc = args.len();
+    let envc = envs.len();
+
+    // Push argument and environment strings (top-down).
+    let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
+    for arg in args.iter().rev() {
+        let bytes = arg.as_bytes();
+        sp -= bytes.len() + 1;
+        write_bytes(token, sp, bytes);
+        *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
+        arg_ptrs.push(sp);
+    }
+    arg_ptrs.reverse();
+
+    let mut env_ptrs: Vec<usize> = Vec::with_capacity(envc);
+    for env in envs.iter().rev() {
+        let bytes = env.as_bytes();
+        sp -= bytes.len() + 1;
+        write_bytes(token, sp, bytes);
+        *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
+        env_ptrs.push(sp);
+    }
+    env_ptrs.reverse();
+
+    // AT_RANDOM: 16 bytes.
+    sp -= 16;
+    let random_ptr = sp;
+    let mut x = (entry_point as u64) ^ (sp as u64).rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+    for i in 0..16usize {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *translated_mutref(token, (random_ptr + i) as *mut u8) = (x >> 56) as u8;
+    }
+
+    let auxv: [(usize, usize); 10] = [
+        (AT_PHDR, elf_aux.phdr),
+        (AT_PHENT, elf_aux.phent),
+        (AT_PHNUM, elf_aux.phnum),
+        (AT_PAGESZ, crate::config::PAGE_SIZE),
+        (AT_ENTRY, entry_point),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_RANDOM, random_ptr),
+    ];
+
+    // Make the final entry stack pointer 16-byte aligned.
+    // Starting from a 16-byte boundary, pushing an odd number of usize words flips alignment.
+    let aux_words = (auxv.len() + 1) * 2; // + AT_NULL
+    let envp_words = envc + 1; // NULL-terminated
+    let argv_words = argc + 1; // NULL-terminated
+    let total_words = aux_words + envp_words + argv_words + 1; // + argc
+    sp &= !0xf;
+    if total_words % 2 == 1 {
+        sp -= core::mem::size_of::<usize>();
+    }
+
+    // auxv (type, val) pairs, ends with AT_NULL.
+    push_usize(token, &mut sp, 0);
+    push_usize(token, &mut sp, AT_NULL);
+    for (t, v) in auxv.iter().rev() {
+        push_usize(token, &mut sp, *v);
+        push_usize(token, &mut sp, *t);
+    }
+
+    // envp pointers array (envc + 1), with trailing NULL.
+    push_usize(token, &mut sp, 0);
+    for p in env_ptrs.iter().rev() {
+        push_usize(token, &mut sp, *p);
+    }
+    let envp_base = sp;
+
+    // argv pointers array (argc + 1), with trailing NULL.
+    push_usize(token, &mut sp, 0);
+    for p in arg_ptrs.iter().rev() {
+        push_usize(token, &mut sp, *p);
+    }
+    let argv_base = sp;
+
+    // argc.
+    push_usize(token, &mut sp, argc);
+
+    (sp, argv_base, envp_base)
+}
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -99,10 +216,20 @@ impl ProcessControlBlock {
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
+        let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE;
         // allocate a pid
         let pid_handle = pid_alloc();
+        let args = vec![String::from("init_proc")];
+        let (user_sp, argv_base, envp_base) = build_linux_stack(
+            new_token,
+            ustack_base + USER_STACK_SIZE,
+            &args,
+            &[],
+            elf_aux,
+            entry_point,
+        );
         let process = Arc::new(Self {
             pid: pid_handle,
             inner: SpinMutex::new(ProcessControlBlockInner {
@@ -147,16 +274,19 @@ impl ProcessControlBlock {
         // prepare trap_cx of main thread
         let task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
-        let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
-        *trap_cx = TrapContext::app_init_context(
+        let mut tcx = TrapContext::app_init_context(
             entry_point,
-            ustack_top,
+            user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
         );
+        tcx.x[10] = args.len();
+        tcx.x[11] = argv_base;
+        tcx.x[12] = envp_base;
+        *trap_cx = tcx;
         // println!(
         //     "[DEBUG] ProcessControlBlock::new - entry_point={:#x}, ustack_top={:#x}, kstack_top={:#x}",
         //     entry_point, ustack_top, kstack_top
@@ -171,7 +301,7 @@ impl ProcessControlBlock {
             "[proc] init main thread pid={} tid=0 entry={:#x} ustack_top={:#x} kstack_top={:#x}",
             process.getpid(),
             entry_point,
-            ustack_top,
+            ustack_base + USER_STACK_SIZE,
             kstack_top
         );
         // Bootstrap initproc onto hart 0 for determinism.
@@ -184,7 +314,7 @@ impl ProcessControlBlock {
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) {
         assert_eq!(self.borrow_mut().thread_count(), 1);
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE;
         // substitute memory_set
@@ -208,38 +338,14 @@ impl ProcessControlBlock {
         // Build a Linux-like initial stack layout so both:
         // - C runtime can read argc/argv from `sp` (as in oscomp ulib), and
         // - Rust runtime can read argc/argv from a0/a1.
-        let argc = args.len();
-        let ptr_size = core::mem::size_of::<usize>();
-        let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
-
-        // Push argument strings (top-down).
-        let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
-        for arg in args.iter().rev() {
-            user_sp -= arg.len() + 1;
-            let mut p = user_sp;
-            for c in arg.as_bytes() {
-                *translated_mutref(new_token, p as *mut u8) = *c;
-                p += 1;
-            }
-            *translated_mutref(new_token, p as *mut u8) = 0;
-            arg_ptrs.push(user_sp);
-        }
-        arg_ptrs.reverse();
-
-        // Align.
-        user_sp -= user_sp % ptr_size;
-
-        // Push argv pointers array (argc + 1) with trailing NULL.
-        user_sp -= (argc + 1) * ptr_size;
-        let argv_base = user_sp;
-        for i in 0..argc {
-            *translated_mutref(new_token, (argv_base + i * ptr_size) as *mut usize) = arg_ptrs[i];
-        }
-        *translated_mutref(new_token, (argv_base + argc * ptr_size) as *mut usize) = 0;
-
-        // Push argc.
-        user_sp -= ptr_size;
-        *translated_mutref(new_token, user_sp as *mut usize) = argc;
+        let (user_sp, argv_base, envp_base) = build_linux_stack(
+            new_token,
+            task_inner.res.as_mut().unwrap().ustack_top(),
+            &args,
+            &[],
+            elf_aux,
+            entry_point,
+        );
         // initialize trap_cx
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -248,8 +354,9 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        trap_cx.x[10] = argc;
+        trap_cx.x[10] = args.len();
         trap_cx.x[11] = argv_base;
+        trap_cx.x[12] = envp_base;
         *task_inner.get_trap_cx() = trap_cx;
     }
 

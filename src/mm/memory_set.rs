@@ -37,6 +37,13 @@ pub struct MemorySet {
     areas: Vec<MapArea>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ElfAux {
+    pub phdr: usize,
+    pub phent: usize,
+    pub phnum: usize,
+}
+
 impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
@@ -154,7 +161,7 @@ impl MemorySet {
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp and entry poremove_areeint.
     /// 用户占 被设计为 程序地址 (虚拟地址) 的最高端.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize, ElfAux) {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -164,9 +171,17 @@ impl MemorySet {
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
+        let ph_entry_size = elf_header.pt2.ph_entry_size() as usize;
+        let ph_offset = elf_header.pt2.ph_offset() as usize;
+        let ph_table_size = ph_entry_size.saturating_mul(ph_count as usize);
+        let mut phdr_vaddr: usize = 0;
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
+            // Prefer explicit PHDR segment when present.
+            if phdr_vaddr == 0 && ph.get_type().unwrap() == xmas_elf::program::Type::Phdr {
+                phdr_vaddr = ph.virtual_addr() as usize;
+            }
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
@@ -182,11 +197,24 @@ impl MemorySet {
                     map_perm |= MapPermission::X;
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_vpn = map_area.vpn_range.get_end();
+                let seg_end = map_area.vpn_range.get_end();
+                if seg_end > max_end_vpn {
+                    max_end_vpn = seg_end;
+                }
                 memory_set.push(
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
                 );
+
+                // Best-effort: compute AT_PHDR virtual address if PHDR table bytes are in this LOAD.
+                let seg_off = ph.offset() as usize;
+                let seg_filesz = ph.file_size() as usize;
+                if phdr_vaddr == 0
+                    && ph_offset >= seg_off
+                    && ph_offset.saturating_add(ph_table_size) <= seg_off.saturating_add(seg_filesz)
+                {
+                    phdr_vaddr = ph.virtual_addr() as usize + (ph_offset - seg_off);
+                }
             }
         }
         // map user stack with U flags
@@ -237,6 +265,11 @@ impl MemorySet {
             memory_set,
             user_stack_bottom,
             elf.header.pt2.entry_point() as usize,
+            ElfAux {
+                phdr: phdr_vaddr,
+                phent: ph_entry_size,
+                phnum: ph_count as usize,
+            },
         )
     }
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
@@ -352,6 +385,7 @@ pub struct MapArea {
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
     map_perm: MapPermission,
+    start_offset: usize,
 }
 
 impl MapArea {
@@ -368,6 +402,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            start_offset: start_va.page_offset(),
         }
     }
     pub fn from_another(another: &MapArea) -> Self {
@@ -376,6 +411,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            start_offset: another.start_offset,
         }
     }
     /// map _one 两种映射类型.其中恒等映射 本人是不持有 frame 的.
@@ -432,22 +468,24 @@ impl MapArea {
     /// assume that all frames were cleared before
     pub fn copy_data(&mut self, page_table: &PageTable, data: &[u8]) {
         assert_eq!(self.map_type, MapType::Framed);
-        let mut start: usize = 0;
         let mut current_vpn = self.vpn_range.get_start();
-        let len = data.len();
-        loop {
-            let src = &data[start..len.min(start + PAGE_SIZE)];
-            let dst = &mut page_table
+        let mut src_off = 0usize;
+
+        // First page may start at an offset within the page.
+        let mut page_off = self.start_offset;
+        while src_off < data.len() {
+            let dst_page = page_table
                 .translate(current_vpn)
                 .unwrap()
                 .ppn()
-                .get_bytes_array()[..src.len()];
-            dst.copy_from_slice(src);
-            start += PAGE_SIZE;
-            if start >= len {
-                break;
-            }
+                .get_bytes_array();
+            let cap = PAGE_SIZE - page_off;
+            let to_copy = core::cmp::min(cap, data.len() - src_off);
+            dst_page[page_off..page_off + to_copy]
+                .copy_from_slice(&data[src_off..src_off + to_copy]);
+            src_off += to_copy;
             current_vpn.step();
+            page_off = 0;
         }
     }
 }
