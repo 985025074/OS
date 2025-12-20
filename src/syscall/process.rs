@@ -51,14 +51,18 @@ fn read_usize_user(token: usize, ptr: usize) -> usize {
     usize::from_ne_bytes(raw)
 }
 
-fn load_elf_from_path(token: usize, path: &str) -> Option<Vec<u8>> {
+fn load_elf_from_path(path: &str) -> Option<Vec<u8>> {
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
     let abs = normalize_path(&cwd, path);
 
     if let Some(inode) = ROOT_INODE.find_path(&abs) {
         if inode.is_file() {
-            return Some(inode.read_all());
+            let data = inode.read_all();
+            if data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F'] {
+                return Some(data);
+            }
+            return None;
         }
     }
     if !abs.ends_with(".bin") {
@@ -66,7 +70,11 @@ fn load_elf_from_path(token: usize, path: &str) -> Option<Vec<u8>> {
         with_bin.push_str(".bin");
         if let Some(inode) = ROOT_INODE.find_path(&with_bin) {
             if inode.is_file() {
-                return Some(inode.read_all());
+                let data = inode.read_all();
+                if data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F'] {
+                    return Some(data);
+                }
+                return None;
             }
         }
     }
@@ -222,6 +230,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
 }
 
 pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isize {
+    const ENOEXEC: isize = -8;
     let token = get_current_token();
     let path = translated_str(token, path_ptr as *const u8);
 
@@ -241,7 +250,18 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
         args_vec.push(path.clone());
     }
 
-    let Some(app_data) = load_elf_from_path(token, &path) else {
+    let Some(app_data) = load_elf_from_path(&path) else {
+        // If the target exists but is not an ELF binary, behave like Linux and
+        // return ENOEXEC so shells (busybox/ash) can interpret it as a script.
+        // For missing files we still return a generic failure.
+        let process = current_process();
+        let cwd = { process.borrow_mut().cwd.clone() };
+        let abs = normalize_path(&cwd, &path);
+        let exists = ROOT_INODE.find_path(&abs).is_some()
+            || (!abs.ends_with(".bin") && ROOT_INODE.find_path(&(abs.clone() + ".bin")).is_some());
+        if exists {
+            return ENOEXEC;
+        }
         return -1;
     };
 
