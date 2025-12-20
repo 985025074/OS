@@ -1,10 +1,11 @@
 use alloc::sync::{Arc, Weak};
 use spin::Mutex;
 
-use crate::{
-    fs::File, mm::UserBuffer, println, task::processor::suspend_current_and_run_next,
-};
-const RING_BUFFER_SIZE: usize = 32;
+use crate::{fs::File, mm::UserBuffer, task::processor::suspend_current_and_run_next};
+
+// A small pipe buffer makes typical shell pipelines (busybox/ash, rt-tests) extremely
+// slow and can even deadlock if producers/consumers don't run concurrently.
+const RING_BUFFER_SIZE: usize = 4096;
 //  Pipe 是一个包装器,包装 具体的 队列
 pub struct Pipe {
     readable: bool,
@@ -40,6 +41,7 @@ pub struct PipeRingBuffer {
     head: usize,
     tail: usize,
     status: RingBufferStatus,
+    read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
 }
 
@@ -50,11 +52,15 @@ impl PipeRingBuffer {
             head: 0,
             tail: 0,
             status: RingBufferStatus::EMPTY,
+            read_end: None,
             write_end: None,
         }
     }
 
     /// 设置内部参数
+    pub fn set_read_end(&mut self, read_end: &Arc<Pipe>) {
+        self.read_end = Some(Arc::downgrade(read_end));
+    }
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
         self.write_end = Some(Arc::downgrade(write_end));
     }
@@ -99,6 +105,11 @@ impl PipeRingBuffer {
     pub fn all_write_ends_closed(&self) -> bool {
         self.write_end.as_ref().unwrap().upgrade().is_none()
     }
+
+    /// 通过weak Ptr 判断是否所有读端都关闭
+    pub fn all_read_ends_closed(&self) -> bool {
+        self.read_end.as_ref().unwrap().upgrade().is_none()
+    }
 }
 
 /// Return (read_end, write_end)
@@ -106,7 +117,11 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     let buffer = Arc::new(Mutex::new(PipeRingBuffer::new()));
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
-    buffer.lock().set_write_end(&write_end);
+    {
+        let mut inner = buffer.lock();
+        inner.set_read_end(&read_end);
+        inner.set_write_end(&write_end);
+    }
     (read_end, write_end)
 }
 
@@ -120,45 +135,46 @@ impl File for Pipe {
     fn read(&self, buf: UserBuffer) -> usize {
         assert!(self.readable());
         let want_to_read = buf.len();
-        let mut buf_iter = buf.into_iter();
-        let mut already_read = 0usize;
         loop {
             let mut ring_buffer = self.buffer.lock();
-            let loop_read = ring_buffer.available_read();
-            if loop_read == 0 {
+            let avail = ring_buffer.available_read();
+            if avail == 0 {
                 if ring_buffer.all_write_ends_closed() {
-                    return already_read;
+                    return 0;
                 }
                 drop(ring_buffer);
                 suspend_current_and_run_next();
                 continue;
             }
-            for _ in 0..loop_read {
-                if let Some(byte_ref) = buf_iter.next() {
-                    unsafe {
-                        *byte_ref = ring_buffer.read_byte();
-                    }
-                    already_read += 1;
-                    if already_read == want_to_read {
-                        return want_to_read;
-                    }
-                } else {
-                    return already_read;
+            // Read at most what's currently available; for pipes, returning a
+            // short read is normal once some data is obtained.
+            let mut buf_iter = buf.into_iter();
+            let mut read_now = 0usize;
+            let to_read = core::cmp::min(avail, want_to_read);
+            for _ in 0..to_read {
+                let Some(byte_ref) = buf_iter.next() else {
+                    break;
+                };
+                unsafe {
+                    *byte_ref = ring_buffer.read_byte();
                 }
+                read_now += 1;
             }
+            return read_now;
         }
     }
     fn write(&self, buf: UserBuffer) -> usize {
         assert!(self.writable());
         let want_to_write = buf.len();
-        println!("Pipe write want to write {} bytes.", want_to_write);
         let mut buf_iter = buf.into_iter();
         let mut already_write = 0usize;
         loop {
             let mut ring_buffer = self.buffer.lock();
             let loop_write = ring_buffer.available_write();
-            println!("ok this loop we got {} to write", loop_write);
             if loop_write == 0 {
+                if ring_buffer.all_read_ends_closed() {
+                    return already_write;
+                }
                 drop(ring_buffer);
                 suspend_current_and_run_next();
                 continue;

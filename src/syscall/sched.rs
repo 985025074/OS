@@ -14,6 +14,10 @@ const SCHED_OTHER: i32 = 0;
 const SCHED_FIFO: i32 = 1;
 const SCHED_RR: i32 = 2;
 
+// Keep in sync with `syscall::misc` TID encoding.
+const LINUX_TID_MAGIC: usize = 1 << 30;
+const LINUX_TID_PID_SHIFT: usize = 15;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SchedParam {
@@ -29,10 +33,23 @@ struct TimeSpec {
 
 fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     let cur = current_process();
-    if pid == 0 || pid == cur.getpid() {
+    if pid == 0 {
         Some(cur)
     } else {
-        pid2process(pid)
+        // glibc often passes a thread ID (TID) to sched_* syscalls.
+        // Accept both:
+        // - plain TGIDs (process PIDs), and
+        // - encoded TIDs produced by our `gettid()` compatibility layer.
+        let tgid = if (pid & LINUX_TID_MAGIC) != 0 {
+            (pid & !LINUX_TID_MAGIC) >> LINUX_TID_PID_SHIFT
+        } else {
+            pid
+        };
+        if tgid == cur.getpid() {
+            Some(cur)
+        } else {
+            pid2process(tgid)
+        }
     }
 }
 
@@ -104,10 +121,6 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     let Some(_process) = resolve_process(pid) else {
         return ESRCH;
     };
-    let required = (MAX_HARTS + 7) / 8;
-    if cpusetsize < required {
-        return EINVAL;
-    }
     let mut tmp = alloc::vec![0u8; cpusetsize];
     let max_bits = cpusetsize * 8;
     for cpu in 0..MAX_HARTS {

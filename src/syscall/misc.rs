@@ -1,8 +1,50 @@
 use crate::{
-    mm::translated_mutref,
+    mm::{translated_byte_buffer, translated_mutref},
     task::processor::{current_process, current_task},
     trap::get_current_token,
+    time::get_time,
 };
+use core::mem::size_of;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// ---- Linux-like TID encoding ------------------------------------------------
+//
+// Internally, CongCore uses a small per-process `tid` index for locating per-thread resources
+// (trap context pages, optional kernel-managed stacks). glibc expects a Linux-style `gettid()`
+// that is:
+// - equal to `getpid()` for the main thread, and
+// - unique across all threads in the system.
+//
+// To avoid refactoring the internal resource indexing, we encode non-main thread IDs into
+// a 32-bit range with a magic bit so they won't collide with normal PIDs.
+const LINUX_TID_MAGIC: usize = 1 << 30;
+// Use 15 bits for per-process thread index to avoid overlapping the magic bit:
+// (tgid << 15) occupies bits [15..29] for typical OSComp PID ranges (< 32768).
+const LINUX_TID_PID_SHIFT: usize = 15;
+
+pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
+    if tid_index == 0 {
+        tgid
+    } else {
+        LINUX_TID_MAGIC | (tgid << LINUX_TID_PID_SHIFT) | (tid_index & 0x7fff)
+    }
+}
+
+fn current_tid_index() -> usize {
+    current_task()
+        .unwrap()
+        .borrow_mut()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid
+}
+
+fn current_linux_tid() -> usize {
+    encode_linux_tid(current_process().getpid(), current_tid_index())
+}
+
+// -----------------------------------------------------------------------------
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -97,11 +139,14 @@ pub fn syscall_setsid() -> isize {
 /// pointer and return a Linux-like TID (use PID as TID).
 pub fn syscall_set_tid_address(_tidptr: usize) -> isize {
     let task = current_task().unwrap();
-    if _tidptr != 0 {
+    let tid_index = {
         let mut inner = task.borrow_mut();
-        inner.clear_child_tid = Some(_tidptr);
-    }
-    task.borrow_mut().res.as_ref().unwrap().tid as isize
+        if _tidptr != 0 {
+            inner.clear_child_tid = Some(_tidptr);
+        }
+        inner.res.as_ref().unwrap().tid
+    };
+    encode_linux_tid(current_process().getpid(), tid_index) as isize
 }
 
 pub fn syscall_getuid() -> isize {
@@ -119,7 +164,7 @@ pub fn syscall_getegid() -> isize {
 
 /// Linux `gettid(2)` (syscall 178 on riscv64).
 pub fn syscall_gettid_linux() -> isize {
-    current_task().unwrap().borrow_mut().res.as_ref().unwrap().tid as isize
+    current_linux_tid() as isize
 }
 
 /// Linux `set_robust_list(2)` (syscall 99 on riscv64).
@@ -128,4 +173,143 @@ pub fn syscall_gettid_linux() -> isize {
 /// but returning success keeps single-threaded apps progressing.
 pub fn syscall_set_robust_list(_head: usize, _len: usize) -> isize {
     0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RLimit64 {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+/// Linux `prlimit64(2)` (syscall 261 on riscv64).
+///
+/// Provide a permissive "unlimited" answer for common queries (e.g. RLIMIT_STACK).
+pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_limit: usize) -> isize {
+    if old_limit != 0 {
+        let token = get_current_token();
+        *translated_mutref(token, old_limit as *mut RLimit64) = RLimit64 {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+    }
+    0
+}
+
+/// Linux `getrandom(2)` (syscall 278 on riscv64).
+///
+/// Fill the buffer with a simple xorshift PRNG seeded from time and pid/tid.
+pub fn syscall_getrandom(buf: usize, len: usize, _flags: u32) -> isize {
+    if buf == 0 {
+        return 0;
+    }
+    let token = get_current_token();
+    let mut seed = (get_time() as u64)
+        ^ ((current_process().getpid() as u64) << 32)
+        ^ (current_linux_tid() as u64);
+    let chunks = translated_byte_buffer(token, buf as *mut u8, len);
+    let mut written = 0usize;
+    for chunk in chunks {
+        for b in chunk {
+            // xorshift64*
+            let mut x = seed;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x2545F4914F6CDD1D);
+            seed = x;
+            *b = (x & 0xff) as u8;
+            written += 1;
+        }
+    }
+    written as isize
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// Linux `ppoll(2)` (syscall 73 on riscv64).
+///
+/// Minimal readiness reporting for shells (busybox/ash) and glibc helpers.
+/// We conservatively mark fds as ready if they are readable/writable.
+pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize, _sigsetsize: usize) -> isize {
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const EBADF: isize = -9;
+
+    if nfds == 0 {
+        return 0;
+    }
+    if fds_ptr == 0 {
+        return 0;
+    }
+
+    let token = get_current_token();
+    let process = current_process();
+    let mut ready = 0isize;
+    for i in 0..nfds {
+        let pfd = translated_mutref(token, (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd);
+        if pfd.fd < 0 {
+            pfd.revents = 0;
+            continue;
+        }
+        let fd = pfd.fd as usize;
+        let file = {
+            let inner = process.borrow_mut();
+            if fd >= inner.fd_table.len() {
+                None
+            } else {
+                inner.fd_table[fd].clone()
+            }
+        };
+        let Some(file) = file else {
+            pfd.revents = 0;
+            return EBADF;
+        };
+        let mut revents: i16 = 0;
+        if (pfd.events & POLLIN) != 0 && file.readable() {
+            revents |= POLLIN;
+        }
+        if (pfd.events & POLLOUT) != 0 && file.writable() {
+            revents |= POLLOUT;
+        }
+        pfd.revents = revents;
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+    ready
+}
+
+/// Linux `umask(2)` (syscall 166 on riscv64).
+///
+/// A minimal implementation for daemon() and common utilities.
+pub fn syscall_umask(mask: usize) -> isize {
+    static UMASK: AtomicUsize = AtomicUsize::new(0);
+    let prev = UMASK.swap(mask & 0o777, Ordering::Relaxed);
+    prev as isize
+}
+
+/// Linux `ioctl(2)` (syscall 29 on riscv64).
+///
+/// We don't model TTYs yet; return `ENOTTY` for most requests to avoid `ENOSYS`
+/// aborts in busybox/glibc helpers.
+pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
+    const EBADF: isize = -9;
+    const ENOTTY: isize = -25;
+
+    let process = current_process();
+    let exists = {
+        let inner = process.borrow_mut();
+        fd < inner.fd_table.len() && inner.fd_table[fd].is_some()
+    };
+    if !exists {
+        return EBADF;
+    }
+    ENOTTY
 }

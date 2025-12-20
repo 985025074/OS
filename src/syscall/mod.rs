@@ -15,8 +15,10 @@ mod time_sys;
 mod sched;
 pub(crate) mod futex;
 const SYSCALL_GETCWD: usize = 17;
+const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
+const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_UMOUNT2: usize = 39;
@@ -24,12 +26,15 @@ const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
+const SYSCALL_VFORK: usize = 58;
 const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_READV: usize = 65;
 const SYSCALL_WRITEV: usize = 66;
+const SYSCALL_PPOLL: usize = 73;
+const SYSCALL_NEWFSTATAT: usize = 78;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
@@ -37,6 +42,7 @@ const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_SCHED_SETPARAM: usize = 118;
 const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
 const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
@@ -52,6 +58,7 @@ const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETSID: usize = 156;
 const SYSCALL_SETSID: usize = 157;
 const SYSCALL_UNAME: usize = 160;
+const SYSCALL_UMASK: usize = 166;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
@@ -67,6 +74,8 @@ const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_WAIT4: usize = 260;
+const SYSCALL_PRLIMIT64: usize = 261;
+const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
 const SYSCALL_SIGRETURN: usize = 139; // rt_sigreturn
@@ -117,8 +126,10 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
     // );
     match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
+        SYSCALL_FCNTL => filesystem::syscall_fcntl(args[0], args[1], args[2]),
         SYSCALL_DUP => filesystem::syscall_dup(args[0]),
         SYSCALL_DUP3 => filesystem::syscall_dup3(args[0], args[1], args[2]),
+        SYSCALL_IOCTL => misc::syscall_ioctl(args[0], args[1], args[2]),
         SYSCALL_MKDIRAT => filesystem::syscall_mkdirat(args[0] as isize, args[1], args[2]),
         SYSCALL_UNLINKAT => filesystem::syscall_unlinkat(args[0] as isize, args[1], args[2]),
         SYSCALL_UMOUNT2 => misc::syscall_umount2(args[0], args[1]),
@@ -129,7 +140,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => flow::syscall_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => flow::syscall_readv(args[0], args[1], args[2]),
         SYSCALL_WRITEV => flow::syscall_writev(args[0], args[1], args[2]),
+        SYSCALL_PPOLL => misc::syscall_ppoll(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETDENTS64 => filesystem::syscall_getdents64(args[0], args[1], args[2]),
+        SYSCALL_NEWFSTATAT => filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_FSTAT => filesystem::syscall_fstat(args[0], args[1]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit(args[0]),
@@ -137,6 +150,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FUTEX => futex::syscall_futex(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_SET_ROBUST_LIST => misc::syscall_set_robust_list(args[0], args[1]),
         SYSCALL_NANOSLEEP => time_sys::syscall_nanosleep(args[0], args[1]),
+        SYSCALL_CLOCK_GETTIME => time_sys::syscall_clock_gettime(args[0], args[1]),
         SYSCALL_SCHED_SETPARAM => sched::syscall_sched_setparam(args[0], args[1]),
         SYSCALL_SCHED_SETSCHEDULER => sched::syscall_sched_setscheduler(args[0], args[1], args[2]),
         SYSCALL_SCHED_GETSCHEDULER => sched::syscall_sched_getscheduler(args[0]),
@@ -152,6 +166,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETSID => misc::syscall_getsid(args[0]),
         SYSCALL_SETSID => misc::syscall_setsid(),
         SYSCALL_UNAME => misc::syscall_uname(args[0]),
+        SYSCALL_UMASK => misc::syscall_umask(args[0]),
         SYSCALL_GETTIMEOFDAY => time_sys::syscall_gettimeofday(args[0], args[1]),
         SYSCALL_WAIT4 => process::syscall_wait4(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_EXECVE => process::syscall_execve(args[0], args[1], args[2]),
@@ -167,7 +182,10 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNMAP => memory::syscall_munmap(args[0], args[1]),
         SYSCALL_MMAP => memory::syscall_mmap(args[0], args[1], args[2], args[3], args[4] as isize, args[5]),
         SYSCALL_MPROTECT => memory::syscall_mprotect(args[0], args[1], args[2]),
+        SYSCALL_PRLIMIT64 => misc::syscall_prlimit64(args[0], args[1], args[2], args[3]),
+        SYSCALL_GETRANDOM => misc::syscall_getrandom(args[0], args[1], args[2] as u32),
         SYSCALL_CLOSE => filesystem::syscall_close(args[0]),
+        SYSCALL_VFORK => process::syscall_vfork(),
         SYSCALL_PIPE2 => filesystem::syscall_pipe2(args[0], args[1]),
 
         SYSCALL_KILL => signal::syscall_kill(args[0], args[1] as i32),

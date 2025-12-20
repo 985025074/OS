@@ -17,9 +17,9 @@ use crate::{
     },
     trap::init_trap,
 };
-
 use alloc::{sync::Arc, task, vec::Vec};
 use lazy_static::lazy_static;
+use log;
 use spin::Mutex;
 
 use crate::debug_config::DEBUG_SCHED;
@@ -145,8 +145,7 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 }
 pub fn idle_task() {
     #[allow(dead_code)]
-    static EMPTY_SPINS: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
+    static EMPTY_SPINS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     loop {
         // Ensure kernel-mode traps use the kernel handler (stvec points to alltraps_k)
         init_trap();
@@ -161,7 +160,10 @@ pub fn idle_task() {
         if let Some(task) = local_processor().lock().take_pending_blocked() {
             // The task is now off CPU on this hart.
             task.clear_on_cpu();
-            if task.wakeup_pending.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            if task
+                .wakeup_pending
+                .swap(false, core::sync::atomic::Ordering::AcqRel)
+            {
                 let mut inner = task.borrow_mut();
                 inner.task_status = TaskStatus::Ready;
                 drop(inner);
@@ -302,7 +304,11 @@ pub fn block_current_and_run_next() {
     let mut task_inner = task.borrow_mut();
     if crate::debug_config::DEBUG_TIMER {
         let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-        log::debug!("[block] tid={} status_before={:?}", tid, task_inner.task_status);
+        log::debug!(
+            "[block] tid={} status_before={:?}",
+            tid,
+            task_inner.task_status
+        );
     }
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     let should_block = match task_inner.task_status {
@@ -368,7 +374,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         wakeup_task(waiter);
     }
 
-    crate::println!(
+    log::debug!(
         "[exit] pid={} tid={} exit_code={}",
         process.getpid(),
         tid,

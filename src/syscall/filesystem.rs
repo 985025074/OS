@@ -18,6 +18,13 @@ const O_RDWR: usize = 0x2;
 const O_CREAT: usize = 0x40;
 const O_DIRECTORY: usize = 0x10000;
 
+// Linux errno (negative return in kernel ABI).
+const EBADF: isize = -9;
+const ENOENT: isize = -2;
+const EINVAL: isize = -22;
+const EMFILE: isize = -24;
+const ENOTDIR: isize = -20;
+
 fn normalize_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
@@ -51,6 +58,21 @@ fn normalize_path(cwd: &str, path: &str) -> String {
     out
 }
 
+fn normalize_relative_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            parts.pop();
+            continue;
+        }
+        parts.push(seg);
+    }
+    parts.join("/")
+}
+
 fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -81,11 +103,56 @@ fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
         .map(|o| o.ext4_inode())
 }
 
+pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
+    // Minimal `fcntl(2)` support for busybox/ash/glibc startup.
+    const F_DUPFD: usize = 0;
+    const F_GETFD: usize = 1;
+    const F_SETFD: usize = 2;
+    const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+
+    match cmd {
+        F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
+            // We don't track per-fd flags yet; pretend success.
+            if get_fd_file(fd).is_none() {
+                return EBADF;
+            }
+            if cmd == F_GETFD || cmd == F_GETFL {
+                return 0;
+            }
+            0
+        }
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let Some(file) = get_fd_file(fd) else {
+                return EBADF;
+            };
+            let minfd = arg;
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            let mut newfd = minfd;
+            while newfd < inner.fd_table.len() && inner.fd_table[newfd].is_some() {
+                newfd += 1;
+            }
+            if newfd >= inner.fd_table.len() {
+                // Extend fd table to fit.
+                if newfd > 4096 {
+                    return EMFILE;
+                }
+                inner.fd_table.resize(newfd + 1, None);
+            }
+            inner.fd_table[newfd] = Some(file);
+            newfd as isize
+        }
+        _ => EINVAL,
+    }
+}
+
 pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
-        return -1;
+        return ENOENT;
     }
 
     // Pseudo files for minimal proc/sys/dev compatibility.
@@ -124,29 +191,64 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     let base_inode = base_inode.unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE));
 
     // Resolve target.
-    let mut inode = base_inode.find_path(&path);
+    let mut inode = if path.starts_with('/') {
+        let abs = normalize_path("/", &path);
+        ROOT_INODE.find_path(&abs)
+    } else if dirfd == AT_FDCWD {
+        let abs = normalize_path(&cwd, &path);
+        ROOT_INODE.find_path(&abs)
+    } else {
+        // dirfd-based relative lookup (best-effort, without an absolute cwd string).
+        let rel = normalize_relative_path(&path);
+        if rel.is_empty() {
+            Some(alloc::sync::Arc::clone(&base_inode))
+        } else {
+            base_inode.find_path(&rel)
+        }
+    };
 
     // CREATE: create file if missing.
     if inode.is_none() && (flags & O_CREAT != 0) {
-        let (parent_path, name) = match split_parent_and_name(&path) {
-            Some(v) => v,
-            None => return -1,
-        };
-        let parent = if parent_path.is_empty() {
-            alloc::sync::Arc::clone(&base_inode)
+        if path.starts_with('/') || dirfd == AT_FDCWD {
+            let abs = if path.starts_with('/') {
+                normalize_path("/", &path)
+            } else {
+                normalize_path(&cwd, &path)
+            };
+            let (parent_path, name) = match split_parent_and_name(&abs) {
+                Some(v) => v,
+                None => return EINVAL,
+            };
+            let parent = if parent_path.is_empty() {
+                alloc::sync::Arc::clone(&ROOT_INODE)
+            } else {
+                ROOT_INODE.find_path(parent_path).unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE))
+            };
+            inode = parent.create_file(name).ok();
         } else {
-            base_inode.find_path(parent_path).unwrap_or_else(|| alloc::sync::Arc::clone(&base_inode))
-        };
-        inode = parent.create_file(name).ok();
+            let rel = normalize_relative_path(&path);
+            let (parent_path, name) = match split_parent_and_name(&rel) {
+                Some(v) => v,
+                None => return EINVAL,
+            };
+            let parent = if parent_path.is_empty() {
+                alloc::sync::Arc::clone(&base_inode)
+            } else {
+                base_inode
+                    .find_path(parent_path)
+                    .unwrap_or_else(|| alloc::sync::Arc::clone(&base_inode))
+            };
+            inode = parent.create_file(name).ok();
+        }
     }
 
     let inode = match inode {
         Some(i) => i,
-        None => return -1,
+        None => return ENOENT,
     };
 
     if (flags & O_DIRECTORY) != 0 && !inode.is_dir() {
-        return -1;
+        return ENOTDIR;
     }
 
     let os_inode = alloc::sync::Arc::new(OSInode::new(readable, writable, inode));
@@ -453,7 +555,7 @@ fn write_bytes_user(token: usize, mut dst: usize, bytes: &[u8]) {
 
 pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     let Some(inode) = get_fd_inode(fd) else {
-        return -1;
+        return EBADF;
     };
 
     let mode = if inode.is_dir() { 0x040000 } else { 0x100000 };
@@ -487,9 +589,73 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     0
 }
 
+pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: usize) -> isize {
+    if st_ptr == 0 {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let path = translated_str(token, pathname as *const u8);
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let abs = if path.starts_with('/') {
+        normalize_path("/", &path)
+    } else if dirfd == AT_FDCWD {
+        normalize_path(&cwd, &path)
+    } else if dirfd >= 0 {
+        // Resolve relative to an open directory fd if possible; fallback to cwd.
+        if let Some(inode) = get_fd_inode(dirfd as usize) {
+            // Best-effort: derive a path-like context is hard without reverse lookup;
+            // just resolve relative to cwd for now.
+            let _ = inode;
+            normalize_path(&cwd, &path)
+        } else {
+            return EBADF;
+        }
+    } else {
+        normalize_path(&cwd, &path)
+    };
+
+    let Some(inode) = ROOT_INODE.find_path(&abs) else {
+        return ENOENT;
+    };
+
+    let mode = if inode.is_dir() { 0x040000 } else { 0x100000 };
+    let size = inode.size() as i64;
+    let blocks = ((inode.size() + 511) / 512) as u64;
+
+    let st = KStat {
+        st_dev: 0,
+        st_ino: inode.inode_num() as u64,
+        st_mode: mode,
+        st_nlink: 1,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad: 0,
+        st_size: size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks,
+        st_atime_sec: 0,
+        st_atime_nsec: 0,
+        st_mtime_sec: 0,
+        st_mtime_nsec: 0,
+        st_ctime_sec: 0,
+        st_ctime_nsec: 0,
+        __unused: [0, 0],
+    };
+
+    *translated_mutref(token, st_ptr as *mut KStat) = st;
+    0
+}
+
 pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
-        return -1;
+        return EBADF;
     };
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
         return -1;

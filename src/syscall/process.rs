@@ -4,6 +4,7 @@ use core::mem::size_of;
 use crate::{
     fs::ROOT_INODE,
     mm::{kernel_token, translated_mutref, translated_single_address, translated_str},
+    syscall::misc::encode_linux_tid,
     task::{
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
@@ -90,19 +91,20 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let new_task = Arc::new(TaskControlBlock::new_linux_thread(Arc::clone(&process)));
         new_task.set_cpu_id(select_hart_for_new_task());
 
-        let tid = {
+        let (_tid_index, linux_tid) = {
             let mut new_inner = new_task.borrow_mut();
             let res = new_inner.res.as_ref().unwrap();
-            let tid = res.tid;
+            let tid_index = res.tid;
+            let linux_tid = encode_linux_tid(process.getpid(), tid_index);
 
             // Attach to process thread table.
             {
                 let mut process_inner = process.borrow_mut();
                 let tasks = &mut process_inner.tasks;
-                while tasks.len() < tid + 1 {
+                while tasks.len() < tid_index + 1 {
                     tasks.push(None);
                 }
-                tasks[tid] = Some(Arc::clone(&new_task));
+                tasks[tid_index] = Some(Arc::clone(&new_task));
             }
 
             let trap_cx = new_inner.get_trap_cx();
@@ -120,20 +122,20 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
                 new_inner.clear_child_tid = Some(_ctid);
             }
-            tid
+            (tid_index, linux_tid)
         };
 
         // Parent/child tid pointers live in the shared address space.
         let token = get_current_token();
         if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
-            *translated_mutref(token, _ptid as *mut i32) = tid as i32;
+            *translated_mutref(token, _ptid as *mut i32) = linux_tid as i32;
         }
         if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
-            *translated_mutref(token, _ctid as *mut i32) = tid as i32;
+            *translated_mutref(token, _ctid as *mut i32) = linux_tid as i32;
         }
 
         add_task(new_task);
-        return tid as isize;
+        return linux_tid as isize;
     }
 
     // Fork-like clone (process).
@@ -147,6 +149,17 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.x[2] = stack;
     }
+    child.getpid() as isize
+}
+
+/// Linux `vfork(2)` compatibility.
+///
+/// For now, treat it as a normal `fork(2)` (copy address space). This is
+/// sufficient for busybox/ash and many OSComp scripts, and avoids the strict
+/// parent-blocking/VM-sharing semantics of true vfork.
+pub fn syscall_vfork() -> isize {
+    let process = current_process();
+    let child = process.fork();
     child.getpid() as isize
 }
 

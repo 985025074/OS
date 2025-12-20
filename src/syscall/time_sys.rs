@@ -15,6 +15,13 @@ struct TimeVal {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct TimeSpec {
+    sec: i64,
+    nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct Tms {
     tms_utime: i64,
     tms_stime: i64,
@@ -49,6 +56,21 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     thread::sys_sleep(ms)
 }
 
+pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
+    if tp_ptr == 0 {
+        return -1;
+    }
+    let ticks = get_time() as u64;
+    let ns = ticks.saturating_mul(1_000_000_000) / CLOCK_FREQ as u64;
+    let ts = TimeSpec {
+        sec: (ns / 1_000_000_000) as i64,
+        nsec: (ns % 1_000_000_000) as i64,
+    };
+    let token = get_current_token();
+    *translated_mutref(token, tp_ptr as *mut TimeSpec) = ts;
+    0
+}
+
 pub fn syscall_times(tms_ptr: usize) -> isize {
     if tms_ptr != 0 {
         let token = get_current_token();
@@ -61,4 +83,3 @@ pub fn syscall_times(tms_ptr: usize) -> isize {
     }
     crate::time::get_time_ms() as isize
 }
-
