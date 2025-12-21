@@ -26,6 +26,101 @@ struct PseudoInner {
     kind: PseudoKind,
 }
 
+/// A minimal pseudo directory for `/proc`, `/sys`, etc.
+///
+/// Directory iteration is implemented in `syscall_getdents64` by downcasting.
+pub struct PseudoDir {
+    entries: Vec<PseudoDirent>,
+    inner: Mutex<PseudoDirInner>,
+}
+
+#[derive(Clone)]
+pub struct PseudoDirent {
+    pub name: alloc::string::String,
+    pub ino: u64,
+    pub dtype: u8, // Linux DT_* values (e.g. 4=DIR, 8=REG)
+}
+
+struct PseudoDirInner {
+    index: usize,
+}
+
+impl PseudoDir {
+    pub fn new(entries: Vec<PseudoDirent>) -> Self {
+        Self {
+            entries,
+            inner: Mutex::new(PseudoDirInner { index: 0 }),
+        }
+    }
+
+    pub fn entries(&self) -> &[PseudoDirent] {
+        &self.entries
+    }
+
+    pub fn index(&self) -> usize {
+        self.inner.lock().index
+    }
+
+    pub fn set_index(&self, index: usize) {
+        self.inner.lock().index = index;
+    }
+}
+
+impl File for PseudoDir {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn write(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A minimal RTC device node for busybox `hwclock`.
+///
+/// Actual RTC semantics are handled in `syscall_ioctl` by downcasting.
+pub struct RtcFile;
+
+impl RtcFile {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl File for RtcFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        buf.len()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl PseudoFile {
     pub fn new_static(content: &str) -> Self {
         Self {

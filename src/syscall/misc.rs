@@ -304,12 +304,72 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const ENOTTY: isize = -25;
 
     let process = current_process();
-    let exists = {
+    let file = {
         let inner = process.borrow_mut();
-        fd < inner.fd_table.len() && inner.fd_table[fd].is_some()
+        if fd >= inner.fd_table.len() {
+            None
+        } else {
+            inner.fd_table[fd].clone()
+        }
     };
-    if !exists {
+    let Some(file) = file else {
         return EBADF;
+    };
+
+    // Best-effort support for `/dev/misc/rtc` (busybox `hwclock`).
+    if file.as_any().downcast_ref::<crate::fs::RtcFile>().is_some() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct RtcTime {
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
+        }
+
+        if _argp != 0 {
+            let secs = (crate::time::get_time_ms() / 1000) as i64;
+            let tm_sec = (secs % 60) as i32;
+            let tm_min = ((secs / 60) % 60) as i32;
+            let tm_hour = ((secs / 3600) % 24) as i32;
+            let tm_mday = 1 + (secs / 86400) as i32;
+            let rt = RtcTime {
+                tm_sec,
+                tm_min,
+                tm_hour,
+                tm_mday,
+                tm_mon: 0,
+                tm_year: 70,
+                tm_wday: 4,
+                tm_yday: 0,
+                tm_isdst: 0,
+            };
+            let token = get_current_token();
+            *translated_mutref(token, _argp as *mut RtcTime) = rt;
+        }
+        return 0;
     }
+
     ENOTTY
+}
+
+/// Linux `syslog(2)` / `klogctl(2)` (syscall 116 on riscv64).
+///
+/// Busybox `dmesg` calls this. We don't maintain a kernel log buffer for userspace;
+/// return success and (for read requests) an empty buffer.
+pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
+    // Common read actions include 2 (READ), 3 (READ_ALL), 4 (READ_CLEAR).
+    if bufp != 0 && len != 0 {
+        let token = get_current_token();
+        let bufs = translated_byte_buffer(token, bufp as *mut u8, len);
+        for b in bufs {
+            b.fill(0);
+        }
+    }
+    0
 }
