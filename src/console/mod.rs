@@ -7,6 +7,9 @@ struct Stdout;
 
 impl Write for Stdout {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // Record raw bytes into the kernel log buffer for `dmesg`.
+        // Keep `\n` as-is (UART will translate to CRLF separately).
+        crate::klog::append_str(s);
         for c in s.chars() {
             // QEMU's UART expects CRLF for proper newlines.
             if c == '\n' {

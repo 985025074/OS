@@ -363,13 +363,52 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
 /// Busybox `dmesg` calls this. We don't maintain a kernel log buffer for userspace;
 /// return success and (for read requests) an empty buffer.
 pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
-    // Common read actions include 2 (READ), 3 (READ_ALL), 4 (READ_CLEAR).
-    if bufp != 0 && len != 0 {
-        let token = get_current_token();
-        let bufs = translated_byte_buffer(token, bufp as *mut u8, len);
-        for b in bufs {
-            b.fill(0);
+    const EINVAL: isize = -22;
+
+    // `klogctl` actions (Linux uapi).
+    const SYSLOG_ACTION_READ: usize = 2;
+    const SYSLOG_ACTION_READ_ALL: usize = 3;
+    const SYSLOG_ACTION_READ_CLEAR: usize = 4;
+    const SYSLOG_ACTION_CLEAR: usize = 5;
+    const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
+    const SYSLOG_ACTION_SIZE_UNREAD: usize = 11;
+
+    match _type {
+        SYSLOG_ACTION_SIZE_BUFFER => return crate::klog::capacity() as isize,
+        SYSLOG_ACTION_SIZE_UNREAD => return crate::klog::len() as isize,
+        SYSLOG_ACTION_CLEAR => {
+            crate::klog::clear();
+            return 0;
+        }
+        _ => {}
+    }
+
+    if bufp == 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let data = match _type {
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL => crate::klog::snapshot(len),
+        SYSLOG_ACTION_READ_CLEAR => crate::klog::snapshot_and_clear(len),
+        _ => return EINVAL,
+    };
+
+    let token = get_current_token();
+    let bufs = translated_byte_buffer(token, bufp as *mut u8, len);
+    let mut off = 0usize;
+    for b in bufs {
+        if off >= data.len() {
+            break;
+        }
+        let n = core::cmp::min(b.len(), data.len() - off);
+        b[..n].copy_from_slice(&data[off..off + n]);
+        off += n;
+        if n < b.len() {
+            break;
         }
     }
-    0
+    data.len() as isize
 }

@@ -1264,6 +1264,14 @@ fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
 
+fn read_u32_le(buf: &[u8]) -> u32 {
+    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+
+fn read_u16_le(buf: &[u8]) -> u16 {
+    u16::from_le_bytes([buf[0], buf[1]])
+}
+
 fn write_bytes_user(token: usize, mut dst: usize, bytes: &[u8]) {
     for b in bytes {
         *translated_mutref(token, dst as *mut u8) = *b;
@@ -1531,14 +1539,20 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return ENOTDIR;
     };
 
-    // Keep a separate per-fd index to avoid interfering with file read offsets.
-    let entries = inode.dir_entries();
-    let mut index = os_inode.dir_offset();
-    if index >= entries.len() {
+    if len == 0 {
         return 0;
     }
 
-    if len == 0 {
+    // Stream ext4 directory entries from the on-disk format using a byte offset.
+    //
+    // This avoids rebuilding `inode.dir_entries()` on every `getdents64` call, which
+    // becomes O(n^2) for large directories (busybox `du`/`find`).
+    const BLOCK_SIZE: usize = 4096;
+    const EXT4_DIRENT_HDR: usize = 8; // u32 ino, u16 rec_len, u8 name_len, u8 file_type
+
+    let dir_size = inode.size() as usize;
+    let mut off = os_inode.dir_offset();
+    if off >= dir_size {
         return 0;
     }
 
@@ -1546,39 +1560,80 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         let pid = current_process().getpid();
         if pid >= 2 && (fd == 3 || fd == 4) {
             crate::println!(
-                "[fs] getdents64(pid={}) fd={} len={} idx={} entries={}",
+                "[fs] getdents64(pid={}) fd={} len={} off={} dir_size={}",
                 pid,
                 fd,
                 len,
-                index,
-                entries.len()
+                off,
+                dir_size
             );
         }
     }
 
     let mut kbuf = alloc::vec![0u8; len];
     let mut written = 0usize;
-    while index < entries.len() {
-        let (name, ino, ftype) = &entries[index];
-        let name_bytes = name.as_bytes();
-        let reclen = align_up(19 + name_bytes.len() + 1, 8);
-        if written + reclen > len {
+
+    let mut scratch = alloc::vec![0u8; BLOCK_SIZE];
+    while off < dir_size && written + 24 <= len {
+        let block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
+        let within = off - block_start;
+        let to_read = core::cmp::min(BLOCK_SIZE, dir_size - block_start);
+        if to_read < EXT4_DIRENT_HDR || within >= to_read {
             break;
         }
+        inode.read_at(block_start, &mut scratch[..to_read]);
 
-        let base = written;
-        kbuf[base..base + 8].copy_from_slice(&(*ino as u64).to_le_bytes());
-        kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
-        kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        kbuf[base + 18] = dt_type_from_ext4(*ftype);
-        kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
-        kbuf[base + 19 + name_bytes.len()] = 0;
-        for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
-            *b = 0;
+        // Parse entries within this block, starting at `within`.
+        let mut pos = within;
+        while pos + EXT4_DIRENT_HDR <= to_read && written + 24 <= len {
+            let inode_num = read_u32_le(&scratch[pos..pos + 4]);
+            let rec_len = read_u16_le(&scratch[pos + 4..pos + 6]) as usize;
+            let name_len = scratch[pos + 6] as usize;
+            let file_type = scratch[pos + 7];
+
+            if rec_len < EXT4_DIRENT_HDR || pos + rec_len > to_read {
+                // Corrupt/unsupported entry; stop to avoid looping.
+                off = dir_size;
+                break;
+            }
+
+            let next_off = block_start + pos + rec_len;
+            // Skip unused entries (inode_num == 0).
+            if inode_num != 0 && name_len > 0 && pos + EXT4_DIRENT_HDR + name_len <= pos + rec_len {
+                let name_bytes = &scratch[pos + EXT4_DIRENT_HDR..pos + EXT4_DIRENT_HDR + name_len];
+                let reclen = align_up(19 + name_len + 1, 8);
+                if written + reclen > len {
+                    // Caller buffer full; keep current offset for next call.
+                    os_inode.set_dir_offset(block_start + pos);
+                    let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written);
+                    let mut src_off = 0usize;
+                    for ub in user_bufs {
+                        let end = src_off + ub.len();
+                        ub.copy_from_slice(&kbuf[src_off..end]);
+                        src_off = end;
+                    }
+                    return written as isize;
+                }
+
+                let base = written;
+                kbuf[base..base + 8].copy_from_slice(&(inode_num as u64).to_le_bytes());
+                kbuf[base + 8..base + 16].copy_from_slice(&(next_off as i64).to_le_bytes());
+                kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                kbuf[base + 18] = dt_type_from_ext4(file_type);
+                kbuf[base + 19..base + 19 + name_len].copy_from_slice(name_bytes);
+                kbuf[base + 19 + name_len] = 0;
+                for b in kbuf[base + 19 + name_len + 1..base + reclen].iter_mut() {
+                    *b = 0;
+                }
+                written += reclen;
+            }
+
+            pos += rec_len;
+            off = block_start + pos;
+            if off >= dir_size {
+                break;
+            }
         }
-
-        written += reclen;
-        index += 1;
     }
 
     // Copy back to user buffer with per-page translation, avoiding per-byte translation overhead.
@@ -1590,7 +1645,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         src_off = end;
     }
 
-    os_inode.set_dir_offset(index);
+    os_inode.set_dir_offset(off);
     written as isize
 }
 
@@ -1627,7 +1682,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         let inode = os_inode.ext4_inode();
         if inode.is_dir() {
             let cur = os_inode.dir_offset() as isize;
-            let end = inode.dir_entries().len() as isize;
+            let end = inode.size() as isize;
             let new = match whence {
                 SEEK_SET => offset,
                 SEEK_CUR => cur.saturating_add(offset),

@@ -12,6 +12,7 @@ mod console;
 mod debug_config;
 mod drivers;
 mod fs;
+mod klog;
 mod lang_items;
 mod log;
 mod mm;
