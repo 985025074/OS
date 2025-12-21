@@ -16,6 +16,7 @@ const O_RDONLY: usize = 0x0;
 const O_WRONLY: usize = 0x1;
 const O_RDWR: usize = 0x2;
 const O_CREAT: usize = 0x40;
+const O_TRUNC: usize = 0x200;
 const O_DIRECTORY: usize = 0x10000;
 
 // Linux errno (negative return in kernel ABI).
@@ -24,9 +25,17 @@ const ENOENT: isize = -2;
 const EINVAL: isize = -22;
 const EMFILE: isize = -24;
 const ENOTDIR: isize = -20;
+const EISDIR: isize = -21;
 const EACCES: isize = -13;
+const EEXIST: isize = -17;
 const EXDEV: isize = -18;
 const ESPIPE: isize = -29;
+const EROFS: isize = -30;
+const ENOSPC: isize = -28;
+const ENOSYS: isize = -38;
+const ENAMETOOLONG: isize = -36;
+const EOPNOTSUPP: isize = -95;
+const ENOTEMPTY: isize = -39;
 
 fn normalize_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
@@ -106,6 +115,83 @@ fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
         .map(|o| o.ext4_inode())
 }
 
+fn is_pseudo_path(abs: &str) -> bool {
+    abs == "/sys"
+        || abs.starts_with("/sys/")
+        || abs == "/proc"
+        || abs.starts_with("/proc/")
+        || abs == "/dev"
+        || abs.starts_with("/dev/")
+}
+
+enum AtPath {
+    /// An ext4 lookup rooted at `/`.
+    Ext4Abs(String),
+    /// An ext4 lookup rooted at an open directory fd.
+    Ext4Rel {
+        base: alloc::sync::Arc<ext4_fs::Inode>,
+        rel: String,
+    },
+    /// A pseudo filesystem lookup expressed as an absolute path.
+    PseudoAbs(String),
+}
+
+fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+
+    // Absolute path: ignore dirfd.
+    if path.starts_with('/') {
+        let abs = normalize_path("/", path);
+        return Ok(if is_pseudo_path(&abs) {
+            AtPath::PseudoAbs(abs)
+        } else {
+            AtPath::Ext4Abs(abs)
+        });
+    }
+
+    // Relative path.
+    if dirfd == AT_FDCWD {
+        let process = current_process();
+        let cwd = { process.borrow_mut().cwd.clone() };
+        let abs = normalize_path(&cwd, path);
+        return Ok(if is_pseudo_path(&abs) {
+            AtPath::PseudoAbs(abs)
+        } else {
+            AtPath::Ext4Abs(abs)
+        });
+    }
+
+    if dirfd < 0 {
+        return Err(EBADF);
+    }
+
+    let Some(file) = get_fd_file(dirfd as usize) else {
+        return Err(EBADF);
+    };
+
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        let abs = normalize_path(pdir.path(), path);
+        return Ok(if is_pseudo_path(&abs) {
+            AtPath::PseudoAbs(abs)
+        } else {
+            AtPath::Ext4Abs(abs)
+        });
+    }
+
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let base = os_inode.ext4_inode();
+        if !base.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let rel = normalize_relative_path(path);
+        return Ok(AtPath::Ext4Rel { base, rel });
+    }
+
+    Err(ENOTDIR)
+}
+
 fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -117,12 +203,34 @@ fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
     } else if dirfd == AT_FDCWD {
         normalize_path(&cwd, path)
     } else if dirfd >= 0 {
-        // We don't have reverse lookup from inode -> absolute path; best-effort use cwd.
-        normalize_path(&cwd, path)
+        // If dirfd refers to a pseudo directory, resolve relative to it.
+        // For ext4 dirfds, we can't reliably reconstruct an absolute path (no reverse lookup).
+        if let Some(file) = get_fd_file(dirfd as usize) {
+            if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+                normalize_path(pdir.path(), path)
+            } else {
+                normalize_path(&cwd, path)
+            }
+        } else {
+            return None;
+        }
     } else {
         normalize_path(&cwd, path)
     };
     Some(abs)
+}
+
+fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
+    match e {
+        ext4_fs::Ext4Error::NotADirectory => ENOTDIR,
+        ext4_fs::Ext4Error::NotAFile => EISDIR,
+        ext4_fs::Ext4Error::AlreadyExists => EEXIST,
+        ext4_fs::Ext4Error::NotFound => ENOENT,
+        ext4_fs::Ext4Error::NoSpace => ENOSPC,
+        ext4_fs::Ext4Error::NameTooLong => ENAMETOOLONG,
+        ext4_fs::Ext4Error::Unsupported => EOPNOTSUPP,
+        ext4_fs::Ext4Error::InvalidInput => EINVAL,
+    }
 }
 
 fn inode_mode_allows(inode_mode: u16, mask: usize) -> bool {
@@ -214,38 +322,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         }
     }
 
-    // Pseudo files for minimal proc/sys/dev compatibility.
-    // Use the resolved absolute path so callers like `openat(AT_FDCWD, "proc", ...)`
-    // also hit the pseudo filesystem.
-    if let Some(abs) = resolve_abs_path(dirfd, &path) {
-        if abs == "/sys"
-            || abs.starts_with("/sys/")
-            || abs == "/proc"
-            || abs.starts_with("/proc/")
-            || abs == "/dev"
-            || abs.starts_with("/dev/")
-        {
-            if let Some(file) = open_pseudo(&abs) {
-                let process = current_process();
-                let mut inner = process.borrow_mut();
-                let fd = inner.alloc_fd();
-                inner.fd_table[fd] = Some(file);
-                if crate::debug_config::DEBUG_FS {
-                    let pid = current_process().getpid();
-                    if pid >= 2 && (abs == "/proc" || abs == "/sys" || abs == "/dev") {
-                        crate::println!(
-                            "[fs] openat(pid={}) pseudo '{}' -> fd={}",
-                            pid,
-                            abs,
-                            fd
-                        );
-                    }
-                }
-                return fd as isize;
-            }
-        }
-    }
-
     let (readable, writable) = match flags & O_ACCMODE {
         O_RDONLY => (true, false),
         O_WRONLY => (false, true),
@@ -253,71 +329,88 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         _ => (true, false),
     };
 
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-
-    // Resolve base directory.
-    let base_inode = if path.starts_with('/') {
-        None
-    } else if dirfd == AT_FDCWD {
-        ROOT_INODE.find_path(&cwd)
-    } else if dirfd >= 0 {
-        get_fd_inode(dirfd as usize)
-    } else {
-        None
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    let base_inode = base_inode.unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE));
-
-    // Resolve target.
-    let mut inode = if path.starts_with('/') {
-        let abs = normalize_path("/", &path);
-        ROOT_INODE.find_path(&abs)
-    } else if dirfd == AT_FDCWD {
-        let abs = normalize_path(&cwd, &path);
-        ROOT_INODE.find_path(&abs)
-    } else {
-        // dirfd-based relative lookup (best-effort, without an absolute cwd string).
-        let rel = normalize_relative_path(&path);
-        if rel.is_empty() {
-            Some(alloc::sync::Arc::clone(&base_inode))
-        } else {
-            base_inode.find_path(&rel)
+    // Pseudo fs: `/proc`, `/sys`, `/dev`.
+    if let AtPath::PseudoAbs(abs) = &at {
+        let Some(file) = open_pseudo(abs) else {
+            return ENOENT;
+        };
+        let process = current_process();
+        let mut inner = process.borrow_mut();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(file);
+        if crate::debug_config::DEBUG_FS {
+            let pid = current_process().getpid();
+            if pid >= 2 && (abs == "/proc" || abs == "/sys" || abs == "/dev") {
+                crate::println!("[fs] openat(pid={}) pseudo '{}' -> fd={}", pid, abs, fd);
+            }
         }
+        return fd as isize;
+    }
+
+    // ext4 lookup.
+    let mut inode = match &at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(alloc::sync::Arc::clone(base))
+            } else {
+                base.find_path(rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
     };
 
-    // CREATE: create file if missing.
+    // CREATE: create file if missing (Linux: only affects the final component).
     if inode.is_none() && (flags & O_CREAT != 0) {
-        if path.starts_with('/') || dirfd == AT_FDCWD {
-            let abs = if path.starts_with('/') {
-                normalize_path("/", &path)
-            } else {
-                normalize_path(&cwd, &path)
-            };
-            let (parent_path, name) = match split_parent_and_name(&abs) {
-                Some(v) => v,
-                None => return EINVAL,
-            };
-            let parent = if parent_path.is_empty() {
-                alloc::sync::Arc::clone(&ROOT_INODE)
-            } else {
-                ROOT_INODE.find_path(parent_path).unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE))
-            };
-            inode = parent.create_file(name).ok();
-        } else {
-            let rel = normalize_relative_path(&path);
-            let (parent_path, name) = match split_parent_and_name(&rel) {
-                Some(v) => v,
-                None => return EINVAL,
-            };
-            let parent = if parent_path.is_empty() {
-                alloc::sync::Arc::clone(&base_inode)
-            } else {
-                base_inode
-                    .find_path(parent_path)
-                    .unwrap_or_else(|| alloc::sync::Arc::clone(&base_inode))
-            };
-            inode = parent.create_file(name).ok();
+        match &at {
+            AtPath::Ext4Abs(abs) => {
+                let Some((parent_path, name)) = split_parent_and_name(abs) else {
+                    return EINVAL;
+                };
+                if name.is_empty() {
+                    return EISDIR;
+                }
+                let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+                let Some(parent) = ROOT_INODE.find_path(parent_path) else {
+                    return ENOENT;
+                };
+                if !parent.is_dir() {
+                    return ENOTDIR;
+                }
+                inode = match parent.create_file(name) {
+                    Ok(i) => Some(i),
+                    Err(e) => return ext4_err_to_errno(e),
+                };
+            }
+            AtPath::Ext4Rel { base, rel } => {
+                let Some((parent_path, name)) = split_parent_and_name(rel) else {
+                    return EINVAL;
+                };
+                if name.is_empty() {
+                    return EISDIR;
+                }
+                let parent = if parent_path.is_empty() {
+                    alloc::sync::Arc::clone(base)
+                } else {
+                    let Some(p) = base.find_path(parent_path) else {
+                        return ENOENT;
+                    };
+                    p
+                };
+                if !parent.is_dir() {
+                    return ENOTDIR;
+                }
+                inode = match parent.create_file(name) {
+                    Ok(i) => Some(i),
+                    Err(e) => return ext4_err_to_errno(e),
+                };
+            }
+            AtPath::PseudoAbs(_) => unreachable!(),
         }
     }
 
@@ -326,11 +419,35 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         None => return ENOENT,
     };
 
+    // Linux: opening a directory for write is not allowed.
+    if inode.is_dir() && (flags & O_ACCMODE) != O_RDONLY {
+        return EISDIR;
+    }
+
+    // Basic permission check (no uid/gid model; use "other" permission bits).
+    let mut mask = 0usize;
+    if readable {
+        mask |= 4;
+    }
+    if writable {
+        mask |= 2;
+    }
+    if !inode_mode_allows(inode.mode(), mask) {
+        return EACCES;
+    }
+
     if (flags & O_DIRECTORY) != 0 && !inode.is_dir() {
         return ENOTDIR;
     }
 
+    if (flags & O_TRUNC) != 0 && writable && inode.is_file() {
+        if let Err(e) = inode.clear() {
+            return ext4_err_to_errno(e);
+        }
+    }
+
     let os_inode = alloc::sync::Arc::new(OSInode::new(readable, writable, inode));
+    let process = current_process();
     let mut inner = process.borrow_mut();
     let fd = inner.alloc_fd();
     inner.fd_table[fd] = Some(os_inode);
@@ -362,7 +479,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         for pid in pids {
             entries.push(PseudoDirent { name: alloc::format!("{}", pid), ino: pid as u64, dtype: 4 });
         }
-        return Some(alloc::sync::Arc::new(PseudoDir::new(entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc", entries)));
     }
 
     // /proc/self -> current process directory (best-effort; no symlink support).
@@ -374,7 +491,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/self", entries)));
     }
 
     // /proc/<pid> and /proc/<pid>/...
@@ -405,7 +522,8 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                         PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
                         PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
                     ];
-                    return Some(alloc::sync::Arc::new(PseudoDir::new(entries)));
+                    let p = alloc::format!("/proc/{}", pid);
+                    return Some(alloc::sync::Arc::new(PseudoDir::new(&p, entries)));
                 }
                 Some("stat") if it.next().is_none() => {
                     // Provide a Linux-like `/proc/<pid>/stat` line with many fields.
@@ -429,7 +547,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from("devices"), ino: 2, dtype: 4 },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/sys", entries)));
     }
     if path == "/dev" || path == "/dev/" {
         let entries = alloc::vec![
@@ -441,7 +559,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("random"), ino: 5, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("misc"), ino: 6, dtype: 4 },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
     }
     if path == "/dev/misc" || path == "/dev/misc/" {
         let entries = alloc::vec![
@@ -449,7 +567,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from("rtc"), ino: 2, dtype: 8 },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/misc", entries)));
     }
 
     // /sys/devices/system/cpu/*
@@ -521,18 +639,35 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
 pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
-    let Some(abs) = resolve_abs_path(dirfd, &path) else {
+    if path.is_empty() {
         return ENOENT;
-    };
-
-    // Treat known pseudo nodes as always accessible (no uid/gid model yet).
-    if open_pseudo(&abs).is_some() {
-        return 0;
     }
 
-    let Some(inode) = ROOT_INODE.find_path(&abs) else {
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        // Treat known pseudo nodes as always accessible (no uid/gid model yet).
+        return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
+    }
+
+    let inode = match &at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(alloc::sync::Arc::clone(base))
+            } else {
+                base.find_path(rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+    let Some(inode) = inode else {
         return ENOENT;
     };
+
     if !inode_mode_allows(inode.mode(), mode) {
         return EACCES;
     }
@@ -541,10 +676,47 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
 
 /// Linux `readlinkat(2)` (syscall 78 on riscv64).
 ///
-/// Our ext4 implementation currently does not expose symlinks; return `EINVAL`
-/// for non-symlink paths as Linux does.
-pub fn syscall_readlinkat(_dirfd: isize, _pathname: usize, _buf: usize, _bufsiz: usize) -> isize {
-    EINVAL
+/// If the path exists but is not a symlink, Linux returns `EINVAL`.
+///
+/// We currently don't expose ext4 symlink targets to the VFS layer; for a real
+/// symlink we return `ENOSYS`.
+pub fn syscall_readlinkat(dirfd: isize, pathname: usize, _buf: usize, _bufsiz: usize) -> isize {
+    let token = get_current_token();
+    let path = translated_str(token, pathname as *const u8);
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        return if open_pseudo(abs).is_some() { EINVAL } else { ENOENT };
+    }
+
+    let inode = match &at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(alloc::sync::Arc::clone(base))
+            } else {
+                base.find_path(rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+    let Some(inode) = inode else {
+        return ENOENT;
+    };
+
+    const S_IFMT: u16 = 0o170000;
+    const S_IFLNK: u16 = 0o120000;
+    if (inode.mode() & S_IFMT) != S_IFLNK {
+        return EINVAL;
+    }
+    ENOSYS
 }
 
 /// Linux `renameat(2)` (syscall 38 on riscv64).
@@ -552,28 +724,86 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
     let token = get_current_token();
     let old_s = translated_str(token, oldpath as *const u8);
     let new_s = translated_str(token, newpath as *const u8);
-    let Some(old_abs) = resolve_abs_path(olddirfd, &old_s) else {
+    if old_s.is_empty() || new_s.is_empty() {
         return ENOENT;
+    }
+
+    let old_at = match resolve_at_path(olddirfd, &old_s) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    let Some(new_abs) = resolve_abs_path(newdirfd, &new_s) else {
-        return ENOENT;
+    let new_at = match resolve_at_path(newdirfd, &new_s) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    let Some((old_parent, old_name)) = split_parent_and_name(&old_abs) else {
-        return EINVAL;
+
+    if matches!(old_at, AtPath::PseudoAbs(_)) || matches!(new_at, AtPath::PseudoAbs(_)) {
+        return EROFS;
+    }
+
+    fn parent_and_name(at: AtPath) -> Result<(alloc::sync::Arc<ext4_fs::Inode>, alloc::string::String), isize> {
+        match at {
+            AtPath::Ext4Abs(abs) => {
+                if abs == "/" {
+                    return Err(EINVAL);
+                }
+                let Some((parent_path, name)) = split_parent_and_name(&abs) else {
+                    return Err(EINVAL);
+                };
+                if name.is_empty() {
+                    return Err(EINVAL);
+                }
+                let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+                let Some(parent) = ROOT_INODE.find_path(parent_path) else {
+                    return Err(ENOENT);
+                };
+                Ok((parent, alloc::string::String::from(name)))
+            }
+            AtPath::Ext4Rel { base, rel } => {
+                if rel.is_empty() {
+                    return Err(EINVAL);
+                }
+                let Some((parent_path, name)) = split_parent_and_name(&rel) else {
+                    return Err(EINVAL);
+                };
+                if name.is_empty() {
+                    return Err(EINVAL);
+                }
+                let parent = if parent_path.is_empty() {
+                    base
+                } else {
+                    let Some(p) = base.find_path(parent_path) else {
+                        return Err(ENOENT);
+                    };
+                    p
+                };
+                Ok((parent, alloc::string::String::from(name)))
+            }
+            AtPath::PseudoAbs(_) => unreachable!(),
+        }
+    }
+
+    let (old_parent, old_name) = match parent_and_name(old_at) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    let Some((new_parent, new_name)) = split_parent_and_name(&new_abs) else {
-        return EINVAL;
+    let (new_parent, new_name) = match parent_and_name(new_at) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    if old_parent != new_parent {
+
+    if !old_parent.is_dir() || !new_parent.is_dir() {
+        return ENOTDIR;
+    }
+
+    // ext4 implementation only supports rename within the same directory for now.
+    if old_parent.inode_num() != new_parent.inode_num() {
         return EXDEV;
     }
-    let parent_path = if old_parent.is_empty() { "/" } else { old_parent };
-    let Some(parent) = ROOT_INODE.find_path(parent_path) else {
-        return ENOENT;
-    };
-    match parent.rename(old_name, new_name) {
+
+    match old_parent.rename(&old_name, &new_name) {
         Ok(_) => 0,
-        Err(_) => -1,
+        Err(e) => ext4_err_to_errno(e),
     }
 }
 
@@ -589,7 +819,7 @@ pub fn syscall_close(fd: usize) -> isize {
     let process = current_process();
     let mut inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return EBADF;
     }
     inner.fd_table[fd] = None;
     if crate::debug_config::DEBUG_FS {
@@ -603,10 +833,10 @@ pub fn syscall_close(fd: usize) -> isize {
 
 pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
-        return -1;
+        return EBADF;
     };
     if !file.readable() {
-        return -1;
+        return EBADF;
     }
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
@@ -618,10 +848,10 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
 
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
-        return -1;
+        return EBADF;
     };
     if !file.writable() {
-        return -1;
+        return EBADF;
     }
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
@@ -653,7 +883,7 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
 
 pub fn syscall_dup(oldfd: usize) -> isize {
     let Some(file) = get_fd_file(oldfd) else {
-        return -1;
+        return EBADF;
     };
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -664,10 +894,10 @@ pub fn syscall_dup(oldfd: usize) -> isize {
 
 pub fn syscall_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
     if oldfd == newfd {
-        return -1;
+        return EINVAL;
     }
     let Some(file) = get_fd_file(oldfd) else {
-        return -1;
+        return EBADF;
     };
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -682,17 +912,23 @@ pub fn syscall_chdir(pathname: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
-        return -1;
+        return ENOENT;
     }
 
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
     let new_cwd = normalize_path(&cwd, &path);
-    let Some(inode) = ROOT_INODE.find_path(&new_cwd) else {
-        return -1;
-    };
-    if !inode.is_dir() {
-        return -1;
+
+    if let Some(inode) = ROOT_INODE.find_path(&new_cwd) {
+        if !inode.is_dir() {
+            return ENOTDIR;
+        }
+    } else if let Some(node) = open_pseudo(&new_cwd) {
+        if node.as_any().downcast_ref::<PseudoDir>().is_none() {
+            return ENOTDIR;
+        }
+    } else {
+        return ENOENT;
     }
     process.borrow_mut().cwd = new_cwd;
     0
@@ -702,73 +938,155 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, _mode: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
-        return -1;
+        return ENOENT;
     }
 
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-    let base = if path.starts_with('/') {
-        alloc::sync::Arc::clone(&ROOT_INODE)
-    } else if dirfd == AT_FDCWD {
-        ROOT_INODE
-            .find_path(&cwd)
-            .unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE))
-    } else if dirfd >= 0 {
-        get_fd_inode(dirfd as usize).unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE))
-    } else {
-        alloc::sync::Arc::clone(&ROOT_INODE)
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    let (parent_path, name) = match split_parent_and_name(&path) {
-        Some(v) => v,
-        None => return -1,
-    };
-    let parent = if parent_path.is_empty() {
-        base
-    } else {
-        base.find_path(parent_path).unwrap_or(base)
-    };
+    if matches!(at, AtPath::PseudoAbs(_)) {
+        return EROFS;
+    }
 
-    match parent.create_dir(name) {
-        Ok(_) => 0,
-        Err(_) => -1,
+    match at {
+        AtPath::Ext4Abs(abs) => {
+            if abs == "/" {
+                return EEXIST;
+            }
+            let Some((parent_path, name)) = split_parent_and_name(&abs) else {
+                return EINVAL;
+            };
+            if name.is_empty() {
+                return EEXIST;
+            }
+            let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+            let Some(parent) = ROOT_INODE.find_path(parent_path) else {
+                return ENOENT;
+            };
+            if !parent.is_dir() {
+                return ENOTDIR;
+            }
+            match parent.create_dir(name) {
+                Ok(_) => 0,
+                Err(e) => ext4_err_to_errno(e),
+            }
+        }
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                return EEXIST;
+            }
+            let Some((parent_path, name)) = split_parent_and_name(&rel) else {
+                return EINVAL;
+            };
+            if name.is_empty() {
+                return EEXIST;
+            }
+            let parent = if parent_path.is_empty() {
+                base
+            } else {
+                let Some(p) = base.find_path(parent_path) else {
+                    return ENOENT;
+                };
+                p
+            };
+            if !parent.is_dir() {
+                return ENOTDIR;
+            }
+            match parent.create_dir(name) {
+                Ok(_) => 0,
+                Err(e) => ext4_err_to_errno(e),
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
     }
 }
 
 pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
+    const AT_REMOVEDIR: usize = 0x200;
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
-        return -1;
+        return ENOENT;
     }
 
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-    let base = if path.starts_with('/') {
-        alloc::sync::Arc::clone(&ROOT_INODE)
-    } else if dirfd == AT_FDCWD {
-        ROOT_INODE
-            .find_path(&cwd)
-            .unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE))
-    } else if dirfd >= 0 {
-        get_fd_inode(dirfd as usize).unwrap_or_else(|| alloc::sync::Arc::clone(&ROOT_INODE))
-    } else {
-        alloc::sync::Arc::clone(&ROOT_INODE)
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    let (parent_path, name) = match split_parent_and_name(&path) {
-        Some(v) => v,
-        None => return -1,
-    };
-    let parent = if parent_path.is_empty() {
-        base
-    } else {
-        base.find_path(parent_path).unwrap_or(base)
+    if matches!(at, AtPath::PseudoAbs(_)) {
+        return EROFS;
+    }
+
+    let (parent, name) = match at {
+        AtPath::Ext4Abs(abs) => {
+            if abs == "/" {
+                return EISDIR;
+            }
+            let Some((parent_path, name)) = split_parent_and_name(&abs) else {
+                return EINVAL;
+            };
+            if name.is_empty() {
+                return EISDIR;
+            }
+            let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+            let Some(parent) = ROOT_INODE.find_path(parent_path) else {
+                return ENOENT;
+            };
+            (parent, alloc::string::String::from(name))
+        }
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                return EISDIR;
+            }
+            let Some((parent_path, name)) = split_parent_and_name(&rel) else {
+                return EINVAL;
+            };
+            if name.is_empty() {
+                return EISDIR;
+            }
+            let parent = if parent_path.is_empty() {
+                base
+            } else {
+                let Some(p) = base.find_path(parent_path) else {
+                    return ENOENT;
+                };
+                p
+            };
+            (parent, alloc::string::String::from(name))
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
     };
 
-    match parent.unlink(name) {
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+
+    let remove_dir = (_flags & AT_REMOVEDIR) != 0;
+
+    // Validate target type: unlink vs rmdir semantics.
+    let Some(child) = parent.find(&name) else {
+        return ENOENT;
+    };
+    if remove_dir {
+        if !child.is_dir() {
+            return ENOTDIR;
+        }
+        if !child.ls().is_empty() {
+            return ENOTEMPTY;
+        }
+    } else {
+        if child.is_dir() {
+            return EISDIR;
+        }
+    }
+
+    match parent.unlink(&name) {
         Ok(_) => 0,
-        Err(_) => -1,
+        Err(ext4_fs::Ext4Error::Unsupported) => ENOTEMPTY,
+        Err(e) => ext4_err_to_errno(e),
     }
 }
 
@@ -828,14 +1146,26 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     if path.is_empty() {
         return ENOENT;
     }
-    // Best-effort: if path exists, report ext4-like stats.
-    let Some(abs) = resolve_abs_path(AT_FDCWD, &path) else {
-        return ENOENT;
+    let at = match resolve_at_path(AT_FDCWD, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    if ROOT_INODE.find_path(&abs).is_none() {
-        return ENOENT;
+
+    match at {
+        AtPath::PseudoAbs(abs) => {
+            if open_pseudo(&abs).is_none() {
+                return ENOENT;
+            }
+            fill_statfs(st_ptr)
+        }
+        AtPath::Ext4Abs(abs) => {
+            if ROOT_INODE.find_path(&abs).is_none() {
+                return ENOENT;
+            }
+            fill_statfs(st_ptr)
+        }
+        AtPath::Ext4Rel { .. } => unreachable!(),
     }
-    fill_statfs(st_ptr)
 }
 
 /// Linux `utimensat(2)` (syscall 88 on riscv64).
@@ -844,10 +1174,31 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
 pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
-    let Some(abs) = resolve_abs_path(dirfd, &path) else {
+    if path.is_empty() {
         return ENOENT;
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    if ROOT_INODE.find_path(&abs).is_none() {
+
+    if let AtPath::PseudoAbs(_) = at {
+        return EROFS;
+    }
+
+    let inode = match at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(&abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(base)
+            } else {
+                base.find_path(&rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+    if inode.is_none() {
         return ENOENT;
     }
     0
@@ -857,7 +1208,7 @@ pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
     if size == 0 {
-        return -1;
+        return EINVAL;
     }
     let to_copy = min(cwd.len() + 1, size);
     let token = get_current_token();
@@ -1029,34 +1380,19 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return ENOENT;
     }
 
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-    let abs = if path.starts_with('/') {
-        normalize_path("/", &path)
-    } else if dirfd == AT_FDCWD {
-        normalize_path(&cwd, &path)
-    } else if dirfd >= 0 {
-        // Resolve relative to an open directory fd if possible; fallback to cwd.
-        if let Some(inode) = get_fd_inode(dirfd as usize) {
-            // Best-effort: derive a path-like context is hard without reverse lookup;
-            // just resolve relative to cwd for now.
-            let _ = inode;
-            normalize_path(&cwd, &path)
-        } else {
-            return EBADF;
-        }
-    } else {
-        normalize_path(&cwd, &path)
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     // Pseudo nodes: return minimal metadata.
-    if let Some(node) = open_pseudo(&abs) {
+    if let AtPath::PseudoAbs(abs) = &at {
+        let Some(node) = open_pseudo(abs) else {
+            return ENOENT;
+        };
         let mode: u32 = if node.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
-        } else if abs == "/dev/null"
-            || abs == "/dev/zero"
-            || abs == "/dev/misc/rtc"
-        {
+        } else if abs == "/dev/null" || abs == "/dev/zero" || abs == "/dev/misc/rtc" {
             0o100666
         } else {
             0o100444
@@ -1086,7 +1422,19 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return 0;
     }
 
-    let Some(inode) = ROOT_INODE.find_path(&abs) else {
+    let inode = match at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(&abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(base)
+            } else {
+                base.find_path(&rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+
+    let Some(inode) = inode else {
         return ENOENT;
     };
 
@@ -1176,11 +1524,11 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     }
 
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return -1;
+        return ENOTDIR;
     };
     let inode = os_inode.ext4_inode();
     if !inode.is_dir() {
-        return -1;
+        return ENOTDIR;
     };
 
     // Keep a separate per-fd index to avoid interfering with file read offsets.

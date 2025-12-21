@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::any::Any;
 use spin::Mutex;
@@ -30,6 +31,7 @@ struct PseudoInner {
 ///
 /// Directory iteration is implemented in `syscall_getdents64` by downcasting.
 pub struct PseudoDir {
+    path: String,
     entries: Vec<PseudoDirent>,
     inner: Mutex<PseudoDirInner>,
 }
@@ -46,11 +48,26 @@ struct PseudoDirInner {
 }
 
 impl PseudoDir {
-    pub fn new(entries: Vec<PseudoDirent>) -> Self {
+    pub fn new(path: &str, entries: Vec<PseudoDirent>) -> Self {
+        let mut p = String::from(path);
+        if p.is_empty() {
+            p.push('/');
+        }
+        if !p.starts_with('/') {
+            p.insert(0, '/');
+        }
+        while p.len() > 1 && p.ends_with('/') {
+            p.pop();
+        }
         Self {
+            path: p,
             entries,
             inner: Mutex::new(PseudoDirInner { index: 0 }),
         }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     pub fn entries(&self) -> &[PseudoDirent] {
