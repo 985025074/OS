@@ -152,16 +152,14 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
 
-    match cmd {
+    let ret = match cmd {
         F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
             // We don't track per-fd flags yet; pretend success.
             if get_fd_file(fd).is_none() {
-                return EBADF;
+                EBADF
+            } else {
+                0
             }
-            if cmd == F_GETFD || cmd == F_GETFL {
-                return 0;
-            }
-            0
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let Some(file) = get_fd_file(fd) else {
@@ -185,7 +183,15 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             newfd as isize
         }
         _ => EINVAL,
+    };
+
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && fd <= 8 {
+            crate::println!("[fs] fcntl(pid={}) fd={} cmd={} arg={:#x} -> {}", pid, fd, cmd, arg, ret);
+        }
     }
+    ret
 }
 
 pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize) -> isize {
@@ -193,6 +199,19 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
         return ENOENT;
+    }
+
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && (path == "." || path == "/proc" || path == "/proc/" || path == "/sys" || path == "/dev") {
+            crate::println!(
+                "[fs] openat pid={} dirfd={} path='{}' flags={:#x}",
+                pid,
+                dirfd,
+                path,
+                flags
+            );
+        }
     }
 
     // Pseudo files for minimal proc/sys/dev compatibility.
@@ -211,6 +230,17 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
                 let mut inner = process.borrow_mut();
                 let fd = inner.alloc_fd();
                 inner.fd_table[fd] = Some(file);
+                if crate::debug_config::DEBUG_FS {
+                    let pid = current_process().getpid();
+                    if pid >= 2 && (abs == "/proc" || abs == "/sys" || abs == "/dev") {
+                        crate::println!(
+                            "[fs] openat(pid={}) pseudo '{}' -> fd={}",
+                            pid,
+                            abs,
+                            fd
+                        );
+                    }
+                }
                 return fd as isize;
             }
         }
@@ -304,6 +334,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     let mut inner = process.borrow_mut();
     let fd = inner.alloc_fd();
     inner.fd_table[fd] = Some(os_inode);
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && (path == "." || path == "/proc" || path == "/proc/") {
+            crate::println!("[fs] openat(pid={}) ok path='{}' -> fd={}", pid, path, fd);
+        }
+    }
     fd as isize
 }
 
@@ -556,6 +592,12 @@ pub fn syscall_close(fd: usize) -> isize {
         return -1;
     }
     inner.fd_table[fd] = None;
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && fd <= 8 {
+            crate::println!("[fs] close(pid={}) fd={}", pid, fd);
+        }
+    }
     0
 }
 
@@ -918,6 +960,12 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         };
         let token = get_current_token();
         *translated_mutref(token, st_ptr as *mut KStat) = st;
+        if crate::debug_config::DEBUG_FS {
+            let pid = current_process().getpid();
+            if pid >= 2 && fd <= 8 {
+                crate::println!("[fs] fstat(pid={}) fd={} pseudo -> ok", pid, fd);
+            }
+        }
         return 0;
     }
 
@@ -956,6 +1004,12 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
 
     let token = get_current_token();
     *translated_mutref(token, st_ptr as *mut KStat) = st;
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && fd <= 8 {
+            crate::println!("[fs] fstat(pid={}) fd={} -> ok mode={:#o}", pid, fd, mode);
+        }
+    }
     0
 }
 
@@ -965,7 +1019,13 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     }
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
+    // Support `AT_EMPTY_PATH`: operate on `dirfd` itself when pathname is empty.
+    // glibc uses this in some directory APIs (e.g., `opendir`) to validate the fd.
+    const AT_EMPTY_PATH: usize = 0x1000;
     if path.is_empty() {
+        if (_flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+            return syscall_fstat(dirfd as usize, st_ptr);
+        }
         return ENOENT;
     }
 
@@ -1068,6 +1128,12 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
 
     // Pseudo directories (e.g. /proc, /sys, /dev).
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        if crate::debug_config::DEBUG_FS {
+            let pid = current_process().getpid();
+            if pid >= 2 {
+                crate::println!("[fs] getdents64(pid={}) pseudo fd={} len={}", pid, fd, len);
+            }
+        }
         let entries = pdir.entries();
         let mut index = pdir.index();
         if index >= entries.len() || len == 0 {
@@ -1126,6 +1192,20 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
 
     if len == 0 {
         return 0;
+    }
+
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && (fd == 3 || fd == 4) {
+            crate::println!(
+                "[fs] getdents64(pid={}) fd={} len={} idx={} entries={}",
+                pid,
+                fd,
+                len,
+                index,
+                entries.len()
+            );
+        }
     }
 
     let mut kbuf = alloc::vec![0u8; len];

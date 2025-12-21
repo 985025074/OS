@@ -10,6 +10,7 @@ KERNEL_ENTRY_PA = 0x80200000
 SMP ?= 4
 MEM ?= 1G
 DISK_IMG ?=
+EXT4_REBUILD ?= 0
 # Optional OpenSBI fw_dynamic for HSM-enabled boot
 FW_DYNAMIC ?=../firmware/fw_dynamic.bin
 # Only append the extra virtio disk if the file exists
@@ -38,8 +39,13 @@ USER_APPS:
 	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
 			base=$$(basename $$f); \
-			cp $$f  ../os/$(APP_DIR)/$$base.bin; \
-			echo "find user app: $$base"; \
+			dst=../os/$(APP_DIR)/$$base.bin; \
+			if [ ! -f "$$dst" ] || ! cmp -s "$$f" "$$dst"; then \
+				cp "$$f" "$$dst"; \
+				echo "find user app (updated): $$base"; \
+			else \
+				echo "find user app (cached): $$base"; \
+			fi; \
 		fi; \
 	done
 	@echo "Build user apps successfully."
@@ -94,13 +100,26 @@ EXT4_IMG := ../ext4-fs-packer/target/fs.ext4
 EXT4_SIZE?= 4G 
 # Build ext4 image from user apps
 ext4_img: USER_APPS
-	@echo "🔧 Building ext4 filesystem image..."
-	@cd ../ext4-fs-packer && cargo run --release -- \
-		-u ../os/$(APP_DIR) \
-		-e extra \
-		-t target \
-		-S $(EXT4_SIZE) 
-	@echo "✅ Ext4 image created: $(EXT4_IMG)"
+	@needs=0; \
+	if [ ! -f "$(EXT4_IMG)" ]; then needs=1; fi; \
+	if [ $$needs -eq 0 ]; then \
+		if find "$(APP_DIR)" -type f -newer "$(EXT4_IMG)" 2>/dev/null | head -n 1 | grep -q .; then needs=1; fi; \
+	fi; \
+	if [ $$needs -eq 0 ]; then \
+		if find ../ext4-fs-packer/extra -type f -newer "$(EXT4_IMG)" 2>/dev/null | head -n 1 | grep -q .; then needs=1; fi; \
+	fi; \
+	if [ "$(EXT4_REBUILD)" = "1" ]; then needs=1; fi; \
+	if [ $$needs -eq 0 ]; then \
+		echo "✅ Reusing existing ext4 image: $(EXT4_IMG)"; \
+	else \
+		echo "🔧 Building ext4 filesystem image..."; \
+		cd ../ext4-fs-packer && cargo run --release -- \
+			-u ../os/$(APP_DIR) \
+			-e extra \
+			-t target \
+			-S $(EXT4_SIZE); \
+		echo "✅ Ext4 image created: $(EXT4_IMG)"; \
+	fi
 
 # Run with ext4 filesystem
 run_ext4: KERNEL ext4_img
