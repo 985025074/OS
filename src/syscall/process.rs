@@ -51,18 +51,14 @@ fn read_usize_user(token: usize, ptr: usize) -> usize {
     usize::from_ne_bytes(raw)
 }
 
-fn load_elf_from_path(path: &str) -> Option<Vec<u8>> {
+fn load_file_from_path(path: &str) -> Option<Vec<u8>> {
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
     let abs = normalize_path(&cwd, path);
 
     if let Some(inode) = ROOT_INODE.find_path(&abs) {
         if inode.is_file() {
-            let data = inode.read_all();
-            if data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F'] {
-                return Some(data);
-            }
-            return None;
+            return Some(inode.read_all());
         }
     }
     if !abs.ends_with(".bin") {
@@ -70,15 +66,41 @@ fn load_elf_from_path(path: &str) -> Option<Vec<u8>> {
         with_bin.push_str(".bin");
         if let Some(inode) = ROOT_INODE.find_path(&with_bin) {
             if inode.is_file() {
-                let data = inode.read_all();
-                if data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F'] {
-                    return Some(data);
-                }
-                return None;
+                return Some(inode.read_all());
             }
         }
     }
     None
+}
+
+fn is_elf(data: &[u8]) -> bool {
+    data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F']
+}
+
+fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
+    if data.len() < 2 || &data[0..2] != b"#!" {
+        return None;
+    }
+    let line_end = data
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(data.len());
+    let mut line = &data[2..line_end];
+    // Trim leading spaces/tabs.
+    while !line.is_empty() && (line[0] == b' ' || line[0] == b'\t') {
+        line = &line[1..];
+    }
+    // Trim trailing CR/spaces.
+    while !line.is_empty() && (line[line.len() - 1] == b'\r' || line[line.len() - 1] == b' ') {
+        line = &line[..line.len() - 1];
+    }
+    let Ok(s) = core::str::from_utf8(line) else {
+        return None;
+    };
+    let mut it = s.split_whitespace();
+    let interp = String::from(it.next()?);
+    let arg = it.next().map(String::from);
+    Some((interp, arg))
 }
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
@@ -231,6 +253,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
 
 pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isize {
     const ENOEXEC: isize = -8;
+    const ENOENT: isize = -2;
     let token = get_current_token();
     let path = translated_str(token, path_ptr as *const u8);
 
@@ -250,24 +273,46 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
         args_vec.push(path.clone());
     }
 
-    let Some(app_data) = load_elf_from_path(&path) else {
-        // If the target exists but is not an ELF binary, behave like Linux and
-        // return ENOEXEC so shells (busybox/ash) can interpret it as a script.
-        // For missing files we still return a generic failure.
-        let process = current_process();
-        let cwd = { process.borrow_mut().cwd.clone() };
-        let abs = normalize_path(&cwd, &path);
-        let exists = ROOT_INODE.find_path(&abs).is_some()
-            || (!abs.ends_with(".bin") && ROOT_INODE.find_path(&(abs.clone() + ".bin")).is_some());
-        if exists {
-            return ENOEXEC;
-        }
-        return -1;
+    let Some(file_data) = load_file_from_path(&path) else {
+        return ENOENT;
     };
 
-    let process = current_process();
-    process.exec(&app_data, args_vec);
-    0
+    // ELF binary: normal exec.
+    if is_elf(&file_data) {
+        let process = current_process();
+        process.exec(&file_data, args_vec);
+        return 0;
+    }
+
+    // Script with shebang: emulate Linux `#!` handling in-kernel so that
+    // busybox/ash can run `./script.sh` directly.
+    if let Some((interp, opt_arg)) = parse_shebang(&file_data) {
+        let Some(interp_data) = load_file_from_path(&interp) else {
+            return ENOENT;
+        };
+        if !is_elf(&interp_data) {
+            return ENOEXEC;
+        }
+        let mut new_args: Vec<String> = Vec::new();
+        new_args.push(interp.clone());
+        if let Some(a) = opt_arg {
+            new_args.push(a);
+        }
+        // Pass script path as argv[1] (or argv[2] with opt arg), like Linux.
+        new_args.push(path.clone());
+        // Append original args after argv[0].
+        for a in args_vec.iter().skip(1) {
+            new_args.push(a.clone());
+        }
+        let process = current_process();
+        process.exec(&interp_data, new_args);
+        return 0;
+    }
+
+    // Non-ELF without shebang: let shells interpret it.
+    return ENOEXEC;
+
+    // unreachable
 }
 
 pub fn syscall_getpid() -> isize {

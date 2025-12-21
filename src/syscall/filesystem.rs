@@ -558,7 +558,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         return EBADF;
     };
 
-    let mode = if inode.is_dir() { 0x040000 } else { 0x100000 };
+    let mode = inode.mode() as u32;
     let size = inode.size() as i64;
     let blocks = ((inode.size() + 511) / 512) as u64;
 
@@ -623,7 +623,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return ENOENT;
     };
 
-    let mode = if inode.is_dir() { 0x040000 } else { 0x100000 };
+    let mode = inode.mode() as u32;
     let size = inode.size() as i64;
     let blocks = ((inode.size() + 511) / 512) as u64;
 
