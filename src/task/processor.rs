@@ -7,7 +7,7 @@ use crate::{
         INITPROC,
         id::TaskUserRes,
         manager::{
-            TASK_MANAGER, add_task, fetch_task, remove_from_pid2process, remove_inactive_task,
+            TASK_MANAGER, add_task, fetch_task, remove_inactive_task,
             wakeup_task,
         },
         process_block::ProcessControlBlock,
@@ -406,7 +406,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                 shutdown();
             }
         }
-        remove_from_pid2process(pid);
         // Mark zombie and capture parent pointer first...
         let parent = {
             let mut process_inner = process.borrow_mut();

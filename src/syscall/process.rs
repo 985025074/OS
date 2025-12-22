@@ -223,6 +223,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
         };
 
         if let Some(pid) = zombie_pid {
+            // Keep exited processes visible (e.g., for `kill $!`) until they are reaped.
+            // Reaping happens here (wait4), so remove it from the global PID table now.
+            crate::task::manager::remove_from_pid2process(pid);
             if wstatus_ptr != 0 {
                 // Linux wait status encoding:
                 // - normal exit: (code & 0xff) << 8
