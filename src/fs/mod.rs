@@ -19,8 +19,9 @@ pub trait File: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub use inode::{OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
+pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::ext4_lock;
 pub use pipe::{Pipe, make_pipe};
 pub use stdio::{Stdin, Stdout};
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, RtcFile};
+pub use pseudo::PseudoBlock;

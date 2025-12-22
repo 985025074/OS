@@ -22,6 +22,7 @@ pub(crate) fn ext4_lock() -> spin::MutexGuard<'static, ()> {
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    append: bool,
     inner: Mutex<OSInodeInner>,
 }
 
@@ -35,9 +36,14 @@ pub struct OSInodeInner {
 impl OSInode {
     /// Construct an OS inode from an inode
     pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+        Self::new_with_append(readable, writable, false, inode)
+    }
+
+    pub fn new_with_append(readable: bool, writable: bool, append: bool, inode: Arc<Inode>) -> Self {
         Self {
             readable,
             writable,
+            append,
             inner: Mutex::new(OSInodeInner {
                 offset: 0,
                 dir_offset: 0,
@@ -95,10 +101,14 @@ impl OSInode {
 }
 
 lazy_static! {
+    /// ext4 filesystem handle (shared by all inodes).
+    pub static ref EXT4_FS: Arc<spin::Mutex<Ext4FileSystem>> = {
+        Ext4FileSystem::open(BLOCK_DEVICE.clone())
+    };
+
     /// Root inode of the filesystem
     pub static ref ROOT_INODE: Arc<Inode> = {
-        let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
-        Arc::new(Ext4FileSystem::root_inode(&efs))
+        Arc::new(Ext4FileSystem::root_inode(&EXT4_FS))
     };
 
     /// User directory inode (for ext4, apps are in /user)
@@ -221,6 +231,9 @@ impl File for OSInode {
     fn write(&self, _buf: UserBuffer) -> usize {
         let _fs_guard = EXT4_LOCK.lock();
         let mut inner = self.inner.lock();
+        if self.append {
+            inner.offset = inner.inode.size() as usize;
+        }
         let mut total_write_size = 0usize;
         for slice in _buf.buffers.iter() {
             match inner.inode.write_at(inner.offset, &*slice) {

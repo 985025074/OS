@@ -138,6 +138,38 @@ impl File for RtcFile {
     }
 }
 
+/// A minimal block device node for `/dev/root` so tools like busybox `df`
+/// treat the root filesystem as a real device-backed mount.
+pub struct PseudoBlock;
+
+impl PseudoBlock {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl File for PseudoBlock {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn write(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl PseudoFile {
     pub fn new_static(content: &str) -> Self {
         Self {
@@ -180,6 +212,22 @@ impl PseudoFile {
                 offset: 0,
                 kind: PseudoKind::Zero,
             }),
+        }
+    }
+
+    pub fn offset(&self) -> usize {
+        self.inner.lock().offset
+    }
+
+    pub fn set_offset(&self, offset: usize) {
+        self.inner.lock().offset = offset;
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        let inner = self.inner.lock();
+        match &inner.kind {
+            PseudoKind::Static(data) => Some(data.len()),
+            _ => None,
         }
     }
 }

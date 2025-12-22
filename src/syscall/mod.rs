@@ -40,8 +40,9 @@ const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
-const SYSCALL_FSTATFS: usize = 83;
-const SYSCALL_STATFS: usize = 84;
+// riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
+const SYSCALL_STATFS: usize = 43;
+const SYSCALL_FSTATFS: usize = 44;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
@@ -229,6 +230,26 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GET_HARTID => smp::sys_get_hartid(),
 
         // Unknown syscall: Linux returns -ENOSYS.
-        _ => -38,
+        _ => {
+            static UNKNOWN_LEFT: AtomicUsize = AtomicUsize::new(32);
+            if crate::debug_config::DEBUG_SYSCALL {
+                let left = UNKNOWN_LEFT.fetch_sub(1, Ordering::Relaxed);
+                if left > 0 {
+                    let pid = crate::task::processor::current_process().getpid();
+                    crate::println!(
+                        "[syscall] unknown pid={} id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                        pid,
+                        id,
+                        args[0],
+                        args[1],
+                        args[2],
+                        args[3],
+                        args[4],
+                        args[5]
+                    );
+                }
+            }
+            -38
+        }
     }
 }

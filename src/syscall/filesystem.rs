@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 
 use crate::{
-    fs::{File, OSInode, PseudoDir, PseudoDirent, PseudoFile, RtcFile, ROOT_INODE, ext4_lock, make_pipe},
+    fs::{File, OSInode, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, RtcFile, ROOT_INODE, ext4_lock, make_pipe},
     mm::{UserBuffer, translated_byte_buffer, translated_mutref, translated_str},
     task::processor::current_process,
     trap::get_current_token,
@@ -17,6 +17,7 @@ const O_WRONLY: usize = 0x1;
 const O_RDWR: usize = 0x2;
 const O_CREAT: usize = 0x40;
 const O_TRUNC: usize = 0x200;
+const O_APPEND: usize = 0x400;
 const O_DIRECTORY: usize = 0x10000;
 
 // Linux errno (negative return in kernel ABI).
@@ -328,6 +329,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         O_RDWR => (true, true),
         _ => (true, false),
     };
+    let append = (flags & O_APPEND) != 0;
 
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
@@ -448,7 +450,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         }
     }
 
-    let os_inode = alloc::sync::Arc::new(OSInode::new(readable, writable, inode));
+    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append(readable, writable, append, inode));
     drop(ext4_guard);
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -498,6 +500,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
+            PseudoDirent { name: alloc::string::String::from("mounts"), ino: (pid as u64) << 32 | 4, dtype: 8 },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/self", entries)));
     }
@@ -567,9 +570,13 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                         PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
                         PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
                         PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
+                        PseudoDirent { name: alloc::string::String::from("mounts"), ino: (pid as u64) << 32 | 4, dtype: 8 },
                     ];
                     let p = alloc::format!("/proc/{}", pid);
                     return Some(alloc::sync::Arc::new(PseudoDir::new(&p, entries)));
+                }
+                Some("mounts") if it.next().is_none() => {
+                    return open_pseudo("/proc/mounts");
                 }
                 Some("stat") if it.next().is_none() => {
                     // Linux-like `/proc/<pid>/stat` (man proc). Keep it well-formed so
@@ -667,11 +674,12 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         let entries = alloc::vec![
             PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
+            PseudoDirent { name: alloc::string::String::from("root"), ino: 6, dtype: 6 },
             PseudoDirent { name: alloc::string::String::from("null"), ino: 2, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("zero"), ino: 3, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("urandom"), ino: 4, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("random"), ino: 5, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("misc"), ino: 6, dtype: 4 },
+            PseudoDirent { name: alloc::string::String::from("misc"), ino: 7, dtype: 4 },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
     }
@@ -730,7 +738,10 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/proc/mounts" {
         // Minimal mount table so `df` works.
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("rootfs / ext4 rw 0 0\n")));
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("/dev/root / ext4 rw 0 0\n")));
+    }
+    if path == "/proc/self/mounts" {
+        return open_pseudo("/proc/mounts");
     }
     if path == "/proc/meminfo" {
         // Minimal meminfo so busybox `free` works.
@@ -743,6 +754,9 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
     }
     // /dev/*
+    if path == "/dev/root" {
+        return Some(alloc::sync::Arc::new(PseudoBlock::new()));
+    }
     if path == "/dev/null" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_null()));
     }
@@ -1246,18 +1260,28 @@ fn fill_statfs(st_ptr: usize) -> isize {
     if st_ptr == 0 {
         return EINVAL;
     }
-    // EXT4_SUPER_MAGIC
+    // ext4 statfs (best-effort; our ext4 allocator does not yet update
+    // on-disk free counters, so these values may be stale after heavy writes,
+    // but they are meaningful for `df`).
+    let fs = crate::fs::EXT4_FS.lock();
+    let sb = &fs.superblock;
+    let block_size = sb.block_size() as i64;
+    let total_blocks = sb.blocks_count();
+    let free_blocks = ((sb.s_free_blocks_count_hi as u64) << 32) | sb.s_free_blocks_count_lo as u64;
+    let reserved_blocks = ((sb.s_r_blocks_count_hi as u64) << 32) | sb.s_r_blocks_count_lo as u64;
+    let bavail = free_blocks.saturating_sub(reserved_blocks);
     let st = KStatFs {
+        // EXT4_SUPER_MAGIC
         f_type: 0xEF53,
-        f_bsize: 4096,
-        f_blocks: 0,
-        f_bfree: 0,
-        f_bavail: 0,
-        f_files: 0,
-        f_ffree: 0,
+        f_bsize: block_size,
+        f_blocks: total_blocks,
+        f_bfree: free_blocks,
+        f_bavail: bavail,
+        f_files: sb.s_inodes_count as u64,
+        f_ffree: sb.s_free_inodes_count as u64,
         f_fsid: [0, 0],
         f_namelen: 255,
-        f_frsize: 4096,
+        f_frsize: block_size,
         f_flags: 0,
         f_spare: [0; 4],
     };
@@ -1266,15 +1290,16 @@ fn fill_statfs(st_ptr: usize) -> isize {
     0
 }
 
-/// Linux `fstatfs(2)` (syscall 83 on riscv64).
+/// Linux `fstatfs(2)` (syscall 44 on riscv64).
 pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
         return EBADF;
     }
+    let _ext4_guard = ext4_lock();
     fill_statfs(st_ptr)
 }
 
-/// Linux `statfs(2)` (syscall 84 on riscv64).
+/// Linux `statfs(2)` (syscall 43 on riscv64).
 pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
@@ -1389,6 +1414,8 @@ struct KStat {
     __unused: [u32; 2],
 }
 
+const EXT4_ST_DEV: u64 = 1;
+
 fn dt_type_from_ext4(ftype: u8) -> u8 {
     match ftype {
         2 => 4, // DT_DIR
@@ -1424,14 +1451,22 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     // Pseudo nodes: return minimal metadata so libc/busybox can `opendir()` them.
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
     {
         let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
+        } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
+            0o060600
         } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
             0o100666
         } else {
             0o100444
+        };
+        let st_rdev: u64 = if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
+            EXT4_ST_DEV
+        } else {
+            0
         };
         let st = KStat {
             st_dev: 0,
@@ -1440,7 +1475,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
             st_nlink: 1,
             st_uid: 0,
             st_gid: 0,
-            st_rdev: 0,
+            st_rdev,
             __pad: 0,
             st_size: 0,
             st_blksize: 4096,
@@ -1478,7 +1513,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     let blocks = ((inode.size() + 511) / 512) as u64;
 
     let st = KStat {
-        st_dev: 0,
+        st_dev: EXT4_ST_DEV,
         st_ino: inode.inode_num() as u64,
         st_mode: mode,
         st_nlink: 1,
@@ -1538,11 +1573,14 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         };
         let mode: u32 = if node.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
+        } else if abs == "/dev/root" {
+            0o060600
         } else if abs == "/dev/null" || abs == "/dev/zero" || abs == "/dev/misc/rtc" {
             0o100666
         } else {
             0o100444
         };
+        let st_rdev: u64 = if abs == "/dev/root" { EXT4_ST_DEV } else { 0 };
         let st = KStat {
             st_dev: 0,
             st_ino: 1,
@@ -1550,7 +1588,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             st_nlink: 1,
             st_uid: 0,
             st_gid: 0,
-            st_rdev: 0,
+            st_rdev,
             __pad: 0,
             st_size: 0,
             st_blksize: 4096,
@@ -1590,7 +1628,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     let blocks = ((inode.size() + 511) / 512) as u64;
 
     let st = KStat {
-        st_dev: 0,
+        st_dev: EXT4_ST_DEV,
         st_ino: inode.inode_num() as u64,
         st_mode: mode,
         st_nlink: 1,
@@ -1852,10 +1890,24 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         return new;
     }
 
-    // Other pseudo nodes: best-effort.
-    if file.as_any().downcast_ref::<PseudoFile>().is_some() || file.as_any().downcast_ref::<RtcFile>().is_some() {
-        // These nodes are not seekable in our model.
-        return ESPIPE;
+    // Pseudo regular files: allow seeking for static content (e.g., `/proc/mounts`),
+    // which libc helpers (busybox `df`) may `rewind()` via lseek.
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        let Some(end) = pf.len().map(|n| n as isize) else {
+            return ESPIPE;
+        };
+        let cur = pf.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        pf.set_offset(new as usize);
+        return new;
     }
 
     ESPIPE
