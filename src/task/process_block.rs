@@ -151,6 +151,10 @@ pub struct ProcessControlBlockInner {
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
+    /// Linux-like argv for `/proc/<pid>/cmdline` and ps.
+    pub argv: Vec<String>,
+    /// Process creation time since boot (ms).
+    pub start_time_ms: usize,
     //
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub cwd: String,
@@ -241,6 +245,8 @@ impl ProcessControlBlock {
                 parent: None,
                 children: Vec::new(),
                 exit_code: 0,
+                argv: args.clone(),
+                start_time_ms: crate::time::get_time_ms(),
                 fd_table: vec![
                     // 0 -> stdin
                     Some(Arc::new(Stdin)),
@@ -330,6 +336,7 @@ impl ProcessControlBlock {
             inner.brk = heap_start;
             inner.mmap_next = 0x4000_0000;
             inner.mmap_areas.clear();
+            inner.argv = args.clone();
         }
         // then we need to update the task's user resource
         // Note: from_elf already created both the user stack and trap_cx area,
@@ -371,6 +378,7 @@ impl ProcessControlBlock {
         assert_eq!(parent.thread_count(), 1);
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
+        let argv = parent.argv.clone();
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
         // alloc a pid
@@ -393,6 +401,8 @@ impl ProcessControlBlock {
                 parent: Some(Arc::downgrade(self)),
                 children: Vec::new(),
                 exit_code: 0,
+                argv,
+                start_time_ms: crate::time::get_time_ms(),
                 fd_table: new_fd_table,
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,

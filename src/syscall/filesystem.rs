@@ -311,7 +311,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
 
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
-        if pid >= 2 && (path == "." || path == "/proc" || path == "/proc/" || path == "/sys" || path == "/dev") {
+        if path == "." || path == "/proc" || path == "/proc/" || path == "/sys" || path == "/dev" {
             crate::println!(
                 "[fs] openat pid={} dirfd={} path='{}' flags={:#x}",
                 pid,
@@ -345,7 +345,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         inner.fd_table[fd] = Some(file);
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
-            if pid >= 2 && (abs == "/proc" || abs == "/sys" || abs == "/dev") {
+            if abs == "/proc" || abs == "/sys" || abs == "/dev" {
                 crate::println!("[fs] openat(pid={}) pseudo '{}' -> fd={}", pid, abs, fd);
             }
         }
@@ -453,7 +453,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     inner.fd_table[fd] = Some(os_inode);
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
-        if pid >= 2 && (path == "." || path == "/proc" || path == "/proc/") {
+        if path == "." || path == "/proc" || path == "/proc/" {
             crate::println!("[fs] openat(pid={}) ok path='{}' -> fd={}", pid, path, fd);
         }
     }
@@ -470,6 +470,10 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("mounts"), ino: 2, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("meminfo"), ino: 3, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("loadavg"), ino: 4, dtype: 8 },
+            PseudoDirent { name: alloc::string::String::from("uptime"), ino: 5, dtype: 8 },
+            PseudoDirent { name: alloc::string::String::from("stat"), ino: 6, dtype: 8 },
+            // Linux has /proc/self as a symlink; we expose it as a directory.
+            PseudoDirent { name: alloc::string::String::from("self"), ino: 7, dtype: 4 },
         ];
         let mut pids: alloc::vec::Vec<usize> = {
             let map = crate::task::manager::PID2PCB.lock();
@@ -490,6 +494,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
+            PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/self", entries)));
     }
@@ -500,19 +505,56 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         let mut it = rest.split('/');
         let first = it.next().unwrap_or("");
         if first == "self" {
+            let pid = current_process().getpid();
+            if let Some(after) = rest.strip_prefix("self/") {
+                let p = alloc::format!("/proc/{}/{}", pid, after);
+                return open_pseudo(&p);
+            }
             return open_pseudo("/proc/self");
         }
         if let Ok(pid) = first.parse::<usize>() {
             // Validate pid exists.
             let proc = crate::task::manager::pid2process(pid)?;
-            let ppid = proc
-                .borrow_mut()
-                .parent
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .map(|p| p.getpid())
-                .unwrap_or(0);
-            let comm = "CongCore";
+            let (ppid, argv, start_time_ms, num_threads, main_state, vsize, vsize_kb) = {
+                let inner = proc.borrow_mut();
+                let ppid = inner
+                    .parent
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|p| p.getpid())
+                    .unwrap_or(0);
+                let argv = inner.argv.clone();
+                let start_time_ms = inner.start_time_ms;
+                let num_threads = inner.thread_count();
+                let main_state = inner
+                    .tasks
+                    .iter()
+                    .flatten()
+                    .next()
+                    .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
+                    .unwrap_or(crate::task::task_block::TaskStatus::Ready);
+                let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
+                let mmap_bytes: usize = inner
+                    .mmap_areas
+                    .iter()
+                    .map(|(s, e)| e.saturating_sub(*s))
+                    .sum();
+                let vsize: u64 = (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
+                let vsize_kb: usize = (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
+                (ppid, argv, start_time_ms, num_threads, main_state, vsize, vsize_kb)
+            };
+
+            let comm = argv
+                .first()
+                .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+                .unwrap_or("CongCore")
+                .replace(')', "_");
+
+            let state_char = match main_state {
+                crate::task::task_block::TaskStatus::Running => 'R',
+                crate::task::task_block::TaskStatus::Ready => 'R',
+                crate::task::task_block::TaskStatus::Blocked => 'S',
+            };
 
             match it.next() {
                 None => {
@@ -521,20 +563,89 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                         PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
                         PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
                         PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
+                        PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
                     ];
                     let p = alloc::format!("/proc/{}", pid);
                     return Some(alloc::sync::Arc::new(PseudoDir::new(&p, entries)));
                 }
                 Some("stat") if it.next().is_none() => {
-                    // Provide a Linux-like `/proc/<pid>/stat` line with many fields.
-                    // Most tools (busybox ps) only need a subset but expect a long line.
+                    // Linux-like `/proc/<pid>/stat` (man proc). Keep it well-formed so
+                    // proc parsers (busybox ps) can read it.
+                    const HZ: u64 = 100;
+                    let starttime = (start_time_ms as u64).saturating_mul(HZ) / 1000;
+                    let rss_pages: u64 = if vsize == 0 {
+                        0
+                    } else {
+                        (vsize + crate::config::PAGE_SIZE as u64 - 1) / crate::config::PAGE_SIZE as u64
+                    };
+                    // Field order follows Linux `/proc/<pid>/stat` (man proc).
+                    let pgrp = pid;
+                    let session = pid;
+                    let tty_nr = 0;
+                    let tpgid = 0;
+                    let flags = 0;
+                    let minflt = 0;
+                    let cminflt = 0;
+                    let majflt = 0;
+                    let cmajflt = 0;
+                    let utime = 0;
+                    let stime = 0;
+                    let cutime = 0;
+                    let cstime = 0;
+                    let priority = 0;
+                    let nice = 0;
+                    let itrealvalue = 0;
+                    let rsslim = 0;
+                    let startcode = 0;
+                    let endcode = 0;
+                    let startstack = 0;
+                    let kstkesp = 0;
+                    let kstkeip = 0;
+                    let signal = 0;
+                    let blocked = 0;
+                    let sigignore = 0;
+                    let sigcatch = 0;
+                    let wchan = 0;
+                    let nswap = 0;
+                    let cnswap = 0;
+                    let exit_signal = 0;
+                    let processor = 0;
+                    let rt_priority = 0;
+                    let policy = 0;
+                    let delayacct_blkio_ticks = 0;
+                    let guest_time = 0;
+                    let cguest_time = 0;
+                    let start_data = 0;
+                    let end_data = 0;
+                    let start_brk = 0;
+                    let arg_start = 0;
+                    let arg_end = 0;
+                    let env_start = 0;
+                    let env_end = 0;
+                    let exit_code = 0;
+
                     let s = alloc::format!(
-                        "{pid} ({comm}) R {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+                        "{pid} ({comm}) {state_char} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} {num_threads} {itrealvalue} {starttime} {vsize} {rss_pages} {rsslim} {startcode} {endcode} {startstack} {kstkesp} {kstkeip} {signal} {blocked} {sigignore} {sigcatch} {wchan} {nswap} {cnswap} {exit_signal} {processor} {rt_priority} {policy} {delayacct_blkio_ticks} {guest_time} {cguest_time} {start_data} {end_data} {start_brk} {arg_start} {arg_end} {env_start} {env_end} {exit_code}\n"
                     );
                     return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
                 }
                 Some("cmdline") if it.next().is_none() => {
-                    let s = alloc::format!("{comm}\0");
+                    let mut s = String::new();
+                    for arg in argv.iter() {
+                        s.push_str(arg);
+                        s.push('\0');
+                    }
+                    return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
+                }
+                Some("status") if it.next().is_none() => {
+                    let state_desc = match state_char {
+                        'R' => "R (running)",
+                        'S' => "S (sleeping)",
+                        _ => "R (running)",
+                    };
+                    let s = alloc::format!(
+                        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{num_threads}\nVmSize:\t{vsize_kb} kB\n"
+                    );
                     return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
                 }
                 _ => {}
@@ -601,6 +712,18 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     // /proc/loadavg
     if path == "/proc/loadavg" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static("0.00 0.00 0.00 1/1 1\n")));
+    }
+    if path == "/proc/uptime" {
+        let ms = crate::time::get_time_ms();
+        let secs = ms / 1000;
+        let frac = (ms % 1000) / 10;
+        let s = alloc::format!("{secs}.{frac:02} 0.00\n");
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
+    }
+    if path == "/proc/stat" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+            "cpu  0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n",
+        )));
     }
     if path == "/proc/mounts" {
         // Minimal mount table so `df` works.
@@ -1321,7 +1444,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         *translated_mutref(token, st_ptr as *mut KStat) = st;
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
-            if pid >= 2 && fd <= 8 {
+            if fd <= 8 {
                 crate::println!("[fs] fstat(pid={}) fd={} pseudo -> ok", pid, fd);
             }
         }
@@ -1486,9 +1609,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
-            if pid >= 2 {
-                crate::println!("[fs] getdents64(pid={}) pseudo fd={} len={}", pid, fd, len);
-            }
+            crate::println!("[fs] getdents64(pid={}) pseudo fd={} len={}", pid, fd, len);
         }
         let entries = pdir.entries();
         let mut index = pdir.index();
