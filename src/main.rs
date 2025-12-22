@@ -51,12 +51,16 @@ fn clear_bss() {
 }
 
 fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
+    // Mark boot hart online; secondary harts will be marked online after successful HSM start.
+    task::manager::mark_hart_online(boot_hart_id);
     for hart_id in 0..config::MAX_HARTS {
         if hart_id == boot_hart_id {
             continue;
         }
-        // Ignore failures for now; OpenSBI returns non-zero on error.
-        let _ = sbi::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
+        // Only consider harts that OpenSBI successfully started as online.
+        if sbi::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa) == 0 {
+            task::manager::mark_hart_online(hart_id);
+        }
     }
 }
 
@@ -77,6 +81,7 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
         "[kernel] secondary hart {} online (dtb_pa={:#x}), entering scheduler...",
         hart_id, dtb_pa
     );
+    task::manager::mark_hart_online(hart_id);
     task::task_start_secondary();
 }
 

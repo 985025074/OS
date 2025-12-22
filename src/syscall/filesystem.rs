@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 
 use crate::{
-    fs::{File, OSInode, PseudoDir, PseudoDirent, PseudoFile, RtcFile, ROOT_INODE, make_pipe},
+    fs::{File, OSInode, PseudoDir, PseudoDirent, PseudoFile, RtcFile, ROOT_INODE, ext4_lock, make_pipe},
     mm::{UserBuffer, translated_byte_buffer, translated_mutref, translated_str},
     task::processor::current_process,
     trap::get_current_token,
@@ -352,6 +352,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         return fd as isize;
     }
 
+    let ext4_guard = ext4_lock();
+
     // ext4 lookup.
     let mut inode = match &at {
         AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
@@ -447,6 +449,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     }
 
     let os_inode = alloc::sync::Arc::new(OSInode::new(readable, writable, inode));
+    drop(ext4_guard);
     let process = current_process();
     let mut inner = process.borrow_mut();
     let fd = inner.alloc_fd();
@@ -776,6 +779,7 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
         return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
     }
 
+    let _ext4_guard = ext4_lock();
     let inode = match &at {
         AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
         AtPath::Ext4Rel { base, rel } => {
@@ -819,6 +823,7 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, _buf: usize, _bufsiz: u
         return if open_pseudo(abs).is_some() { EINVAL } else { ENOENT };
     }
 
+    let _ext4_guard = ext4_lock();
     let inode = match &at {
         AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
         AtPath::Ext4Rel { base, rel } => {
@@ -863,6 +868,8 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
     if matches!(old_at, AtPath::PseudoAbs(_)) || matches!(new_at, AtPath::PseudoAbs(_)) {
         return EROFS;
     }
+
+    let _ext4_guard = ext4_lock();
 
     fn parent_and_name(at: AtPath) -> Result<(alloc::sync::Arc<ext4_fs::Inode>, alloc::string::String), isize> {
         match at {
@@ -1042,8 +1049,11 @@ pub fn syscall_chdir(pathname: usize) -> isize {
     let cwd = { process.borrow_mut().cwd.clone() };
     let new_cwd = normalize_path(&cwd, &path);
 
-    if let Some(inode) = ROOT_INODE.find_path(&new_cwd) {
-        if !inode.is_dir() {
+    if let Some(is_dir) = {
+        let _ext4_guard = ext4_lock();
+        ROOT_INODE.find_path(&new_cwd).map(|inode| inode.is_dir())
+    } {
+        if !is_dir {
             return ENOTDIR;
         }
     } else if let Some(node) = open_pseudo(&new_cwd) {
@@ -1073,6 +1083,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, _mode: usize) -> isize {
         return EROFS;
     }
 
+    let _ext4_guard = ext4_lock();
     match at {
         AtPath::Ext4Abs(abs) => {
             if abs == "/" {
@@ -1143,6 +1154,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
         return EROFS;
     }
 
+    let _ext4_guard = ext4_lock();
     let (parent, name) = match at {
         AtPath::Ext4Abs(abs) => {
             if abs == "/" {
@@ -1282,6 +1294,7 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
             fill_statfs(st_ptr)
         }
         AtPath::Ext4Abs(abs) => {
+            let _ext4_guard = ext4_lock();
             if ROOT_INODE.find_path(&abs).is_none() {
                 return ENOENT;
             }
@@ -1310,6 +1323,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         return EROFS;
     }
 
+    let _ext4_guard = ext4_lock();
     let inode = match at {
         AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(&abs),
         AtPath::Ext4Rel { base, rel } => {
@@ -1458,6 +1472,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         return EBADF;
     };
 
+    let _ext4_guard = ext4_lock();
     let mode = inode.mode() as u32;
     let size = inode.size() as i64;
     let blocks = ((inode.size() + 511) / 512) as u64;
@@ -1553,6 +1568,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return 0;
     }
 
+    let _ext4_guard = ext4_lock();
     let inode = match at {
         AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(&abs),
         AtPath::Ext4Rel { base, rel } => {
@@ -1656,6 +1672,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return ENOTDIR;
     };
     let inode = os_inode.ext4_inode();
+    let ext4_guard = ext4_lock();
     if !inode.is_dir() {
         return ENOTDIR;
     };
@@ -1767,6 +1784,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     }
 
     os_inode.set_dir_offset(off);
+    drop(ext4_guard);
     written as isize
 }
 
@@ -1801,6 +1819,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
+        let _ext4_guard = ext4_lock();
         if inode.is_dir() {
             let cur = os_inode.dir_offset() as isize;
             let end = inode.size() as isize;

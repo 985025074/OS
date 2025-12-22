@@ -14,6 +14,10 @@ use spin::Mutex;
 /// Serialize ext4 operations across harts.
 static EXT4_LOCK: Mutex<()> = Mutex::new(());
 
+pub(crate) fn ext4_lock() -> spin::MutexGuard<'static, ()> {
+    EXT4_LOCK.lock()
+}
+
 /// A wrapper around a filesystem inode to implement File trait
 pub struct OSInode {
     readable: bool,

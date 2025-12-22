@@ -13,9 +13,34 @@ use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
 
 static NEXT_HART: AtomicUsize = AtomicUsize::new(0);
+static ONLINE_HART_MASK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn mark_hart_online(hart_id: usize) {
+    if hart_id < usize::BITS as usize {
+        ONLINE_HART_MASK.fetch_or(1usize << hart_id, Ordering::SeqCst);
+    }
+}
+
+fn online_hart_mask() -> usize {
+    let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
+    // Fallback: at least hart0 exists.
+    if mask == 0 { 1 } else { mask }
+}
+
+fn pick_online_hart(start: usize) -> usize {
+    let mask = online_hart_mask();
+    for i in 0..MAX_HARTS {
+        let cand = (start + i) % MAX_HARTS;
+        if (mask & (1usize << cand)) != 0 {
+            return cand;
+        }
+    }
+    0
+}
 
 pub fn select_hart_for_new_task() -> usize {
-    NEXT_HART.fetch_add(1, Ordering::Relaxed) % MAX_HARTS
+    let start = NEXT_HART.fetch_add(1, Ordering::Relaxed) % MAX_HARTS;
+    pick_online_hart(start)
 }
 
 pub fn dump_system_state() {
@@ -207,10 +232,23 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
     let prev_sie = riscv::register::sstatus::read().sie();
     unsafe { riscv::register::sstatus::clear_sie() };
-    let hart_id = task.get_cpu_id() % MAX_HARTS;
+    let desired = task.get_cpu_id() % MAX_HARTS;
+    let mask = online_hart_mask();
+    let cur = crate::task::processor::hart_id() % MAX_HARTS;
+    let hart_id = if (mask & (1usize << desired)) != 0 {
+        desired
+    } else if (mask & (1usize << cur)) != 0 {
+        // If the preferred hart is offline, run it where we are.
+        task.set_cpu_id(cur);
+        cur
+    } else {
+        // Last resort: pick any online hart.
+        let picked = pick_online_hart(0);
+        task.set_cpu_id(picked);
+        picked
+    };
     TASK_MANAGER.lock().add(task, hart_id);
     // Linux-style: if we queued to a remote hart, kick it out of `wfi` via IPI.
-    let cur = crate::task::processor::hart_id();
     if cur < MAX_HARTS && cur != hart_id {
         crate::sbi::send_ipi(hart_id);
     }
