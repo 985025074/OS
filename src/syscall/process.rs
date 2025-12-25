@@ -77,6 +77,24 @@ fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F']
 }
 
+fn elf_interp_path(data: &[u8]) -> Option<String> {
+    let elf = xmas_elf::ElfFile::new(data).ok()?;
+    for i in 0..elf.header.pt2.ph_count() {
+        let ph = elf.program_header(i).ok()?;
+        if ph.get_type().ok()? == xmas_elf::program::Type::Interp {
+            let off = ph.offset() as usize;
+            let sz = ph.file_size() as usize;
+            if off.checked_add(sz)? > elf.input.len() {
+                return None;
+            }
+            let raw = &elf.input[off..off + sz];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            return core::str::from_utf8(&raw[..end]).ok().map(String::from);
+        }
+    }
+    None
+}
+
 fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
     if data.len() < 2 || &data[0..2] != b"#!" {
         return None;
@@ -194,19 +212,30 @@ pub fn syscall_vfork() -> isize {
 }
 
 pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {
+    const WNOHANG: usize = 0x00000001;
+    const ECHILD: isize = -10;
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
     loop {
         let cur_process = current_process();
-        let (has_any_child, zombie_pid) = {
+        let (has_matching_child, zombie_pid) = {
             let mut process_inner = cur_process.borrow_mut();
             if process_inner.children.is_empty() {
                 (false, None)
             } else {
                 let mut found: Option<(usize, usize)> = None; // (index, pid)
+                let mut has_match = false;
                 for (index, child) in process_inner.children.iter().enumerate() {
                     let child_inner = child.borrow_mut();
-                    let matches = pid == -1 || child.pid.0 == pid as usize;
+                    let matches = match pid {
+                        -1 => true, // any child
+                        0 => true,  // treat as any (pgid not modeled)
+                        p if p > 0 => child.pid.0 == p as usize,
+                        _ => true, // negative pgid not modeled; treat as any
+                    };
+                    if matches {
+                        has_match = true;
+                    }
                     if matches && child_inner.is_zombie {
                         temp_exit_code = child_inner.exit_code;
                         found = Some((index, child.pid.0));
@@ -217,7 +246,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                     process_inner.children.remove(index);
                     (true, Some(pid))
                 } else {
-                    (true, None)
+                    (has_match, None)
                 }
             }
         };
@@ -240,8 +269,13 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
             return pid as isize;
         }
 
-        if !has_any_child {
-            return -1;
+        if !has_matching_child {
+            return ECHILD;
+        }
+
+        // Non-blocking wait: return immediately if no child has exited yet.
+        if (_options & WNOHANG) != 0 {
+            return 0;
         }
 
         // Block until a child exits.
@@ -282,6 +316,19 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
 
     // ELF binary: normal exec.
     if is_elf(&file_data) {
+        // Dynamic ELF: map both main program and interpreter, and start at the
+        // interpreter entry with a Linux-like auxv (AT_PHDR/AT_ENTRY/AT_BASE).
+        if let Some(interp) = elf_interp_path(&file_data) {
+            let Some(interp_data) = load_file_from_path(&interp) else {
+                return ENOENT;
+            };
+            if !is_elf(&interp_data) {
+                return ENOEXEC;
+            }
+            let process = current_process();
+            process.exec_dyn(&file_data, &interp_data, args_vec);
+            return 0;
+        }
         let process = current_process();
         process.exec(&file_data, args_vec);
         return 0;

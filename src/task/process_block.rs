@@ -25,13 +25,19 @@ const AT_PHDR: usize = 3;
 const AT_PHENT: usize = 4;
 const AT_PHNUM: usize = 5;
 const AT_PAGESZ: usize = 6;
+const AT_BASE: usize = 7;
 const AT_ENTRY: usize = 9;
 const AT_UID: usize = 11;
 const AT_EUID: usize = 12;
 const AT_GID: usize = 13;
 const AT_EGID: usize = 14;
+const AT_PLATFORM: usize = 15;
+const AT_HWCAP: usize = 16;
+const AT_CLKTCK: usize = 17;
+const AT_SYSINFO_EHDR: usize = 33;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
+const AT_EXECFN: usize = 31;
 
 fn build_linux_stack(
     token: usize,
@@ -39,7 +45,8 @@ fn build_linux_stack(
     args: &[String],
     envs: &[String],
     elf_aux: crate::mm::ElfAux,
-    entry_point: usize,
+    at_entry: usize,
+    at_base: usize,
 ) -> (usize, usize, usize) {
     fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
@@ -76,27 +83,59 @@ fn build_linux_stack(
     }
     env_ptrs.reverse();
 
+    // AT_PLATFORM: a small string describing the CPU architecture.
+    // glibc's dynamic loader expects this to be present.
+    let platform = "riscv64";
+    sp -= platform.len() + 1;
+    write_bytes(token, sp, platform.as_bytes());
+    *translated_mutref(token, (sp + platform.len()) as *mut u8) = 0;
+    let platform_ptr = sp;
+
+    // AT_EXECFN: filename of the executed program.
+    // Best-effort: use argv[0] (should match the execve path in most cases).
+    let execfn = args.first().map(|s| s.as_str()).unwrap_or("");
+    if !execfn.is_empty() {
+        sp -= execfn.len() + 1;
+        write_bytes(token, sp, execfn.as_bytes());
+        *translated_mutref(token, (sp + execfn.len()) as *mut u8) = 0;
+    }
+    let execfn_ptr = sp;
+
     // AT_RANDOM: 16 bytes.
     sp -= 16;
     let random_ptr = sp;
-    let mut x = (entry_point as u64) ^ (sp as u64).rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut x = (at_entry as u64) ^ (sp as u64).rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
     for i in 0..16usize {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
         *translated_mutref(token, (random_ptr + i) as *mut u8) = (x >> 56) as u8;
     }
 
-    let auxv: [(usize, usize); 10] = [
+    let mut auxv: Vec<(usize, usize)> = vec![
+        (AT_HWCAP, 0),
         (AT_PHDR, elf_aux.phdr),
         (AT_PHENT, elf_aux.phent),
         (AT_PHNUM, elf_aux.phnum),
         (AT_PAGESZ, crate::config::PAGE_SIZE),
-        (AT_ENTRY, entry_point),
+        (AT_ENTRY, at_entry),
+        (AT_CLKTCK, 100),
         (AT_UID, 0),
         (AT_EUID, 0),
         (AT_GID, 0),
         (AT_EGID, 0),
+        (AT_SECURE, 0),
+        (AT_PLATFORM, platform_ptr),
+        (AT_EXECFN, execfn_ptr),
         (AT_RANDOM, random_ptr),
     ];
+    // Linux provides a VDSO base via AT_SYSINFO_EHDR. We don't have a real VDSO yet,
+    // but glibc's dynamic loader expects this entry to be non-zero on many setups.
+    // Provide a best-effort pointer to the interpreter's ELF header when available.
+    if at_base != 0 {
+        auxv.push((AT_SYSINFO_EHDR, at_base));
+    }
+    if at_base != 0 {
+        auxv.push((AT_BASE, at_base));
+    }
 
     // Make the final entry stack pointer 16-byte aligned.
     // Starting from a 16-byte boundary, pushing an odd number of usize words flips alignment.
@@ -236,6 +275,7 @@ impl ProcessControlBlock {
             &[],
             elf_aux,
             entry_point,
+            0,
         );
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -350,17 +390,66 @@ impl ProcessControlBlock {
         // Build a Linux-like initial stack layout so both:
         // - C runtime can read argc/argv from `sp` (as in oscomp ulib), and
         // - Rust runtime can read argc/argv from a0/a1.
-        let (user_sp, argv_base, envp_base) = build_linux_stack(
+    let (user_sp, argv_base, envp_base) = build_linux_stack(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             &args,
             &[],
             elf_aux,
             entry_point,
+            0,
         );
         // initialize trap_cx
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
+            user_sp,
+            KERNEL_SPACE.lock().token(),
+            task.kstack.get_top(),
+            trap_handler as usize,
+        );
+        trap_cx.x[10] = args.len();
+        trap_cx.x[11] = argv_base;
+        trap_cx.x[12] = envp_base;
+        *task_inner.get_trap_cx() = trap_cx;
+    }
+
+    /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
+    /// map both the main program and the interpreter, then start at the interpreter entry
+    /// while exposing the main program metadata via auxv (AT_PHDR/AT_ENTRY) and AT_BASE.
+    pub fn exec_dyn(self: &Arc<Self>, elf_data: &[u8], interp_data: &[u8], args: Vec<String>) {
+        assert_eq!(self.borrow_mut().thread_count(), 1);
+        let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
+            MemorySet::from_elf_with_interp(elf_data, interp_data);
+        let new_token = memory_set.token();
+        let heap_start = ustack_base + USER_STACK_SIZE;
+        {
+            let mut inner = self.borrow_mut();
+            inner.memory_set = memory_set;
+            inner.heap_start = heap_start;
+            inner.brk = heap_start;
+            inner.mmap_next = 0x4000_0000;
+            inner.mmap_areas.clear();
+            inner.argv = args.clone();
+        }
+
+        let task = self.borrow_mut().get_task(0);
+        let mut task_inner = task.borrow_mut();
+        let res = task_inner.res.as_mut().unwrap();
+        res.ustack_base = ustack_base;
+        task_inner.trap_cx_ppn = res.trap_cx_ppn();
+
+        let (user_sp, argv_base, envp_base) = build_linux_stack(
+            new_token,
+            task_inner.res.as_mut().unwrap().ustack_top(),
+            &args,
+            &[],
+            main_aux,
+            main_entry,
+            interp_base,
+        );
+
+        let mut trap_cx = TrapContext::app_init_context(
+            interp_entry,
             user_sp,
             KERNEL_SPACE.lock().token(),
             task.kstack.get_top(),
@@ -379,8 +468,9 @@ impl ProcessControlBlock {
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
         let argv = parent.argv.clone();
-        // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        // Fork address space using copy-on-write for user pages to avoid huge copies
+        // when spawning many processes (e.g., rt-tests hackbench).
+        let memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table

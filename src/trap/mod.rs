@@ -224,6 +224,13 @@ pub fn trap_handler() {
         Trap::Interrupt(TIME_INTERVAL) => {
             set_next_trigger();
             check_timer();
+            // Also handle pending fatal signals on timer ticks.
+            // Without this, CPU-bound tasks that never enter syscalls would never observe
+            // signals like SIGINT/SIGKILL and could run forever.
+            if let Some((errno, msg)) = check_if_current_signals_error() {
+                println!("[kernel] {}", msg);
+                exit_current_and_run_next(errno);
+            }
             suspend_current_and_run_next();
         }
         Trap::Interrupt(SOFTWARE_INTERRUPT) => {
@@ -244,6 +251,10 @@ pub fn trap_handler() {
         println!("[kernel] {}", msg);
         exit_current_and_run_next(errno);
     }
+    // Progress timers even if S-mode timer interrupts are disabled during syscalls.
+    // This avoids long-running syscall-heavy workloads (e.g., hackbench fork storms)
+    // from starving `sleep()/nanosleep()` wakeups.
+    check_timer();
     trap_return();
 }
 
@@ -266,6 +277,14 @@ fn exception_name(code: usize) -> &'static str {
 }
 
 fn handle_user_exception(code: usize, stval: usize) {
+    // Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
+    if code == STORE_PAGE_FAULT {
+        let process = crate::task::processor::current_process();
+        let mut inner = process.borrow_mut();
+        if inner.memory_set.resolve_cow_fault(stval) {
+            return;
+        }
+    }
     let cx = get_trap_context();
     log::warn!(
         "[user_exn] code={} ({}) sepc={:#x} stval={:#x}",

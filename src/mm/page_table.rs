@@ -10,7 +10,7 @@ use bitflags::*;
 
 bitflags! {
     /// page table entry flags
-    pub struct PTEFlags: u8 {
+    pub struct PTEFlags: u16 {
         const V = 1 << 0;
         const R = 1 << 1;
         const W = 1 << 2;
@@ -19,6 +19,8 @@ bitflags! {
         const G = 1 << 5;
         const A = 1 << 6;
         const D = 1 << 7;
+        /// Software-managed copy-on-write marker (Sv39 PTE RSW bit 0).
+        const COW = 1 << 8;
     }
 }
 
@@ -42,7 +44,8 @@ impl PageTableEntry {
         (self.bits >> 10 & ((1usize << 44) - 1)).into()
     }
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap()
+        // Low 10 bits are flags (including the 2 software RSW bits).
+        PTEFlags::from_bits((self.bits & 0x3ff) as u16).unwrap()
     }
     pub fn is_valid(&self) -> bool {
         (self.flags() & PTEFlags::V) != PTEFlags::empty()
@@ -131,6 +134,35 @@ impl PageTable {
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
+    }
+
+    /// Update an existing leaf PTE's flags, preserving its mapped PPN.
+    ///
+    /// Returns `false` if the vpn is not mapped.
+    pub fn set_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() {
+            return false;
+        }
+        let ppn = pte.ppn();
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
+    }
+
+    /// Update an existing leaf PTE's mapped PPN and flags.
+    ///
+    /// Returns `false` if the vpn is not mapped.
+    pub fn remap(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() {
+            return false;
+        }
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
     }
     /// Translate `VirtAddr` to `PhysAddr`
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {

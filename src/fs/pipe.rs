@@ -28,6 +28,22 @@ impl Pipe {
             buffer,
         }
     }
+
+    pub fn poll_readable(&self) -> bool {
+        if !self.readable {
+            return false;
+        }
+        let ring = self.buffer.lock();
+        ring.available_read() > 0 || ring.all_write_ends_closed()
+    }
+
+    pub fn poll_writable(&self) -> bool {
+        if !self.writable {
+            return false;
+        }
+        let ring = self.buffer.lock();
+        ring.available_write() > 0 || ring.all_read_ends_closed()
+    }
 }
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {

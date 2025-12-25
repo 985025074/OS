@@ -3,10 +3,16 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{config::MEMORY_END, println};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 use lazy_static::*;
 use spin::Mutex;
+
+lazy_static! {
+    /// Reference counts for physical frames (for COW/shared mappings).
+    static ref FRAME_REFCOUNTS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+}
 
 /// manage a frame which has the same lifecycle as the tracker
 pub struct FrameTracker {
@@ -20,7 +26,20 @@ impl FrameTracker {
         for i in bytes_array {
             *i = 0;
         }
+        {
+            let mut rc = FRAME_REFCOUNTS.lock();
+            rc.insert(ppn.0, 1);
+        }
         Self { ppn }
+    }
+}
+
+impl Clone for FrameTracker {
+    fn clone(&self) -> Self {
+        let mut rc = FRAME_REFCOUNTS.lock();
+        let e = rc.entry(self.ppn.0).or_insert(0);
+        *e += 1;
+        Self { ppn: self.ppn }
     }
 }
 
@@ -32,7 +51,18 @@ impl Debug for FrameTracker {
 
 impl Drop for FrameTracker {
     fn drop(&mut self) {
-        frame_dealloc(self.ppn);
+        let mut rc = FRAME_REFCOUNTS.lock();
+        let Some(cnt) = rc.get_mut(&self.ppn.0) else {
+            // Should not happen, but avoid double-free.
+            return;
+        };
+        if *cnt <= 1 {
+            rc.remove(&self.ppn.0);
+            drop(rc);
+            frame_dealloc(self.ppn);
+        } else {
+            *cnt -= 1;
+        }
     }
 }
 

@@ -1,10 +1,11 @@
 use alloc::sync::Arc;
 use core::cmp::min;
+use core::arch::asm;
 
 use crate::{
     config::PAGE_SIZE,
     fs::{File, OSInode},
-    mm::{MapPermission, translated_mutref},
+    mm::{MapPermission, PTEFlags, translated_mutref},
     task::processor::current_process,
     trap::get_current_token,
 };
@@ -12,6 +13,9 @@ use crate::{
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const PROT_EXEC: usize = 4;
+
+const EINVAL: isize = -22;
+const ENOMEM: isize = -12;
 
 fn align_down(x: usize, align: usize) -> usize {
     x & !(align - 1)
@@ -149,5 +153,68 @@ pub fn syscall_munmap(addr: usize, _len: usize) -> isize {
 /// permissions. We currently do not enforce per-page user permissions strictly,
 /// so accept the call and return success.
 pub fn syscall_mprotect(_addr: usize, _len: usize, _prot: usize) -> isize {
+    if _len == 0 {
+        return 0;
+    }
+    if _addr % PAGE_SIZE != 0 {
+        return EINVAL;
+    }
+    let Some(end) = _addr.checked_add(_len) else {
+        return EINVAL;
+    };
+    let start = _addr;
+    let end = align_up(end, PAGE_SIZE);
+
+    let mut new_flags = PTEFlags::U;
+    if (_prot & PROT_READ) != 0 {
+        new_flags |= PTEFlags::R;
+    }
+    if (_prot & PROT_WRITE) != 0 {
+        new_flags |= PTEFlags::W;
+    }
+    if (_prot & PROT_EXEC) != 0 {
+        new_flags |= PTEFlags::X;
+    }
+
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    let mut addr = start;
+    while addr < end {
+        let vpn = crate::mm::VirtAddr::from(addr).floor();
+        let Some(pte) = inner.memory_set.translate(vpn) else {
+            return ENOMEM;
+        };
+        if !pte.flags().contains(PTEFlags::U) {
+            return ENOMEM;
+        }
+        if !inner.memory_set.set_pte_flags(vpn, new_flags) {
+            return ENOMEM;
+        }
+        addr += PAGE_SIZE;
+    }
+    // Ensure permission changes take effect immediately.
+    unsafe { asm!("sfence.vma"); }
+    0
+}
+
+/// Linux `mlock` (syscall 228).
+///
+/// We do not implement page pinning; accept the call so rt-tests can proceed.
+pub fn syscall_mlock(_addr: usize, _len: usize) -> isize {
+    0
+}
+
+/// Linux `munlock` (syscall 229).
+pub fn syscall_munlock(_addr: usize, _len: usize) -> isize {
+    0
+}
+
+/// Linux `mlockall` (syscall 230).
+pub fn syscall_mlockall(_flags: usize) -> isize {
+    0
+}
+
+/// Linux `munlockall` (syscall 231).
+pub fn syscall_munlockall() -> isize {
     0
 }

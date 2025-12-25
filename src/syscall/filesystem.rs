@@ -3,7 +3,11 @@ use alloc::vec::Vec;
 use core::cmp::min;
 
 use crate::{
-    fs::{File, OSInode, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, RtcFile, ROOT_INODE, ext4_lock, make_pipe},
+    fs::{
+        shm_create, shm_get, shm_list, shm_remove, File, OSInode, PseudoBlock, PseudoDir,
+        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile, ROOT_INODE, OpenFlags, ext4_lock,
+        make_pipe, open_file,
+    },
     mm::{UserBuffer, translated_byte_buffer, translated_mutref, translated_str},
     task::processor::current_process,
     trap::get_current_token,
@@ -16,6 +20,7 @@ const O_RDONLY: usize = 0x0;
 const O_WRONLY: usize = 0x1;
 const O_RDWR: usize = 0x2;
 const O_CREAT: usize = 0x40;
+const O_EXCL: usize = 0x80;
 const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_DIRECTORY: usize = 0x10000;
@@ -86,6 +91,16 @@ fn normalize_relative_path(path: &str) -> String {
     parts.join("/")
 }
 
+fn shm_object_name(abs: &str) -> Option<&str> {
+    // Only accept `/dev/shm/<name>` (single path component).
+    let rest = abs.strip_prefix("/dev/shm/")?;
+    let name = rest.trim_start_matches('/');
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name)
+}
+
 fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -123,6 +138,8 @@ fn is_pseudo_path(abs: &str) -> bool {
         || abs.starts_with("/proc/")
         || abs == "/dev"
         || abs.starts_with("/dev/")
+        || abs == "/lib"
+        || abs.starts_with("/lib/")
 }
 
 enum AtPath {
@@ -338,7 +355,25 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
 
     // Pseudo fs: `/proc`, `/sys`, `/dev`.
     if let AtPath::PseudoAbs(abs) = &at {
-        let Some(file) = open_pseudo(abs) else {
+        // Minimal `/dev/shm` support for POSIX `shm_open` users (e.g., cyclictest).
+        // Must handle `O_CREAT|O_EXCL` even when the object already exists.
+        let file: alloc::sync::Arc<dyn File + Send + Sync> = if let Some(name) = shm_object_name(abs)
+        {
+            if (flags & O_CREAT) != 0 {
+                if (flags & O_EXCL) != 0 && shm_get(name).is_some() {
+                    return EEXIST;
+                }
+                let data = shm_create(name);
+                alloc::sync::Arc::new(PseudoShmFile::new(data))
+            } else {
+                let Some(data) = shm_get(name) else {
+                    return ENOENT;
+                };
+                alloc::sync::Arc::new(PseudoShmFile::new(data))
+            }
+        } else if let Some(f) = open_pseudo(abs) {
+            f
+        } else {
             return ENOENT;
         };
         let process = current_process();
@@ -675,6 +710,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from("root"), ino: 6, dtype: 6 },
+            PseudoDirent { name: alloc::string::String::from("shm"), ino: 8, dtype: 4 },
             PseudoDirent { name: alloc::string::String::from("null"), ino: 2, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("zero"), ino: 3, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("urandom"), ino: 4, dtype: 8 },
@@ -682,6 +718,16 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("misc"), ino: 7, dtype: 4 },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
+    }
+    if path == "/dev/shm" || path == "/dev/shm/" {
+        let mut entries = alloc::vec![
+            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
+            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
+        ];
+        for (idx, name) in shm_list().into_iter().enumerate() {
+            entries.push(PseudoDirent { name, ino: (1000 + idx) as u64, dtype: 8 });
+        }
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/shm", entries)));
     }
     if path == "/dev/misc" || path == "/dev/misc/" {
         let entries = alloc::vec![
@@ -756,6 +802,10 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     // /dev/*
     if path == "/dev/root" {
         return Some(alloc::sync::Arc::new(PseudoBlock::new()));
+    }
+    if let Some(name) = shm_object_name(path) {
+        let data = shm_get(name)?;
+        return Some(alloc::sync::Arc::new(PseudoShmFile::new(data)));
     }
     if path == "/dev/null" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_null()));
@@ -1093,7 +1143,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, _mode: usize) -> isize {
         Err(e) => return e,
     };
 
-    if matches!(at, AtPath::PseudoAbs(_)) {
+    if let AtPath::PseudoAbs(_) = &at {
         return EROFS;
     }
 
@@ -1164,7 +1214,18 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
         Err(e) => return e,
     };
 
-    if matches!(at, AtPath::PseudoAbs(_)) {
+    if let AtPath::PseudoAbs(abs) = &at {
+        let remove_dir = (_flags & AT_REMOVEDIR) != 0;
+        // Minimal `/dev/shm` support for POSIX `shm_unlink`.
+        if abs == "/dev/shm" || abs == "/dev/shm/" {
+            return if remove_dir { EROFS } else { EISDIR };
+        }
+        if let Some(name) = shm_object_name(abs) {
+            if remove_dir {
+                return ENOTDIR;
+            }
+            return if shm_remove(name) { 0 } else { ENOENT };
+        }
         return EROFS;
     }
 
@@ -1237,6 +1298,49 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
         Err(ext4_fs::Ext4Error::Unsupported) => ENOTEMPTY,
         Err(e) => ext4_err_to_errno(e),
     }
+}
+
+/// Linux `ftruncate(2)` (syscall 46 on riscv64).
+///
+/// Needed by musl `shm_open` users (e.g., cyclictest).
+pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+
+    // `/dev/shm/*` backing file.
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        shm.truncate(length);
+        return 0;
+    }
+
+    // Best-effort ext4 support.
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        let _ext4_guard = ext4_lock();
+        if !inode.is_file() {
+            return EINVAL;
+        }
+        let old = inode.size() as usize;
+        if length == 0 {
+            return match inode.clear() {
+                Ok(_) => 0,
+                Err(e) => ext4_err_to_errno(e),
+            };
+        }
+        if length > old {
+            // Extend by writing a single 0 byte at the final position.
+            let buf = [0u8; 1];
+            return match inode.write_at(length - 1, &buf) {
+                Ok(_) => 0,
+                Err(e) => ext4_err_to_errno(e),
+            };
+        }
+        // Shrinking is not supported yet; accept for compatibility.
+        return 0;
+    }
+
+    EINVAL
 }
 
 #[repr(C)]
@@ -1452,12 +1556,15 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
+        || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
     {
         let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
         } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
             0o060600
+        } else if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+            0o100666
         } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
             0o100666
         } else {
@@ -1468,6 +1575,16 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         } else {
             0
         };
+        let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+            shm.len() as i64
+        } else {
+            0
+        };
+        let st_blocks: u64 = if st_size <= 0 {
+            0
+        } else {
+            ((st_size as u64 + 511) / 512) as u64
+        };
         let st = KStat {
             st_dev: 0,
             st_ino: 1,
@@ -1477,10 +1594,10 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
             st_gid: 0,
             st_rdev,
             __pad: 0,
-            st_size: 0,
+            st_size,
             st_blksize: 4096,
             __pad2: 0,
-            st_blocks: 0,
+            st_blocks,
             st_atime_sec: 0,
             st_atime_nsec: 0,
             st_mtime_sec: 0,
@@ -1575,12 +1692,24 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             0o040555
         } else if abs == "/dev/root" {
             0o060600
+        } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+            0o100666
         } else if abs == "/dev/null" || abs == "/dev/zero" || abs == "/dev/misc/rtc" {
             0o100666
         } else {
             0o100444
         };
         let st_rdev: u64 = if abs == "/dev/root" { EXT4_ST_DEV } else { 0 };
+        let st_size: i64 = if let Some(shm) = node.as_any().downcast_ref::<PseudoShmFile>() {
+            shm.len() as i64
+        } else {
+            0
+        };
+        let st_blocks: u64 = if st_size <= 0 {
+            0
+        } else {
+            ((st_size as u64 + 511) / 512) as u64
+        };
         let st = KStat {
             st_dev: 0,
             st_ino: 1,
@@ -1590,10 +1719,10 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             st_gid: 0,
             st_rdev,
             __pad: 0,
-            st_size: 0,
+            st_size,
             st_blksize: 4096,
             __pad2: 0,
-            st_blocks: 0,
+            st_blocks,
             st_atime_sec: 0,
             st_atime_nsec: 0,
             st_mtime_sec: 0,
@@ -1907,6 +2036,22 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             return EINVAL;
         }
         pf.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        let end = shm.len() as isize;
+        let cur = shm.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        shm.set_offset(new as usize);
         return new;
     }
 

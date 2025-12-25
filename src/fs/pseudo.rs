@@ -1,8 +1,11 @@
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::mm::UserBuffer;
@@ -138,6 +141,31 @@ impl File for RtcFile {
     }
 }
 
+type ShmData = Arc<Mutex<Vec<u8>>>;
+
+lazy_static! {
+    static ref SHM_OBJECTS: Mutex<BTreeMap<String, ShmData>> = Mutex::new(BTreeMap::new());
+}
+
+pub fn shm_list() -> Vec<String> {
+    SHM_OBJECTS.lock().keys().cloned().collect()
+}
+
+pub fn shm_get(name: &str) -> Option<ShmData> {
+    SHM_OBJECTS.lock().get(name).cloned()
+}
+
+pub fn shm_create(name: &str) -> ShmData {
+    let mut map = SHM_OBJECTS.lock();
+    map.entry(String::from(name))
+        .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
+}
+
+pub fn shm_remove(name: &str) -> bool {
+    SHM_OBJECTS.lock().remove(name).is_some()
+}
+
 /// A minimal block device node for `/dev/root` so tools like busybox `df`
 /// treat the root filesystem as a real device-backed mount.
 pub struct PseudoBlock;
@@ -163,6 +191,100 @@ impl File for PseudoBlock {
 
     fn write(&self, _buf: UserBuffer) -> usize {
         0
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A minimal shared-memory file for `/dev/shm/<name>`.
+///
+/// This is a very small in-memory backing store to satisfy musl's `shm_open`/`shm_unlink`
+/// users (e.g., `cyclictest`). It provides per-fd offsets and a shared data buffer.
+pub struct PseudoShmFile {
+    data: ShmData,
+    offset: Mutex<usize>,
+}
+
+impl PseudoShmFile {
+    pub fn new(data: ShmData) -> Self {
+        Self {
+            data,
+            offset: Mutex::new(0),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.lock().len()
+    }
+
+    pub fn offset(&self) -> usize {
+        *self.offset.lock()
+    }
+
+    pub fn set_offset(&self, offset: usize) {
+        *self.offset.lock() = offset;
+    }
+
+    pub fn truncate(&self, new_len: usize) {
+        let mut data = self.data.lock();
+        data.resize(new_len, 0);
+        let mut off = self.offset.lock();
+        if *off > new_len {
+            *off = new_len;
+        }
+    }
+}
+
+impl File for PseudoShmFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, mut buf: UserBuffer) -> usize {
+        let mut off = self.offset.lock();
+        let data = self.data.lock();
+        if *off >= data.len() {
+            return 0;
+        }
+        let mut total = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            if *off >= data.len() {
+                break;
+            }
+            let n = core::cmp::min(slice.len(), data.len() - *off);
+            slice[..n].copy_from_slice(&data[*off..*off + n]);
+            *off += n;
+            total += n;
+            if n < slice.len() {
+                break;
+            }
+        }
+        total
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        let mut off = self.offset.lock();
+        let mut data = self.data.lock();
+        let mut total = 0usize;
+        for slice in buf.buffers.iter() {
+            if slice.is_empty() {
+                continue;
+            }
+            let end = off.saturating_add(slice.len());
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[*off..end].copy_from_slice(slice);
+            *off = end;
+            total += slice.len();
+        }
+        total
     }
 
     fn as_any(&self) -> &dyn Any {

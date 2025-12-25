@@ -140,7 +140,9 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
             break;
         }
     }
-    0
+    // Linux `sched_getaffinity` syscall returns the number of bytes written.
+    // musl uses this return value (not the wrapper) when implementing `sysconf(_SC_NPROCESSORS_*)`.
+    cpusetsize as isize
 }
 
 pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {

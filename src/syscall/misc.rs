@@ -242,48 +242,79 @@ pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize
     const POLLOUT: i16 = 0x0004;
     const EBADF: isize = -9;
 
-    if nfds == 0 {
-        return 0;
-    }
-    if fds_ptr == 0 {
+    if nfds == 0 || fds_ptr == 0 {
         return 0;
     }
 
     let token = get_current_token();
     let process = current_process();
-    let mut ready = 0isize;
-    for i in 0..nfds {
-        let pfd = translated_mutref(token, (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd);
-        if pfd.fd < 0 {
-            pfd.revents = 0;
-            continue;
-        }
-        let fd = pfd.fd as usize;
-        let file = {
-            let inner = process.borrow_mut();
-            if fd >= inner.fd_table.len() {
-                None
-            } else {
-                inner.fd_table[fd].clone()
+
+    // `ppoll(NULL)` means "wait forever" (no timeout). Many libc `poll(-1)` wrappers
+    // map to `ppoll(..., NULL, ...)`.
+    let infinite = _tmo_p == 0;
+
+    loop {
+        let mut ready = 0isize;
+        for i in 0..nfds {
+            let pfd = translated_mutref(token, (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd);
+            if pfd.fd < 0 {
+                pfd.revents = 0;
+                continue;
             }
-        };
-        let Some(file) = file else {
-            pfd.revents = 0;
-            return EBADF;
-        };
-        let mut revents: i16 = 0;
-        if (pfd.events & POLLIN) != 0 && file.readable() {
-            revents |= POLLIN;
+            let fd = pfd.fd as usize;
+            let file = {
+                let inner = process.borrow_mut();
+                if fd >= inner.fd_table.len() {
+                    None
+                } else {
+                    inner.fd_table[fd].clone()
+                }
+            };
+            let Some(file) = file else {
+                pfd.revents = 0;
+                return EBADF;
+            };
+
+            let mut revents: i16 = 0;
+
+            // Pipes and our socketpair endpoints need real readiness (buffer-based),
+            // not just "is readable/writable" capability.
+            if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
+                if (pfd.events & POLLIN) != 0 && pipe.poll_readable() {
+                    revents |= POLLIN;
+                }
+                if (pfd.events & POLLOUT) != 0 && pipe.poll_writable() {
+                    revents |= POLLOUT;
+                }
+            } else if let Some(sp) = file.as_any().downcast_ref::<crate::fs::SocketPairEnd>() {
+                if (pfd.events & POLLIN) != 0 && sp.poll_readable() {
+                    revents |= POLLIN;
+                }
+                if (pfd.events & POLLOUT) != 0 && sp.poll_writable() {
+                    revents |= POLLOUT;
+                }
+            } else {
+                if (pfd.events & POLLIN) != 0 && file.readable() {
+                    revents |= POLLIN;
+                }
+                if (pfd.events & POLLOUT) != 0 && file.writable() {
+                    revents |= POLLOUT;
+                }
+            }
+
+            pfd.revents = revents;
+            if revents != 0 {
+                ready += 1;
+            }
         }
-        if (pfd.events & POLLOUT) != 0 && file.writable() {
-            revents |= POLLOUT;
+
+        if ready != 0 || !infinite {
+            return ready;
         }
-        pfd.revents = revents;
-        if revents != 0 {
-            ready += 1;
-        }
+
+        // Block (best-effort): yield and retry until something becomes ready.
+        crate::task::processor::suspend_current_and_run_next();
     }
-    ready
 }
 
 /// Linux `umask(2)` (syscall 166 on riscv64).

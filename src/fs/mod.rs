@@ -1,6 +1,7 @@
 //! File system in os
 mod inode;
 mod pipe;
+mod socketpair;
 mod stdio;
 mod pseudo;
 use crate::mm::UserBuffer;
@@ -22,6 +23,8 @@ pub trait File: Send + Sync {
 pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::ext4_lock;
 pub use pipe::{Pipe, make_pipe};
+pub use socketpair::{SocketPairEnd, make_socketpair};
 pub use stdio::{Stdin, Stdout};
-pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, RtcFile};
+pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile};
 pub use pseudo::PseudoBlock;
+pub use pseudo::{shm_create, shm_get, shm_list, shm_remove};

@@ -276,6 +276,21 @@ pub fn go_to_first_task() -> ! {
     panic!("Unreachable in go_to_first_task!");
 }
 pub fn suspend_current_and_run_next() {
+    // If the current process has a fatal pending signal, terminate it even if we are
+    // inside a long-running/blocking syscall loop (where we may never return to the
+    // trap handler's "check signal then return to user" path).
+    //
+    // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
+    {
+        let process = current_process();
+        let fatal = process
+            .try_borrow_mut()
+            .and_then(|inner| inner.signals.check_error());
+        if let Some((errno, msg)) = fatal {
+            crate::println!("[kernel] {}", msg);
+            exit_current_and_run_next(errno);
+        }
+    }
     // There must be an application running.
     let task = take_current_task().unwrap();
 
@@ -297,6 +312,18 @@ pub fn suspend_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 pub fn block_current_and_run_next() {
+    // Same rationale as in `suspend_current_and_run_next()`: a task can be stuck
+    // yielding within a syscall (interrupts disabled), so handle fatal signals here.
+    {
+        let process = current_process();
+        let fatal = process
+            .try_borrow_mut()
+            .and_then(|inner| inner.signals.check_error());
+        if let Some((errno, msg)) = fatal {
+            crate::println!("[kernel] {}", msg);
+            exit_current_and_run_next(errno);
+        }
+    }
     // There must be an application running.
     let task = take_current_task().unwrap();
 
