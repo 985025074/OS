@@ -1,6 +1,6 @@
 use crate::{
     config::CLOCK_FREQ,
-    mm::translated_mutref,
+    mm::{read_user_value, write_user_value},
     syscall::thread,
     time::get_time,
     trap::get_current_token,
@@ -40,7 +40,7 @@ pub fn syscall_gettimeofday(tv_ptr: usize, _tz: usize) -> isize {
         usec: us % 1_000_000,
     };
     let token = get_current_token();
-    *translated_mutref(token, tv_ptr as *mut TimeVal) = tv;
+    write_user_value(token, tv_ptr as *mut TimeVal, &tv);
     0
 }
 
@@ -49,7 +49,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
         return -1;
     }
     let token = get_current_token();
-    let ts = *translated_mutref(token, req_ptr as *mut TimeSpec);
+    let ts = read_user_value(token, req_ptr as *const TimeSpec);
     if ts.sec < 0 || ts.nsec < 0 {
         return -1;
     }
@@ -70,7 +70,7 @@ pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
         nsec: (ns % 1_000_000_000) as i64,
     };
     let token = get_current_token();
-    *translated_mutref(token, tp_ptr as *mut TimeSpec) = ts;
+    write_user_value(token, tp_ptr as *mut TimeSpec, &ts);
     0
 }
 
@@ -87,7 +87,7 @@ pub fn syscall_clock_nanosleep(_clk_id: usize, flags: usize, req_ptr: usize, rem
         return syscall_nanosleep(req_ptr, rem_ptr);
     }
     let token = get_current_token();
-    let ts = *translated_mutref(token, req_ptr as *mut TimeSpec);
+    let ts = read_user_value(token, req_ptr as *const TimeSpec);
     if ts.sec < 0 || ts.nsec < 0 {
         return -1;
     }
@@ -107,12 +107,37 @@ pub fn syscall_clock_nanosleep(_clk_id: usize, flags: usize, req_ptr: usize, rem
 pub fn syscall_times(tms_ptr: usize) -> isize {
     if tms_ptr != 0 {
         let token = get_current_token();
-        *translated_mutref(token, tms_ptr as *mut Tms) = Tms {
+        let tms = Tms {
             tms_utime: 0,
             tms_stime: 0,
             tms_cutime: 0,
             tms_cstime: 0,
         };
+        write_user_value(token, tms_ptr as *mut Tms, &tms);
     }
     crate::time::get_time_ms() as isize
+}
+
+/// Linux `pselect6` (syscall 72 on riscv64).
+///
+/// glibc sometimes uses `pselect6(0, NULL, NULL, NULL, &ts, NULL)` as a sleep primitive.
+/// We implement a minimal subset:
+/// - if `timeout` is non-null, sleep for the requested duration and return 0 (timeout);
+/// - otherwise, yield.
+pub fn syscall_pselect6(
+    _nfds: usize,
+    _readfds: usize,
+    _writefds: usize,
+    _exceptfds: usize,
+    timeout_ptr: usize,
+    _sigmask: usize,
+) -> isize {
+    if timeout_ptr != 0 {
+        // Reuse nanosleep implementation (same `timespec` layout).
+        let _ = syscall_nanosleep(timeout_ptr, 0);
+        return 0;
+    }
+    // No fds readiness modeled; treat as a scheduler yield.
+    crate::task::processor::suspend_current_and_run_next();
+    0
 }

@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use super::mutex::Mutex;
 use crate::fs::{File, Stdin, Stdout};
 use crate::config::USER_STACK_SIZE;
-use crate::mm::{KERNEL_SPACE, MemorySet, translated_mutref};
+use crate::mm::{KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value};
 use crate::println;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
@@ -18,7 +18,197 @@ use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
+use crate::debug_config::DEBUG_SYSCALL;
 use spin::{Mutex as SpinMutex, MutexGuard};
+
+fn patch_glibc_ld_linux_symtab_dyn(
+    token: usize,
+    interp_base: usize,
+    interp_data: &[u8],
+) {
+    // Workaround for early ld-linux crash on some setups: glibc's rtld expects a
+    // non-null DT_SYMTAB dynamic entry pointer cached in `_rtld_global`.
+    //
+    // The crashing instruction sequence is:
+    //   ld a3, -1248(s10)   # a3 == 0
+    //   ld a6, 8(a3)        # deref NULL -> stval=0x8
+    //
+    // For the tested riscv64 glibc ld.so build, this cache lives at:
+    //   _rtld_global + 0xb20 == 0x21b70 (relative to interpreter base).
+    //
+    // We only apply this patch when we positively identify the interpreter SONAME.
+    const DT_NULL: u64 = 0;
+    const DT_STRTAB: u64 = 5;
+    const DT_SYMTAB: u64 = 6;
+    const DT_STRSZ: u64 = 10;
+    const DT_SONAME: u64 = 14;
+
+    if DEBUG_SYSCALL {
+        crate::println!(
+            "[exec_dyn] try patch ld-linux: base={:#x} len={}",
+            interp_base,
+            interp_data.len()
+        );
+    }
+
+    let elf = match xmas_elf::ElfFile::new(interp_data) {
+        Ok(e) => e,
+        Err(_) => {
+            if DEBUG_SYSCALL {
+                crate::println!("[exec_dyn] patch ld-linux: invalid ELF");
+            }
+            return;
+        }
+    };
+
+    // Prefer PT_DYNAMIC, but fall back to the .dynamic section if parsing fails.
+    let mut dyn_off: Option<usize> = None;
+    let mut dyn_vaddr: Option<usize> = None;
+    let mut dyn_size: Option<usize> = None;
+    let ph_count = elf.header.pt2.ph_count();
+    for i in 0..ph_count {
+        let Ok(ph) = elf.program_header(i) else { continue };
+        if ph.get_type() == Ok(xmas_elf::program::Type::Dynamic) {
+            dyn_off = Some(ph.offset() as usize);
+            dyn_vaddr = Some(ph.virtual_addr() as usize);
+            dyn_size = Some(ph.file_size() as usize);
+            break;
+        }
+    }
+    if DEBUG_SYSCALL {
+        crate::println!(
+            "[exec_dyn] patch ld-linux: PT_DYNAMIC off={:?} vaddr={:?} size={:?}",
+            dyn_off,
+            dyn_vaddr,
+            dyn_size
+        );
+    }
+
+    let mut dyn_bytes: Option<&[u8]> = None;
+    if let (Some(off), Some(size)) = (dyn_off, dyn_size) {
+        if size != 0 && off.saturating_add(size) <= interp_data.len() {
+            dyn_bytes = Some(&interp_data[off..off + size]);
+        }
+    }
+    let mut dyn_vaddr_final = dyn_vaddr;
+
+    // If PT_DYNAMIC isn't present/usable, fall back to section header.
+    if dyn_bytes.is_none() || dyn_vaddr_final.is_none() {
+        if let Some(sec) = elf.find_section_by_name(".dynamic") {
+            dyn_bytes = Some(sec.raw_data(&elf));
+            dyn_vaddr_final = Some(sec.address() as usize);
+            if DEBUG_SYSCALL {
+                crate::println!(
+                    "[exec_dyn] patch ld-linux: use .dynamic section vaddr={:#x} size={:#x}",
+                    sec.address(),
+                    sec.size()
+                );
+            }
+        }
+    }
+
+    let (Some(dyn_bytes), Some(dyn_vaddr)) = (dyn_bytes, dyn_vaddr_final) else {
+        if DEBUG_SYSCALL {
+            crate::println!("[exec_dyn] patch ld-linux: no dynamic table bytes");
+        }
+        return;
+    };
+
+    let mut strtab_vaddr = None;
+    let mut strsz = None;
+    let mut soname_off = None;
+    let mut symtab_dyn_index = None;
+    for (idx, chunk) in dyn_bytes.chunks_exact(16).enumerate() {
+        let tag = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let val = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        if tag == DT_NULL {
+            break;
+        }
+        match tag {
+            DT_STRTAB => strtab_vaddr = Some(val as usize),
+            DT_STRSZ => strsz = Some(val as usize),
+            DT_SONAME => soname_off = Some(val as usize),
+            DT_SYMTAB => symtab_dyn_index = Some(idx),
+            _ => {}
+        }
+    }
+
+    let (Some(strtab_vaddr), Some(strsz), Some(soname_off), Some(symtab_dyn_index)) =
+        (strtab_vaddr, strsz, soname_off, symtab_dyn_index)
+    else {
+        if DEBUG_SYSCALL {
+            if dyn_bytes.len() >= 16 {
+                let tag0 = u64::from_le_bytes(dyn_bytes[0..8].try_into().unwrap());
+                let val0 = u64::from_le_bytes(dyn_bytes[8..16].try_into().unwrap());
+                crate::println!(
+                    "[exec_dyn] patch ld-linux: dyn[0] tag={:#x} val={:#x}",
+                    tag0,
+                    val0
+                );
+            }
+            crate::println!(
+                "[exec_dyn] patch ld-linux: missing tags strtab={:?} strsz={:?} soname={:?} symtab_idx={:?}",
+                strtab_vaddr,
+                strsz,
+                soname_off,
+                symtab_dyn_index
+            );
+        }
+        return;
+    };
+
+    // ld-linux's STRTAB is in the first PT_LOAD with p_offset==p_vaddr==0, so vaddr==file offset.
+    if strtab_vaddr.saturating_add(strsz) > interp_data.len() || soname_off >= strsz {
+        if DEBUG_SYSCALL {
+            crate::println!(
+                "[exec_dyn] patch ld-linux: bad strtab vaddr={:#x} strsz={:#x} soname_off={:#x}",
+                strtab_vaddr,
+                strsz,
+                soname_off
+            );
+        }
+        return;
+    }
+    let strtab = &interp_data[strtab_vaddr..strtab_vaddr + strsz];
+    let mut end = soname_off;
+    while end < strtab.len() && strtab[end] != 0 {
+        end += 1;
+    }
+    let Ok(soname) = core::str::from_utf8(&strtab[soname_off..end]) else {
+        if DEBUG_SYSCALL {
+            crate::println!("[exec_dyn] patch ld-linux: SONAME not utf8");
+        }
+        return;
+    };
+    if DEBUG_SYSCALL {
+        crate::println!(
+            "[exec_dyn] patch ld-linux: SONAME='{}' dyn_vaddr={:#x} symtab_dyn_idx={}",
+            soname,
+            dyn_vaddr,
+            symtab_dyn_index
+        );
+    }
+    if soname != "ld-linux-riscv64-lp64d.so.1" {
+        if DEBUG_SYSCALL {
+            crate::println!("[exec_dyn] patch ld-linux: skip (not glibc ld-linux)");
+        }
+        return;
+    }
+
+    let symtab_dyn_ptr = interp_base + dyn_vaddr + symtab_dyn_index * 16;
+    let rtld_global_symtab_slot = interp_base + 0x21b70;
+    write_user_value(token, rtld_global_symtab_slot as *mut usize, &symtab_dyn_ptr);
+    let verify = read_user_value(token, rtld_global_symtab_slot as *const usize);
+
+    if DEBUG_SYSCALL {
+        crate::println!(
+            "[exec_dyn] patched ld-linux DT_SYMTAB dyn*={:#x} into _rtld_global+0xb20 ({:#x}), verify={:#x}",
+            symtab_dyn_ptr,
+            rtld_global_symtab_slot,
+            verify
+        );
+    }
+}
 
 const AT_NULL: usize = 0;
 const AT_PHDR: usize = 3;
@@ -34,9 +224,11 @@ const AT_EGID: usize = 14;
 const AT_PLATFORM: usize = 15;
 const AT_HWCAP: usize = 16;
 const AT_CLKTCK: usize = 17;
-const AT_SYSINFO_EHDR: usize = 33;
+const AT_FLAGS: usize = 8;
 const AT_SECURE: usize = 23;
+const AT_BASE_PLATFORM: usize = 24;
 const AT_RANDOM: usize = 25;
+const AT_HWCAP2: usize = 26;
 const AT_EXECFN: usize = 31;
 
 fn build_linux_stack(
@@ -47,7 +239,7 @@ fn build_linux_stack(
     elf_aux: crate::mm::ElfAux,
     at_entry: usize,
     at_base: usize,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
             *translated_mutref(token, (addr + i) as *mut u8) = *b;
@@ -56,7 +248,7 @@ fn build_linux_stack(
 
     fn push_usize(token: usize, sp: &mut usize, value: usize) {
         *sp -= core::mem::size_of::<usize>();
-        *translated_mutref(token, *sp as *mut usize) = value;
+        write_user_value(token, *sp as *mut usize, &value);
     }
 
     let argc = args.len();
@@ -85,7 +277,8 @@ fn build_linux_stack(
 
     // AT_PLATFORM: a small string describing the CPU architecture.
     // glibc's dynamic loader expects this to be present.
-    let platform = "riscv64";
+    // Keep consistent with many Linux RISC-V userlands.
+    let platform = "RISC-V64";
     sp -= platform.len() + 1;
     write_bytes(token, sp, platform.as_bytes());
     *translated_mutref(token, (sp + platform.len()) as *mut u8) = 0;
@@ -112,11 +305,13 @@ fn build_linux_stack(
 
     let mut auxv: Vec<(usize, usize)> = vec![
         (AT_HWCAP, 0),
+        (AT_HWCAP2, 0),
         (AT_PHDR, elf_aux.phdr),
         (AT_PHENT, elf_aux.phent),
         (AT_PHNUM, elf_aux.phnum),
         (AT_PAGESZ, crate::config::PAGE_SIZE),
         (AT_ENTRY, at_entry),
+        (AT_FLAGS, 0),
         (AT_CLKTCK, 100),
         (AT_UID, 0),
         (AT_EUID, 0),
@@ -124,15 +319,11 @@ fn build_linux_stack(
         (AT_EGID, 0),
         (AT_SECURE, 0),
         (AT_PLATFORM, platform_ptr),
+        (AT_BASE_PLATFORM, platform_ptr),
         (AT_EXECFN, execfn_ptr),
         (AT_RANDOM, random_ptr),
     ];
-    // Linux provides a VDSO base via AT_SYSINFO_EHDR. We don't have a real VDSO yet,
-    // but glibc's dynamic loader expects this entry to be non-zero on many setups.
-    // Provide a best-effort pointer to the interpreter's ELF header when available.
-    if at_base != 0 {
-        auxv.push((AT_SYSINFO_EHDR, at_base));
-    }
+    // We do not provide a VDSO (AT_SYSINFO_EHDR). glibc should fall back to syscalls.
     if at_base != 0 {
         auxv.push((AT_BASE, at_base));
     }
@@ -155,6 +346,7 @@ fn build_linux_stack(
         push_usize(token, &mut sp, *v);
         push_usize(token, &mut sp, *t);
     }
+    let auxv_base = sp;
 
     // envp pointers array (envc + 1), with trailing NULL.
     push_usize(token, &mut sp, 0);
@@ -173,7 +365,59 @@ fn build_linux_stack(
     // argc.
     push_usize(token, &mut sp, argc);
 
-    (sp, argv_base, envp_base)
+    (sp, argv_base, envp_base, auxv_base)
+}
+
+fn dump_linux_initial_stack(token: usize, sp: usize) {
+    if !DEBUG_SYSCALL {
+        return;
+    }
+    // Best-effort stack dump for diagnosing glibc/ld-linux startup issues.
+    let argc = read_user_value(token, sp as *const usize);
+    let argv0_ptr =
+        read_user_value(token, (sp + core::mem::size_of::<usize>()) as *const usize);
+    let mut argv0 = alloc::string::String::new();
+    if argv0_ptr != 0 {
+        for i in 0..64usize {
+            let ch = *translated_mutref(token, (argv0_ptr + i) as *mut u8);
+            if ch == 0 {
+                break;
+            }
+            argv0.push(ch as char);
+        }
+    }
+    crate::println!(
+        "[exec_dyn] initial_stack sp={:#x} argc={} argv0_ptr={:#x} argv0='{}'",
+        sp,
+        argc,
+        argv0_ptr,
+        argv0
+    );
+
+    // Walk argv/envp to find auxv.
+    let argv_base = sp + core::mem::size_of::<usize>();
+    let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
+    // Skip envp pointers (NULL terminated).
+    for _ in 0..256usize {
+        let v = read_user_value(token, p as *const usize);
+        p += core::mem::size_of::<usize>();
+        if v == 0 {
+            break;
+        }
+    }
+    // Now p points just past envp NULL, i.e. auxv starts here.
+    let mut aux_p = p;
+    for _ in 0..64usize {
+        let t = read_user_value(token, aux_p as *const usize);
+        let v = read_user_value(token, (aux_p + core::mem::size_of::<usize>()) as *const usize);
+        aux_p += 2 * core::mem::size_of::<usize>();
+        if t == AT_NULL {
+            break;
+        }
+        if matches!(t, AT_PHDR | AT_PHENT | AT_PHNUM | AT_PAGESZ | AT_BASE | AT_ENTRY | AT_PLATFORM | AT_EXECFN | AT_RANDOM | AT_HWCAP) {
+            crate::println!("[exec_dyn] auxv type={} val={:#x}", t, v);
+        }
+    }
 }
 pub struct ProcessControlBlock {
     // immutable
@@ -201,6 +445,8 @@ pub struct ProcessControlBlockInner {
     pub brk: usize,
     pub mmap_next: usize,
     pub mmap_areas: Vec<(usize, usize)>,
+    /// System V shared memory attachments (shmat/shmdt).
+    pub sysv_shm_attaches: Vec<crate::syscall::sysv_shm::ShmAttach>,
     pub signals: SignalFlags,
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
@@ -268,7 +514,7 @@ impl ProcessControlBlock {
         // allocate a pid
         let pid_handle = pid_alloc();
         let args = vec![String::from("init_proc")];
-        let (user_sp, argv_base, envp_base) = build_linux_stack(
+        let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
             ustack_base + USER_STACK_SIZE,
             &args,
@@ -298,8 +544,10 @@ impl ProcessControlBlock {
                 cwd: String::from("/user"),
                 heap_start,
                 brk: heap_start,
-                mmap_next: 0x4000_0000,
+                // Keep anonymous/file mmaps high to avoid colliding with ELF segments.
+                mmap_next: 0x20_0000_0000,
                 mmap_areas: Vec::new(),
+                sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
@@ -337,6 +585,7 @@ impl ProcessControlBlock {
         tcx.x[10] = args.len();
         tcx.x[11] = argv_base;
         tcx.x[12] = envp_base;
+        tcx.x[13] = auxv_base;
         *trap_cx = tcx;
         // println!(
         //     "[DEBUG] ProcessControlBlock::new - entry_point={:#x}, ustack_top={:#x}, kstack_top={:#x}",
@@ -371,10 +620,12 @@ impl ProcessControlBlock {
         // substitute memory_set
         {
             let mut inner = self.borrow_mut();
+            let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
             inner.brk = heap_start;
-            inner.mmap_next = 0x4000_0000;
+            inner.mmap_next = 0x20_0000_0000;
             inner.mmap_areas.clear();
             inner.argv = args.clone();
         }
@@ -390,7 +641,7 @@ impl ProcessControlBlock {
         // Build a Linux-like initial stack layout so both:
         // - C runtime can read argc/argv from `sp` (as in oscomp ulib), and
         // - Rust runtime can read argc/argv from a0/a1.
-    let (user_sp, argv_base, envp_base) = build_linux_stack(
+    let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             &args,
@@ -410,6 +661,7 @@ impl ProcessControlBlock {
         trap_cx.x[10] = args.len();
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
+        trap_cx.x[13] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
     }
 
@@ -424,13 +676,19 @@ impl ProcessControlBlock {
         let heap_start = ustack_base + USER_STACK_SIZE;
         {
             let mut inner = self.borrow_mut();
+            let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
             inner.brk = heap_start;
-            inner.mmap_next = 0x4000_0000;
+            inner.mmap_next = 0x20_0000_0000;
             inner.mmap_areas.clear();
             inner.argv = args.clone();
         }
+
+        // Workaround glibc ld-linux early crash by seeding an internal cached
+        // DT_SYMTAB dynamic-entry pointer before entering the interpreter.
+        patch_glibc_ld_linux_symtab_dyn(new_token, interp_base, interp_data);
 
         let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
@@ -438,7 +696,7 @@ impl ProcessControlBlock {
         res.ustack_base = ustack_base;
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
 
-        let (user_sp, argv_base, envp_base) = build_linux_stack(
+        let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             &args,
@@ -447,6 +705,7 @@ impl ProcessControlBlock {
             main_entry,
             interp_base,
         );
+        dump_linux_initial_stack(new_token, user_sp);
 
         let mut trap_cx = TrapContext::app_init_context(
             interp_entry,
@@ -458,6 +717,7 @@ impl ProcessControlBlock {
         trap_cx.x[10] = args.len();
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
+        trap_cx.x[13] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
     }
 
@@ -468,6 +728,7 @@ impl ProcessControlBlock {
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
         let argv = parent.argv.clone();
+        let inherited_shm = parent.sysv_shm_attaches.clone();
         // Fork address space using copy-on-write for user pages to avoid huge copies
         // when spawning many processes (e.g., rt-tests hackbench).
         let memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
@@ -499,6 +760,7 @@ impl ProcessControlBlock {
                 brk: parent.brk,
                 mmap_next: parent.mmap_next,
                 mmap_areas: parent.mmap_areas.clone(),
+                sysv_shm_attaches: inherited_shm.clone(),
                 // is right here?
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
@@ -514,6 +776,7 @@ impl ProcessControlBlock {
                 wait_queue: VecDeque::new(),
             }),
         });
+        crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
         // add child
         parent.children.push(Arc::clone(&child));
         // create main thread of child process

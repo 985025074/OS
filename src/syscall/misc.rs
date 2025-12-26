@@ -1,5 +1,5 @@
 use crate::{
-    mm::{translated_byte_buffer, translated_mutref},
+    mm::{translated_byte_buffer, read_user_value, write_user_value},
     task::processor::{current_process, current_task},
     trap::get_current_token,
     time::get_time,
@@ -86,7 +86,7 @@ pub fn syscall_uname(buf: usize) -> isize {
     write_cstr(&mut un.domainname, "localdomain");
 
     let token = get_current_token();
-    *translated_mutref(token, buf as *mut UtsName) = un;
+    write_user_value(token, buf as *mut UtsName, &un);
     0
 }
 
@@ -188,10 +188,11 @@ struct RLimit64 {
 pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_limit: usize) -> isize {
     if old_limit != 0 {
         let token = get_current_token();
-        *translated_mutref(token, old_limit as *mut RLimit64) = RLimit64 {
+        let rl = RLimit64 {
             rlim_cur: u64::MAX,
             rlim_max: u64::MAX,
         };
+        write_user_value(token, old_limit as *mut RLimit64, &rl);
     }
     0
 }
@@ -256,9 +257,11 @@ pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize
     loop {
         let mut ready = 0isize;
         for i in 0..nfds {
-            let pfd = translated_mutref(token, (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd);
+            let pfd_ptr = (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd;
+            let mut pfd = read_user_value(token, pfd_ptr as *const PollFd);
             if pfd.fd < 0 {
                 pfd.revents = 0;
+                write_user_value(token, pfd_ptr, &pfd);
                 continue;
             }
             let fd = pfd.fd as usize;
@@ -303,6 +306,7 @@ pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize
             }
 
             pfd.revents = revents;
+            write_user_value(token, pfd_ptr, &pfd);
             if revents != 0 {
                 ready += 1;
             }
@@ -381,7 +385,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 tm_isdst: 0,
             };
             let token = get_current_token();
-            *translated_mutref(token, _argp as *mut RtcTime) = rt;
+            write_user_value(token, _argp as *mut RtcTime, &rt);
         }
         return 0;
     }

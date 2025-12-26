@@ -31,6 +31,11 @@ pub struct OSInodeInner {
     offset: usize,
     dir_offset: usize,
     inode: Arc<Inode>,
+    write_buf_off: usize,
+    write_buf: Vec<u8>,
+    read_buf_off: usize,
+    read_buf_valid: usize,
+    read_buf: Vec<u8>,
 }
 
 impl OSInode {
@@ -48,12 +53,18 @@ impl OSInode {
                 offset: 0,
                 dir_offset: 0,
                 inode,
+                write_buf_off: 0,
+                write_buf: Vec::new(),
+                read_buf_off: 0,
+                read_buf_valid: 0,
+                read_buf: Vec::new(),
             }),
         }
     }
 
     /// Read all data inside an inode into vector
     pub fn read_all(&self) -> Vec<u8> {
+        let _ = self.flush();
         let _fs_guard = EXT4_LOCK.lock();
         let mut inner = self.inner.lock();
         let file_size = inner.inode.size() as usize;
@@ -83,12 +94,52 @@ impl OSInode {
         self.inner.lock().inode.clone()
     }
 
+    /// Read from this inode at the given offset without updating the file offset.
+    pub fn pread_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let _ = self.flush();
+        let _fs_guard = EXT4_LOCK.lock();
+        let inner = self.inner.lock();
+        inner.inode.read_at(offset, buf)
+    }
+
+    /// Write to this inode at the given offset without updating the file offset.
+    pub fn pwrite_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ()> {
+        let _ = self.flush();
+        let _fs_guard = EXT4_LOCK.lock();
+        let mut inner = self.inner.lock();
+        // Writes via pwrite/pwritev must invalidate the buffered read cache.
+        inner.read_buf_valid = 0;
+        inner.inode.write_at(offset, buf).map_err(|_| ())
+    }
+
+    pub fn flush(&self) -> Result<(), ()> {
+        let _fs_guard = EXT4_LOCK.lock();
+        let mut inner = self.inner.lock();
+        if inner.write_buf.is_empty() {
+            return Ok(());
+        }
+        let off = inner.write_buf_off;
+        let data = core::mem::take(&mut inner.write_buf);
+        match inner.inode.write_at(off, &data) {
+            Ok(n) if n == data.len() => Ok(()),
+            Ok(_) | Err(_) => {
+                // Restore buffer best-effort (so we don't silently drop data).
+                inner.write_buf_off = off;
+                inner.write_buf = data;
+                Err(())
+            }
+        }
+    }
+
     pub fn offset(&self) -> usize {
         self.inner.lock().offset
     }
 
     pub fn set_offset(&self, offset: usize) {
-        self.inner.lock().offset = offset;
+        let _ = self.flush();
+        let mut inner = self.inner.lock();
+        inner.offset = offset;
+        inner.read_buf_valid = 0;
     }
 
     pub fn dir_offset(&self) -> usize {
@@ -214,16 +265,49 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
+        let _ = self.flush();
         let _fs_guard = EXT4_LOCK.lock();
         let mut inner = self.inner.lock();
         let mut total_read_size = 0usize;
+        const READBUF_MAX: usize = 64 * 1024;
+
+        if inner.read_buf.len() < READBUF_MAX {
+            inner.read_buf.resize(READBUF_MAX, 0);
+            inner.read_buf_off = 0;
+            inner.read_buf_valid = 0;
+        }
+
         for slice in buf.buffers.iter_mut() {
-            let read_size = inner.inode.read_at(inner.offset, *slice);
-            if read_size == 0 {
-                break;
+            let mut out: &mut [u8] = *slice;
+            while !out.is_empty() {
+                let need_refill = inner.read_buf_valid == 0
+                    || inner.offset < inner.read_buf_off
+                    || inner.offset >= inner.read_buf_off + inner.read_buf_valid;
+
+                if need_refill {
+                    inner.read_buf_off = inner.offset;
+                    let inode = inner.inode.clone();
+                    let off = inner.read_buf_off;
+                    let n = inode.read_at(off, &mut inner.read_buf[..READBUF_MAX]);
+                    inner.read_buf_valid = n;
+                    if n == 0 {
+                        return total_read_size;
+                    }
+                }
+
+                let buf_off = inner.offset - inner.read_buf_off;
+                let avail = inner.read_buf_valid.saturating_sub(buf_off);
+                if avail == 0 {
+                    inner.read_buf_valid = 0;
+                    continue;
+                }
+
+                let n = core::cmp::min(avail, out.len());
+                out[..n].copy_from_slice(&inner.read_buf[buf_off..buf_off + n]);
+                inner.offset += n;
+                total_read_size += n;
+                out = &mut out[n..];
             }
-            inner.offset += read_size;
-            total_read_size += read_size;
         }
         total_read_size
     }
@@ -232,25 +316,51 @@ impl File for OSInode {
         let _fs_guard = EXT4_LOCK.lock();
         let mut inner = self.inner.lock();
         if self.append {
+            if !inner.write_buf.is_empty() {
+                let _ = inner.inode.write_at(inner.write_buf_off, &inner.write_buf);
+                inner.write_buf.clear();
+            }
             inner.offset = inner.inode.size() as usize;
         }
         let mut total_write_size = 0usize;
+        const WRITEBUF_MAX: usize = 64 * 1024;
+
         for slice in _buf.buffers.iter() {
-            match inner.inode.write_at(inner.offset, &*slice) {
-                Ok(write_size) => {
-                    if write_size == 0 {
-                        break;
-                    }
-                    inner.offset += write_size;
-                    total_write_size += write_size;
-                    if write_size < slice.len() {
-                        break;
-                    }
-                }
-                Err(_) => {
+            // Flush on non-sequential writes.
+            if !inner.write_buf.is_empty()
+                && inner.offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
+            {
+                if inner
+                    .inode
+                    .write_at(inner.write_buf_off, &inner.write_buf)
+                    .is_err()
+                {
                     println!("[ext4] Warning: write failed");
                     break;
                 }
+                inner.write_buf.clear();
+            }
+
+            if inner.write_buf.is_empty() {
+                inner.write_buf_off = inner.offset;
+            }
+
+            inner.write_buf.extend_from_slice(slice);
+            inner.offset += slice.len();
+            total_write_size += slice.len();
+            inner.read_buf_valid = 0;
+
+            if inner.write_buf.len() >= WRITEBUF_MAX {
+                if inner
+                    .inode
+                    .write_at(inner.write_buf_off, &inner.write_buf)
+                    .is_err()
+                {
+                    println!("[ext4] Warning: write failed");
+                    break;
+                }
+                inner.write_buf.clear();
+                inner.read_buf_valid = 0;
             }
         }
         total_write_size
@@ -258,6 +368,19 @@ impl File for OSInode {
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+}
+
+impl Drop for OSInode {
+    fn drop(&mut self) {
+        let _fs_guard = EXT4_LOCK.lock();
+        let mut inner = self.inner.lock();
+        if inner.write_buf.is_empty() {
+            return;
+        }
+        let off = inner.write_buf_off;
+        let data = core::mem::take(&mut inner.write_buf);
+        let _ = inner.inode.write_at(off, &data);
     }
 }
 

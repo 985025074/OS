@@ -14,6 +14,9 @@ const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const PROT_EXEC: usize = 4;
 
+// Linux `mmap(2)` flags (subset).
+const MAP_FIXED: usize = 0x10;
+
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 
@@ -69,24 +72,33 @@ pub fn syscall_mmap(
     addr: usize,
     len: usize,
     prot: usize,
-    _flags: usize,
+    flags: usize,
     fd: isize,
     off: usize,
 ) -> isize {
     if len == 0 {
-        return -1;
+        return EINVAL;
     }
 
     let process = current_process();
     let mut inner = process.borrow_mut();
 
-    let start = if addr != 0 {
+    // A very small `mmap` implementation:
+    // - only honor `addr` when `MAP_FIXED` is set;
+    // - otherwise treat `addr` as a hint and allocate from `mmap_next`;
+    // - never move `mmap_next` backwards (important for glibc/ld.so).
+    let start = if (flags & MAP_FIXED) != 0 {
+        if addr == 0 {
+            return EINVAL;
+        }
         align_down(addr, PAGE_SIZE)
     } else {
         align_up(inner.mmap_next, PAGE_SIZE)
     };
     let map_len = align_up(len, PAGE_SIZE);
-    let end = start + map_len;
+    let Some(end) = start.checked_add(map_len) else {
+        return ENOMEM;
+    };
 
     let mut perm = MapPermission::U;
     if (prot & PROT_READ) != 0 {
@@ -99,8 +111,46 @@ pub fn syscall_mmap(
         perm |= MapPermission::X;
     }
 
+    if (flags & MAP_FIXED) != 0 {
+        // Refuse to map over kernel-only pages (e.g. TrapContext/trampoline).
+        let mut cur = start;
+        while cur < end {
+            let vpn = crate::mm::VirtAddr::from(cur).floor();
+            if let Some(pte) = inner.memory_set.translate(vpn) {
+                if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
+                    return ENOMEM;
+                }
+            }
+            cur += PAGE_SIZE;
+        }
+
+        // Linux MAP_FIXED replaces any existing mappings in the range.
+        inner
+            .memory_set
+            .unmap_user_range(start.into(), end.into());
+
+        // Keep `mmap_areas` bookkeeping consistent (split/trim overlaps).
+        let mut new_areas = alloc::vec::Vec::new();
+        for (s, l) in inner.mmap_areas.drain(..) {
+            let e = s + l;
+            if end <= s || start >= e {
+                new_areas.push((s, l));
+                continue;
+            }
+            if start > s {
+                new_areas.push((s, start - s));
+            }
+            if end < e {
+                new_areas.push((end, e - end));
+            }
+        }
+        inner.mmap_areas = new_areas;
+    }
+
     inner.memory_set.insert_framed_area(start.into(), end.into(), perm);
-    inner.mmap_next = end;
+    if end > inner.mmap_next {
+        inner.mmap_next = end;
+    }
     inner.mmap_areas.push((start, map_len));
     drop(inner);
 
@@ -127,24 +177,42 @@ pub fn syscall_mmap(
     start as isize
 }
 
-pub fn syscall_munmap(addr: usize, _len: usize) -> isize {
+pub fn syscall_munmap(addr: usize, len: usize) -> isize {
+    if len == 0 {
+        return EINVAL;
+    }
+    if addr % PAGE_SIZE != 0 {
+        return EINVAL;
+    }
     let process = current_process();
     let mut inner = process.borrow_mut();
-    let start = align_down(addr, PAGE_SIZE);
-    if let Some((idx, (_s, l))) = inner
-        .mmap_areas
-        .iter()
-        .enumerate()
-        .find(|(_i, (s, _l))| *s == start)
-    {
-        let len = *l;
-        inner
-            .memory_set
-            .remove_area(start.into(), (start + len).into());
-        inner.mmap_areas.remove(idx);
-        return 0;
+    let start = addr;
+    let Some(end) = start.checked_add(len) else {
+        return EINVAL;
+    };
+    let end = align_up(end, PAGE_SIZE);
+
+    inner
+        .memory_set
+        .unmap_user_range(start.into(), end.into());
+
+    // Update `mmap_areas` bookkeeping: remove/split any overlapping entries.
+    let mut new_areas = alloc::vec::Vec::new();
+    for (s, l) in inner.mmap_areas.drain(..) {
+        let e = s + l;
+        if end <= s || start >= e {
+            new_areas.push((s, l));
+            continue;
+        }
+        if start > s {
+            new_areas.push((s, start - s));
+        }
+        if end < e {
+            new_areas.push((end, e - end));
+        }
     }
-    -1
+    inner.mmap_areas = new_areas;
+    0
 }
 
 /// Linux `mprotect` (syscall 226).
@@ -187,7 +255,16 @@ pub fn syscall_mprotect(_addr: usize, _len: usize, _prot: usize) -> isize {
         if !pte.flags().contains(PTEFlags::U) {
             return ENOMEM;
         }
-        if !inner.memory_set.set_pte_flags(vpn, new_flags) {
+        let old = pte.flags();
+        let mut flags = new_flags;
+        // Preserve software-managed bits (RSW) so that shared/COW mappings keep their nature.
+        if old.contains(PTEFlags::COW) {
+            flags |= PTEFlags::COW;
+        }
+        if old.contains(PTEFlags::SHARED) {
+            flags |= PTEFlags::SHARED;
+        }
+        if !inner.memory_set.set_pte_flags(vpn, flags) {
             return ENOMEM;
         }
         addr += PAGE_SIZE;

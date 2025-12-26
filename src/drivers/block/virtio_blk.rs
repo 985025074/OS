@@ -14,7 +14,12 @@ use virtio_drivers::{Hal, VirtIOBlk, VirtIOHeader};
 #[allow(unused)]
 const VIRTIO0: usize = 0x10001000;
 
-pub struct VirtIOBlock(Mutex<VirtIOBlk<'static, VirtioHal>>);
+struct VirtIOBlockInner {
+    blk: VirtIOBlk<'static, VirtioHal>,
+    bounce: FrameTracker,
+}
+
+pub struct VirtIOBlock(Mutex<VirtIOBlockInner>);
 
 lazy_static! {
     static ref QUEUE_FRAMES: Mutex<Vec<FrameTracker>> = Mutex::new(Vec::new());
@@ -22,27 +27,55 @@ lazy_static! {
 
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        assert_eq!(buf.len() % 512, 0, "read_block buf must be 512B-aligned size");
         let sectors_per_block = buf.len() / 512;
         let base_sector = block_id * sectors_per_block;
 
-        let mut blk = self.0.lock();
-        for i in 0..sectors_per_block {
-            let sector_id = base_sector + i;
-            let offset = i * 512;
-            blk.read_block(sector_id, &mut buf[offset..offset + 512])
+        // VirtIO DMA requires physically-contiguous buffers. A `&mut [u8]` coming from the heap
+        // may cross pages and thus not be contiguous in physical memory even if it is contiguous
+        // in virtual memory. Use a 4KiB bounce page and copy each 512B sector.
+        //
+        // Note: our vendored `virtio-drivers` supports multi-sector reads/writes by allowing
+        // `buf.len()` to be any multiple of 512.
+        let mut inner = self.0.lock();
+        let VirtIOBlockInner { blk, bounce } = &mut *inner;
+        let bounce_bytes = bounce.ppn.get_bytes_array();
+        const MAX_CHUNK_BYTES: usize = 4096;
+        const SECTOR_BYTES: usize = 512;
+        const MAX_CHUNK_SECTORS: usize = MAX_CHUNK_BYTES / SECTOR_BYTES;
+
+        let mut done = 0usize;
+        while done < sectors_per_block {
+            let chunk = core::cmp::min(sectors_per_block - done, MAX_CHUNK_SECTORS);
+            let chunk_bytes = chunk * SECTOR_BYTES;
+            blk.read_block(base_sector + done, &mut bounce_bytes[..chunk_bytes])
                 .expect("Error when reading VirtIOBlk");
+            let dst_off = done * SECTOR_BYTES;
+            buf[dst_off..dst_off + chunk_bytes].copy_from_slice(&bounce_bytes[..chunk_bytes]);
+            done += chunk;
         }
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
+        assert_eq!(buf.len() % 512, 0, "write_block buf must be 512B-aligned size");
         let sectors_per_block = buf.len() / 512;
         let base_sector = block_id * sectors_per_block;
 
-        let mut blk = self.0.lock();
-        for i in 0..sectors_per_block {
-            let sector_id = base_sector + i;
-            let offset = i * 512;
-            blk.write_block(sector_id, &buf[offset..offset + 512])
+        let mut inner = self.0.lock();
+        let VirtIOBlockInner { blk, bounce } = &mut *inner;
+        let bounce_bytes = bounce.ppn.get_bytes_array();
+        const MAX_CHUNK_BYTES: usize = 4096;
+        const SECTOR_BYTES: usize = 512;
+        const MAX_CHUNK_SECTORS: usize = MAX_CHUNK_BYTES / SECTOR_BYTES;
+
+        let mut done = 0usize;
+        while done < sectors_per_block {
+            let chunk = core::cmp::min(sectors_per_block - done, MAX_CHUNK_SECTORS);
+            let chunk_bytes = chunk * SECTOR_BYTES;
+            let src_off = done * SECTOR_BYTES;
+            bounce_bytes[..chunk_bytes].copy_from_slice(&buf[src_off..src_off + chunk_bytes]);
+            blk.write_block(base_sector + done, &bounce_bytes[..chunk_bytes])
                 .expect("Error when writing VirtIOBlk");
+            done += chunk;
         }
     }
 }
@@ -85,14 +118,15 @@ impl VirtIOBlock {
             // Try to initialize the underlying virtio block driver and
             // print a helpful error if it fails instead of panicking silently
             // via unwrap(). This gives clearer diagnostics when init fails.
-            let inner = match VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)) {
+            let blk = match VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)) {
                 Ok(dev) => dev,
                 Err(e) => {
                     println!("[VirtIO ERROR] VirtIOBlk::new failed: {:?}", e);
                     panic!("VirtIOBlk initialization failed");
                 }
             };
-            Self(Mutex::new(inner))
+            let bounce = frame_alloc().expect("VirtIOBlock: OOM for bounce page");
+            Self(Mutex::new(VirtIOBlockInner { blk, bounce }))
         };
         println!("VirtIOBlock initialized.");
         result
@@ -106,6 +140,9 @@ impl Hal for VirtioHal {
         let mut ppn_base = PhysPageNum(0);
         for i in 0..pages {
             let frame = frame_alloc().unwrap();
+            // The virtio queue layout requires the ring/descriptor memory to be zeroed.
+            // virtio-drivers does not clear the DMA region on its own.
+            frame.ppn.get_bytes_array().fill(0);
             if i == 0 {
                 ppn_base = frame.ppn;
             }

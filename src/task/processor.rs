@@ -1,6 +1,6 @@
 use crate::{
     config::MAX_HARTS,
-    mm::translated_mutref,
+    mm::write_user_value,
     println,
     sbi::shutdown,
     task::{
@@ -393,7 +393,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             let inner = process.borrow_mut();
             inner.memory_set.token()
         };
-        *translated_mutref(token, ctid as *mut i32) = 0;
+        write_user_value(token, ctid as *mut i32, &0);
         let _ = crate::syscall::futex::futex_wake(process.getpid(), ctid, 1);
     }
     drop(res_to_drop);
@@ -492,6 +492,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
         let mut process_inner = process.borrow_mut();
         process_inner.children.clear();
+        let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
+        crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         // deallocate other data in user space i.e. program code/data section
         process_inner.memory_set.recycle_data_pages();
         // drop file descriptors

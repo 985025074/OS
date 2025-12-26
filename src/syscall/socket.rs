@@ -2,7 +2,7 @@ use core::mem::size_of;
 
 use crate::{
     fs::make_socketpair,
-    mm::translated_mutref,
+    mm::write_user_value,
     task::processor::current_process,
     trap::get_current_token,
 };
@@ -47,10 +47,11 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     drop(inner);
 
     // ABI: `int sv[2]` (i32).
-    let p0 = translated_mutref(token, sv_ptr as *mut i32);
-    let p1 = translated_mutref(token, (sv_ptr + size_of::<i32>()) as *mut i32);
-    *p0 = fd0 as i32;
-    *p1 = fd1 as i32;
+    write_user_value(token, sv_ptr as *mut i32, &(fd0 as i32));
+    write_user_value(
+        token,
+        (sv_ptr + size_of::<i32>()) as *mut i32,
+        &(fd1 as i32),
+    );
     0
 }
-

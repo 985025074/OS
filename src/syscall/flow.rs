@@ -23,7 +23,7 @@ pub fn syscall_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     let iov_size = core::mem::size_of::<IoVec>();
     let mut total: isize = 0;
     for i in 0..iovcnt {
-        let iv = *crate::mm::translated_mutref(token, (iov_ptr + i * iov_size) as *mut IoVec);
+        let iv = crate::mm::read_user_value(token, (iov_ptr + i * iov_size) as *const IoVec);
         if iv.len == 0 {
             continue;
         }
@@ -44,7 +44,7 @@ pub fn syscall_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     let iov_size = core::mem::size_of::<IoVec>();
     let mut total: isize = 0;
     for i in 0..iovcnt {
-        let iv = *crate::mm::translated_mutref(token, (iov_ptr + i * iov_size) as *mut IoVec);
+        let iv = crate::mm::read_user_value(token, (iov_ptr + i * iov_size) as *const IoVec);
         if iv.len == 0 {
             continue;
         }

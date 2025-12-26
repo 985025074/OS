@@ -15,6 +15,7 @@ mod socket;
 mod time_sys;
 mod sched;
 pub(crate) mod futex;
+pub(crate) mod sysv_shm;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_DUP: usize = 23;
@@ -38,10 +39,15 @@ const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_READV: usize = 65;
 const SYSCALL_WRITEV: usize = 66;
+const SYSCALL_PREAD64: usize = 67;
+const SYSCALL_PWRITE64: usize = 68;
+const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
+const SYSCALL_FSYNC: usize = 82;
+const SYSCALL_FDATASYNC: usize = 83;
 // riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
@@ -79,6 +85,10 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID_LINUX: usize = 178;
+const SYSCALL_SHMGET: usize = 194;
+const SYSCALL_SHMCTL: usize = 195;
+const SYSCALL_SHMAT: usize = 196;
+const SYSCALL_SHMDT: usize = 197;
 const SYSCALL_SOCKETPAIR: usize = 199;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
@@ -118,13 +128,13 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
     // Lightweight syscall trace for debugging glibc/busybox startup.
     // Keep disabled for normal runs.
     static TRACE_LEFT: AtomicUsize = AtomicUsize::new(256);
-    if crate::debug_config::DEBUG_SYSCALL && log::log_enabled!(log::Level::Info) {
+    if crate::debug_config::DEBUG_SYSCALL {
         let pid = crate::task::processor::current_process().getpid();
         // Skip the interactive shell itself (pid=1) to avoid logging every keystroke.
         if pid >= 2 {
             let left = TRACE_LEFT.fetch_sub(1, Ordering::Relaxed);
             if left > 0 {
-                log::info!(
+                crate::println!(
                     "[syscall] pid={} id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
                     pid,
                     id,
@@ -161,12 +171,17 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => flow::syscall_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => flow::syscall_readv(args[0], args[1], args[2]),
         SYSCALL_WRITEV => flow::syscall_writev(args[0], args[1], args[2]),
+        SYSCALL_PREAD64 => filesystem::syscall_pread64(args[0], args[1], args[2], args[3] as isize),
+        SYSCALL_PWRITE64 => filesystem::syscall_pwrite64(args[0], args[1], args[2], args[3] as isize),
+        SYSCALL_PSELECT6 => time_sys::syscall_pselect6(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_PPOLL => misc::syscall_ppoll(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETDENTS64 => filesystem::syscall_getdents64(args[0], args[1], args[2]),
         SYSCALL_LSEEK => filesystem::syscall_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READLINKAT => filesystem::syscall_readlinkat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_NEWFSTATAT => filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_FSTAT => filesystem::syscall_fstat(args[0], args[1]),
+        SYSCALL_FSYNC => filesystem::syscall_fsync(args[0]),
+        SYSCALL_FDATASYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FSTATFS => filesystem::syscall_fstatfs(args[0], args[1]),
         SYSCALL_STATFS => filesystem::syscall_statfs(args[0], args[1]),
         SYSCALL_UTIMENSAT => filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3]),
@@ -206,6 +221,10 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => misc::syscall_getgid(),
         SYSCALL_GETEGID => misc::syscall_getegid(),
         SYSCALL_GETTID_LINUX => misc::syscall_gettid_linux(),
+        SYSCALL_SHMGET => sysv_shm::syscall_shmget(args[0], args[1], args[2]),
+        SYSCALL_SHMCTL => sysv_shm::syscall_shmctl(args[0], args[1], args[2]),
+        SYSCALL_SHMAT => sysv_shm::syscall_shmat(args[0], args[1], args[2]),
+        SYSCALL_SHMDT => sysv_shm::syscall_shmdt(args[0]),
         SYSCALL_SOCKETPAIR => socket::syscall_socketpair(args[0], args[1], args[2], args[3]),
         SYSCALL_BRK => memory::syscall_brk(args[0]),
         SYSCALL_MUNMAP => memory::syscall_munmap(args[0], args[1]),

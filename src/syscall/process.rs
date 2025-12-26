@@ -3,7 +3,7 @@ use core::mem::size_of;
 
 use crate::{
     fs::ROOT_INODE,
-    mm::{kernel_token, translated_mutref, translated_single_address, translated_str},
+    mm::{kernel_token, translated_single_address, translated_str, write_user_value},
     syscall::misc::encode_linux_tid,
     task::{
         manager::{add_task, select_hart_for_new_task},
@@ -176,10 +176,10 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         // Parent/child tid pointers live in the shared address space.
         let token = get_current_token();
         if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
-            *translated_mutref(token, _ptid as *mut i32) = linux_tid as i32;
+            write_user_value(token, _ptid as *mut i32, &(linux_tid as i32));
         }
         if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
-            *translated_mutref(token, _ctid as *mut i32) = linux_tid as i32;
+            write_user_value(token, _ctid as *mut i32, &(linux_tid as i32));
         }
 
         add_task(new_task);
@@ -264,7 +264,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                 } else {
                     (-temp_exit_code) & 0x7f
                 };
-                *translated_mutref(token, wstatus_ptr as *mut i32) = status;
+                write_user_value(token, wstatus_ptr as *mut i32, &status);
             }
             return pid as isize;
         }

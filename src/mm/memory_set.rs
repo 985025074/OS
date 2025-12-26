@@ -372,9 +372,11 @@ impl MemorySet {
             _ => 0,
         };
         // Keep the interpreter at a different base to avoid overlap with the main program.
+        // Match exampleOS layout: put the interpreter high (but still within Sv39 user range)
+        // to reduce collisions with the main program/heap/mmap allocations.
         let interp_bias = match interp.header.pt2.type_().as_type() {
-            xmas_elf::header::Type::SharedObject => 0x3000_0000,
-            _ => 0x3000_0000,
+            xmas_elf::header::Type::SharedObject => 0x30_0000_0000,
+            _ => 0x30_0000_0000,
         };
 
         let mut max_end_vpn = VirtPageNum(0);
@@ -461,7 +463,8 @@ impl MemorySet {
                         }
 
                         // Share the physical page.
-                        if src_flags.contains(PTEFlags::W) {
+                        if src_flags.contains(PTEFlags::W) && !src_flags.contains(PTEFlags::SHARED)
+                        {
                             src_flags.remove(PTEFlags::W);
                             src_flags.insert(PTEFlags::COW);
                             parent_updates.push((vpn, src_flags));
@@ -483,6 +486,26 @@ impl MemorySet {
         }
 
         memory_set
+    }
+
+    /// Insert a user-mapped framed area backed by the provided physical frames.
+    ///
+    /// Used by System V shared memory (`shmat`) to map the same physical pages
+    /// into multiple processes.
+    pub fn insert_shared_frames_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        frames: Vec<FrameTracker>,
+    ) {
+        let mut area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        let pte_flags = PTEFlags::from_bits(area.map_perm.bits as u16).unwrap() | PTEFlags::SHARED;
+        for (vpn, frame) in area.vpn_range.into_iter().zip(frames.into_iter()) {
+            self.page_table.map(vpn, frame.ppn, pte_flags);
+            area.data_frames.insert(vpn, frame);
+        }
+        self.push_mapped(area);
     }
 
     /// Resolve a copy-on-write fault at `fault_va` if the page is tagged COW.
@@ -578,6 +601,66 @@ impl MemorySet {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
         };
+    }
+
+    /// Unmap (best-effort) any user-mapped pages in `[start_va, end_va)`.
+    ///
+    /// This is primarily used to implement Linux `mmap(MAP_FIXED)` semantics, which
+    /// replace existing mappings in the target range.
+    pub fn unmap_user_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn {
+            return;
+        }
+
+        let mut new_areas: Vec<MapArea> = Vec::new();
+        let mut areas = core::mem::take(&mut self.areas);
+        for mut area in areas.drain(..) {
+            if !area.map_perm.contains(MapPermission::U) {
+                new_areas.push(area);
+                continue;
+            }
+
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if end_vpn <= area_start || start_vpn >= area_end {
+                new_areas.push(area);
+                continue;
+            }
+
+            let ov_start = core::cmp::max(start_vpn, area_start);
+            let ov_end = core::cmp::min(end_vpn, area_end);
+
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                area.unmap_one_maybe(&mut self.page_table, vpn);
+            }
+
+            let mut left_frames = BTreeMap::new();
+            let mut right_frames = BTreeMap::new();
+            if area.map_type == MapType::Framed {
+                let mut remaining = core::mem::take(&mut area.data_frames);
+                right_frames = remaining.split_off(&ov_end);
+                let overlap = remaining.split_off(&ov_start);
+                drop(overlap);
+                left_frames = remaining;
+            }
+
+            if area_start < ov_start {
+                let mut left = MapArea::from_another(&area);
+                left.vpn_range = VPNRange::new(area_start, ov_start);
+                left.data_frames = left_frames;
+                new_areas.push(left);
+            }
+            if ov_end < area_end {
+                let mut right = MapArea::from_another(&area);
+                right.vpn_range = VPNRange::new(ov_end, area_end);
+                right.start_offset = 0;
+                right.data_frames = right_frames;
+                new_areas.push(right);
+            }
+        }
+        self.areas = new_areas;
     }
     pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
         if let Some((idx, area)) = self
@@ -682,6 +765,13 @@ impl MapArea {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
+    }
+
+    pub fn unmap_one_maybe(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        if self.map_type == MapType::Framed {
+            self.data_frames.remove(&vpn);
+        }
+        page_table.unmap_if_mapped(vpn);
     }
 
     /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.

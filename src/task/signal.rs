@@ -2,7 +2,7 @@ pub const MAX_SIG: usize = 31;
 use bitflags::bitflags;
 
 use crate::{
-    mm::{translated_mutref, translated_single_address},
+    mm::{read_user_value, translated_single_address, write_user_value},
     println,
     task::processor::current_process,
     task::{
@@ -146,9 +146,9 @@ pub fn set_signal(
             return -1;
         }
         let prev_action = inner.signals_actions.table[signum as usize];
-        *translated_mutref(token, old_action) = prev_action;
+        write_user_value(token, old_action, &prev_action);
         inner.signals_actions.table[signum as usize] =
-            *translated_mutref(token, action as *mut SignalAction);
+            read_user_value(token, action as *const SignalAction);
         0
     } else {
         -1

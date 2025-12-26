@@ -1,12 +1,13 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
-use crate::mm::PhysAddr;
+use crate::{config::PAGE_SIZE, mm::PhysAddr};
 
 use super::{FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::{cmp::min, mem::MaybeUninit};
 
 bitflags! {
     /// page table entry flags
@@ -21,6 +22,10 @@ bitflags! {
         const D = 1 << 7;
         /// Software-managed copy-on-write marker (Sv39 PTE RSW bit 0).
         const COW = 1 << 8;
+        /// Software-managed shared mapping marker (Sv39 PTE RSW bit 1).
+        ///
+        /// Used to preserve System V shared memory mappings across `fork()`.
+        const SHARED = 1 << 9;
     }
 }
 
@@ -132,6 +137,20 @@ impl PageTable {
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
     }
+
+    /// Unmap an existing leaf PTE if it is present and valid.
+    ///
+    /// Returns `true` if an entry was unmapped.
+    pub fn unmap_if_mapped(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() {
+            return false;
+        }
+        *pte = PageTableEntry::empty();
+        true
+    }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
@@ -206,6 +225,82 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
 pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
     let real_addr = translated_single_address(token, ptr as *const u8);
     unsafe { &mut *(real_addr as *mut u8 as *mut T) }
+}
+
+/// Copy bytes from user space into a kernel buffer.
+///
+/// Panics if any user page in the range is unmapped.
+pub fn copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) {
+    if dst.is_empty() {
+        return;
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = src as usize;
+    let end = start + dst.len();
+    let mut written = 0usize;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let pa: PhysAddr = ppn.into();
+        let page_off = start_va.page_offset();
+        let n = min(PAGE_SIZE - page_off, end - start);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (pa.0 + page_off) as *const u8,
+                dst.as_mut_ptr().add(written),
+                n,
+            );
+        }
+        start += n;
+        written += n;
+    }
+}
+
+/// Copy bytes from a kernel buffer into user space.
+///
+/// Panics if any user page in the range is unmapped.
+pub fn copy_to_user(token: usize, dst: *mut u8, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = dst as usize;
+    let end = start + src.len();
+    let mut read = 0usize;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let pa: PhysAddr = ppn.into();
+        let page_off = start_va.page_offset();
+        let n = min(PAGE_SIZE - page_off, end - start);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(read),
+                (pa.0 + page_off) as *mut u8,
+                n,
+            );
+        }
+        start += n;
+        read += n;
+    }
+}
+
+pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
+    let mut value = MaybeUninit::<T>::uninit();
+    let dst_bytes = unsafe {
+        core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
+    };
+    copy_from_user(token, src as *const u8, dst_bytes);
+    unsafe { value.assume_init() }
+}
+
+pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
+    };
+    copy_to_user(token, dst as *mut u8, src_bytes);
 }
 /// translate a single pointer
 pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {

@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::{
     config::MAX_HARTS,
-    mm::{translated_byte_buffer, translated_mutref},
+    mm::{read_user_value, translated_byte_buffer, write_user_value},
     task::{manager::pid2process, processor::current_process, ProcessControlBlock},
     trap::get_current_token,
 };
@@ -77,7 +77,8 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
         inner.sched_priority
     };
     let token = get_current_token();
-    *translated_mutref(token, param_ptr as *mut SchedParam) = SchedParam { sched_priority: prio };
+    let sp = SchedParam { sched_priority: prio };
+    write_user_value(token, param_ptr as *mut SchedParam, &sp);
     0
 }
 
@@ -89,7 +90,7 @@ pub fn syscall_sched_setparam(pid: usize, param_ptr: usize) -> isize {
         return ESRCH;
     };
     let token = get_current_token();
-    let prio = (*translated_mutref(token, param_ptr as *mut SchedParam)).sched_priority;
+    let prio = read_user_value(token, param_ptr as *const SchedParam).sched_priority;
     let mut inner = process.borrow_mut();
     inner.sched_priority = prio;
     0
@@ -107,7 +108,7 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
         return EINVAL;
     }
     let token = get_current_token();
-    let prio = (*translated_mutref(token, param_ptr as *mut SchedParam)).sched_priority;
+    let prio = read_user_value(token, param_ptr as *const SchedParam).sched_priority;
     let mut inner = process.borrow_mut();
     inner.sched_policy = policy;
     inner.sched_priority = prio;
@@ -180,6 +181,7 @@ pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
         return ESRCH;
     };
     let token = get_current_token();
-    *translated_mutref(token, interval_ptr as *mut TimeSpec) = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    let ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    write_user_value(token, interval_ptr as *mut TimeSpec, &ts);
     0
 }

@@ -2,6 +2,7 @@ use core::{arch::asm, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 use crate::config::TRAMPOLINE;
 use crate::debug_config::DEBUG_TRAP;
+use crate::mm::{PageTable, VirtAddr};
 use crate::task::block_sleep::check_timer;
 use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
 use crate::task::signal::check_if_current_signals_error;
@@ -277,6 +278,19 @@ fn exception_name(code: usize) -> &'static str {
 }
 
 fn handle_user_exception(code: usize, stval: usize) {
+    fn try_read_user_u64(token: usize, addr: usize) -> Option<u64> {
+        let page_table = PageTable::from_token(token);
+        let mut bytes = [0u8; 8];
+        for i in 0..8usize {
+            let va = VirtAddr::from(addr.wrapping_add(i));
+            let vpn = va.floor();
+            let pte = page_table.translate(vpn)?;
+            let ppn = pte.ppn();
+            bytes[i] = ppn.get_bytes_array()[va.page_offset()];
+        }
+        Some(u64::from_le_bytes(bytes))
+    }
+
     // Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
         let process = crate::task::processor::current_process();
@@ -286,6 +300,82 @@ fn handle_user_exception(code: usize, stval: usize) {
         }
     }
     let cx = get_trap_context();
+    if crate::debug_config::DEBUG_SYSCALL
+        && (code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT)
+    {
+        let pid = crate::task::processor::current_process().getpid();
+        crate::println!(
+            "[user_exn_regs] pid={} code={} ({}) sepc={:#x} stval={:#x}",
+            pid,
+            code,
+            exception_name(code),
+            cx.sepc,
+            stval
+        );
+        // Print a subset of registers that are most useful for diagnosing page faults.
+        // a0-a7: x10-x17, s0-s11: x8-x9 + x18-x27, sp: x2, ra: x1, gp: x3, tp: x4.
+        crate::println!(
+            "[user_exn_regs] ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
+            cx.x[1],
+            cx.x[2],
+            cx.x[3],
+            cx.x[4]
+        );
+        crate::println!(
+            "[user_exn_regs] a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} a7={:#x}",
+            cx.x[10],
+            cx.x[11],
+            cx.x[12],
+            cx.x[13],
+            cx.x[14],
+            cx.x[15],
+            cx.x[16],
+            cx.x[17]
+        );
+        crate::println!(
+            "[user_exn_regs] s0={:#x} s1={:#x} s2={:#x} s3={:#x} s4={:#x} s5={:#x} s6={:#x} s7={:#x} s8={:#x} s9={:#x} s10={:#x} s11={:#x}",
+            cx.x[8],
+            cx.x[9],
+            cx.x[18],
+            cx.x[19],
+            cx.x[20],
+            cx.x[21],
+            cx.x[22],
+            cx.x[23],
+            cx.x[24],
+            cx.x[25],
+            cx.x[26],
+            cx.x[27]
+        );
+
+        // Extra diagnostics for the recurring glibc ld-linux crash:
+        // sepc ends with 0x11dce and stval==0x8 (NULL+8 deref).
+        if code == LOAD_PAGE_FAULT && stval == 0x8 && (cx.sepc & 0xfffff) == 0x11dce {
+            let token = get_current_token();
+            let s9 = cx.x[25];
+            let s10 = cx.x[26];
+            let slot = s10.wrapping_sub(1248); // ld a3,-1248(s10)
+            let slot_val = try_read_user_u64(token, slot).unwrap_or(0);
+            crate::println!(
+                "[ld-linux_diag] sepc={:#x} base(s9)={:#x} s10={:#x} slot={:#x} slot_val={:#x}",
+                cx.sepc,
+                s9,
+                s10,
+                slot,
+                slot_val
+            );
+            if slot_val != 0 {
+                let tag = try_read_user_u64(token, slot_val as usize).unwrap_or(0);
+                let val = try_read_user_u64(token, (slot_val as usize).wrapping_add(8)).unwrap_or(0);
+                crate::println!(
+                    "[ld-linux_diag] dyn@{:#x}: tag={} val={:#x}",
+                    slot_val,
+                    tag,
+                    val
+                );
+            }
+        }
+    }
     log::warn!(
         "[user_exn] code={} ({}) sepc={:#x} stval={:#x}",
         code,

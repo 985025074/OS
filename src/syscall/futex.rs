@@ -7,7 +7,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
-    mm::translated_mutref,
+    mm::read_user_value,
     task::{
         manager::wakeup_task,
         processor::{block_current_and_run_next, current_process, current_task},
@@ -73,7 +73,7 @@ pub fn syscall_futex(
                 return EINVAL;
             }
             let token = get_current_token();
-            let cur = *translated_mutref(token, uaddr as *mut i32);
+            let cur = read_user_value(token, uaddr as *const i32);
             if cur != val as i32 {
                 return EAGAIN;
             }

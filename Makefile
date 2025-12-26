@@ -9,6 +9,7 @@ FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
 KERNEL_ENTRY_PA = 0x80200000
 SMP ?= 4
 MEM ?= 1G
+QEMU_TIMEOUT ?= 0
 DISK_IMG ?=
 EXT4_REBUILD ?= 0
 # Optional OpenSBI fw_dynamic for HSM-enabled boot
@@ -18,6 +19,12 @@ ifneq (,$(wildcard $(DISK_IMG)))
 DISK_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 else
 DISK_ARGS :=
+endif
+
+ifeq ($(QEMU_TIMEOUT),0)
+QEMU_RUN := qemu-system-riscv64
+else
+QEMU_RUN := timeout $(QEMU_TIMEOUT) qemu-system-riscv64
 endif
 
 # build kernel and copy it to save_dir 
@@ -61,7 +68,7 @@ run: KERNEL
 	echo "🔍 Running QEMU with VirtIO block device..."
 	echo "   ➜ File System Image: $(FS_IMG)"
 	echo "pwd is $(shell pwd)"
-	qemu-system-riscv64 \
+	$(QEMU_RUN) \
 		-machine virt \
 		-kernel $(KERNEL_ELF) \
 		-m $(MEM) \
@@ -125,7 +132,7 @@ ext4_img: USER_APPS
 run_ext4: KERNEL ext4_img
 	@echo "🔍 Running QEMU with ext4 VirtIO block device..."
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
-	qemu-system-riscv64 \
+	$(QEMU_RUN) \
 		-machine virt \
 		-kernel $(KERNEL_ELF) \
 		-m $(MEM) \
@@ -143,7 +150,7 @@ run_ext4_hsm: KERNEL ext4_img
 	@echo "🔍 Running QEMU with ext4 VirtIO block device..."
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
 	@test -f $(FW_DYNAMIC) || (echo "❌ fw_dynamic not found at $(FW_DYNAMIC). Set FW_DYNAMIC=path/to/fw_dynamic.bin"; exit 1)
-	qemu-system-riscv64 \
+	$(QEMU_RUN) \
 		-machine virt \
 		-kernel $(KERNEL_ELF) \
 		-m $(MEM) \
