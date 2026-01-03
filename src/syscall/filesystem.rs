@@ -1769,17 +1769,16 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         return 0;
     }
 
-    let Some(inode) = file
-        .as_any()
-        .downcast_ref::<OSInode>()
-        .map(|o| o.ext4_inode()) else {
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
         return EBADF;
     };
+    let inode = os_inode.ext4_inode();
 
     let _ext4_guard = ext4_lock();
     let mode = inode.mode() as u32;
-    let size = inode.size() as i64;
-    let blocks = ((inode.size() + 511) / 512) as u64;
+    let disk_size = inode.size() as usize;
+    let size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
+    let blocks = (((size as u64) + 511) / 512) as u64;
 
     let st = KStat {
         st_dev: EXT4_ST_DEV,
@@ -2155,7 +2154,9 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         let inode = os_inode.ext4_inode();
         let (is_dir, end) = {
             let _ext4_guard = ext4_lock();
-            (inode.is_dir(), inode.size() as isize)
+            let disk = inode.size() as usize;
+            let end = core::cmp::max(disk, os_inode.pending_write_end()) as isize;
+            (inode.is_dir(), end)
         };
 
         if is_dir {

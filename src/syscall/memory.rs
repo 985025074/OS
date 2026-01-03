@@ -4,7 +4,7 @@ use core::arch::asm;
 
 use crate::{
     config::PAGE_SIZE,
-    fs::{File, OSInode},
+    fs::{File, OSInode, ext4_lock},
     mm::{MapPermission, PTEFlags, translated_mutref},
     task::processor::current_process,
     trap::get_current_token,
@@ -37,7 +37,12 @@ fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
     let file = inner.fd_table[fd].as_ref()?.clone();
     file.as_any()
         .downcast_ref::<OSInode>()
-        .map(|o| o.ext4_inode())
+        .map(|o| {
+            // Ensure data written via buffered `write(2)` is visible to file-backed `mmap(2)`.
+            // This keeps simple tests (write -> fstat -> mmap -> read) working.
+            let _ = o.flush();
+            o.ext4_inode()
+        })
 }
 
 pub fn syscall_brk(addr: usize) -> isize {
@@ -147,7 +152,12 @@ pub fn syscall_mmap(
         inner.mmap_areas = new_areas;
     }
 
-    inner.memory_set.insert_framed_area(start.into(), end.into(), perm);
+    if !inner
+        .memory_set
+        .try_insert_framed_area(start.into(), end.into(), perm)
+    {
+        return ENOMEM;
+    }
     if end > inner.mmap_next {
         inner.mmap_next = end;
     }
@@ -157,6 +167,7 @@ pub fn syscall_mmap(
     // Best-effort: file-backed initial population.
     if fd >= 0 {
         if let Some(inode) = get_fd_inode(fd as usize) {
+            let _ext4_guard = ext4_lock();
             let token = get_current_token();
             let mut pos = 0usize;
             let mut tmp = [0u8; 512];

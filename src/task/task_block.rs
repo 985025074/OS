@@ -435,15 +435,41 @@ impl TaskControlBlockInner {
 }
 
 impl TaskControlBlock {
+    pub fn try_new(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Option<Self> {
+        let res = TaskUserRes::try_new(Arc::clone(&process), ustack_base, alloc_user_res)?;
+        let trap_cx_ppn = res.trap_cx_ppn();
+        let kstack = kstack_alloc()?;
+        let kstack_top = kstack.get_top();
+        Some(Self {
+            process: Arc::downgrade(&process),
+            kstack,
+            cpu_id: AtomicUsize::new(0),
+            on_cpu: AtomicUsize::new(Self::OFF_CPU),
+            wakeup_pending: AtomicBool::new(false),
+            in_ready_queue: AtomicBool::new(false),
+            inner: Mutex::new(TaskControlBlockInner {
+                res: Some(res),
+                trap_cx_ppn,
+                task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
+                task_status: TaskStatus::Ready,
+                exit_code: None,
+                join_waiters: VecDeque::new(),
+                clear_child_tid: None,
+            }),
+        })
+    }
+
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Self {
-        let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
-        let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc();
-        let kstack_top = kstack.get_top();
+        Self::try_new(process, ustack_base, alloc_user_res).expect("OOM: TaskControlBlock::new")
+    }
 
         // Debug output
         // use crate::println;
@@ -452,7 +478,12 @@ impl TaskControlBlock {
         //     trap_return as usize, kstack_top, trap_cx_ppn.0
         // );
 
-        Self {
+    pub fn try_new_linux_thread(process: Arc<ProcessControlBlock>) -> Option<Self> {
+        let res = TaskUserRes::try_new_trap_cx_only(Arc::clone(&process))?;
+        let trap_cx_ppn = res.trap_cx_ppn();
+        let kstack = kstack_alloc()?;
+        let kstack_top = kstack.get_top();
+        Some(Self {
             process: Arc::downgrade(&process),
             kstack,
             cpu_id: AtomicUsize::new(0),
@@ -468,31 +499,11 @@ impl TaskControlBlock {
                 join_waiters: VecDeque::new(),
                 clear_child_tid: None,
             }),
-        }
+        })
     }
 
     pub fn new_linux_thread(process: Arc<ProcessControlBlock>) -> Self {
-        let res = TaskUserRes::new_trap_cx_only(Arc::clone(&process));
-        let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc();
-        let kstack_top = kstack.get_top();
-        Self {
-            process: Arc::downgrade(&process),
-            kstack,
-            cpu_id: AtomicUsize::new(0),
-            on_cpu: AtomicUsize::new(Self::OFF_CPU),
-            wakeup_pending: AtomicBool::new(false),
-            in_ready_queue: AtomicBool::new(false),
-            inner: Mutex::new(TaskControlBlockInner {
-                res: Some(res),
-                trap_cx_ppn,
-                task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
-                task_status: TaskStatus::Ready,
-                exit_code: None,
-                join_waiters: VecDeque::new(),
-                clear_child_tid: None,
-            }),
-        }
+        Self::try_new_linux_thread(process).expect("OOM: TaskControlBlock::new_linux_thread")
     }
 }
 

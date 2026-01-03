@@ -130,13 +130,17 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 
     // Thread-like clone: share address space (glibc pthreads).
     if (flags & CLONE_VM) != 0 {
+        const ENOMEM: isize = -12;
         let task = current_task().unwrap();
         let parent_cx = {
             let inner = task.borrow_mut();
             *inner.get_trap_cx()
         };
         let process = current_process();
-        let new_task = Arc::new(TaskControlBlock::new_linux_thread(Arc::clone(&process)));
+        let Some(new_task) = TaskControlBlock::try_new_linux_thread(Arc::clone(&process))
+            .map(Arc::new) else {
+            return ENOMEM;
+        };
         new_task.set_cpu_id(select_hart_for_new_task());
 
         let (_tid_index, linux_tid) = {
@@ -188,7 +192,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 
     // Fork-like clone (process).
     let process = current_process();
-    let child = process.fork();
+    let Some(child) = process.fork() else {
+        return -12;
+    };
 
     // If userspace provided a stack, set child's user sp to it.
     if stack != 0 {
@@ -207,8 +213,10 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 /// parent-blocking/VM-sharing semantics of true vfork.
 pub fn syscall_vfork() -> isize {
     let process = current_process();
-    let child = process.fork();
-    child.getpid() as isize
+    match process.fork() {
+        Some(child) => child.getpid() as isize,
+        None => -12,
+    }
 }
 
 pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {

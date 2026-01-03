@@ -94,6 +94,15 @@ impl OSInode {
         self.inner.lock().inode.clone()
     }
 
+    /// Return the end offset of buffered (not-yet-flushed) writes.
+    ///
+    /// This is used to report a correct file size to userspace (`fstat`, `lseek(SEEK_END)`)
+    /// even when we are buffering writes in memory.
+    pub fn pending_write_end(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.write_buf_off.saturating_add(inner.write_buf.len())
+    }
+
     /// Read from this inode at the given offset without updating the file offset.
     pub fn pread_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let _ = self.flush();

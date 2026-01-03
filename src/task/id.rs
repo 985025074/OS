@@ -41,15 +41,19 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
     (bottom, top)
 }
 
-pub fn kstack_alloc() -> KernelStack {
+pub fn kstack_alloc() -> Option<KernelStack> {
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    KERNEL_SPACE.lock().insert_framed_area(
+    let ok = KERNEL_SPACE.lock().try_insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
     );
-    KernelStack(kstack_id)
+    if !ok {
+        KSTACK_ALLOCATOR.lock().dealloc(kstack_id);
+        return None;
+    }
+    Some(KernelStack(kstack_id))
 }
 
 impl Drop for KernelStack {
@@ -88,17 +92,7 @@ impl TaskUserRes {
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Self {
-        let tid = process.borrow_mut().alloc_tid();
-        let task_user_res = Self {
-            tid,
-            ustack_base,
-            process: Arc::downgrade(&process),
-            owns_ustack: true,
-        };
-        if alloc_user_res {
-            task_user_res.alloc_user_res();
-        }
-        task_user_res
+        Self::try_new(process, ustack_base, alloc_user_res).expect("OOM: TaskUserRes::new")
     }
 
     /// Allocate only a per-thread TrapContext page (no kernel-managed user stack).
@@ -106,6 +100,28 @@ impl TaskUserRes {
     /// This is used to host Linux/glibc `clone(CLONE_VM|...)` threads whose stacks are
     /// allocated by userspace via `mmap`.
     pub fn new_trap_cx_only(process: Arc<ProcessControlBlock>) -> Self {
+        Self::try_new_trap_cx_only(process).expect("OOM: TaskUserRes::new_trap_cx_only")
+    }
+
+    pub fn try_new(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Option<Self> {
+        let tid = process.borrow_mut().alloc_tid();
+        let task_user_res = Self {
+            tid,
+            ustack_base,
+            process: Arc::downgrade(&process),
+            owns_ustack: true,
+        };
+        if alloc_user_res && !task_user_res.try_alloc_user_res() {
+            return None;
+        }
+        Some(task_user_res)
+    }
+
+    pub fn try_new_trap_cx_only(process: Arc<ProcessControlBlock>) -> Option<Self> {
         let tid = process.borrow_mut().alloc_tid();
         let task_user_res = Self {
             tid,
@@ -113,24 +129,30 @@ impl TaskUserRes {
             process: Arc::downgrade(&process),
             owns_ustack: false,
         };
-        task_user_res.alloc_trap_cx_only();
-        task_user_res
+        if !task_user_res.try_alloc_trap_cx_only() {
+            return None;
+        }
+        Some(task_user_res)
     }
 
-    fn alloc_trap_cx_only(&self) {
+    fn try_alloc_trap_cx_only(&self) -> bool {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.borrow_mut();
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_framed_area(
+        process_inner.memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
-        );
+        )
     }
 
     // 具体的 插入 用户资源 ,如 用户栈 和 trap_cx
     pub fn alloc_user_res(&self) {
+        assert!(self.try_alloc_user_res(), "OOM: TaskUserRes::alloc_user_res");
+    }
+
+    fn try_alloc_user_res(&self) -> bool {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.borrow_mut();
         if self.owns_ustack {
@@ -138,20 +160,32 @@ impl TaskUserRes {
             let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom + USER_STACK_SIZE;
             // insert the user resource into the program memory space
-            process_inner.memory_set.insert_framed_area(
+            if !process_inner.memory_set.try_insert_framed_area(
                 ustack_bottom.into(),
                 ustack_top.into(),
                 MapPermission::R | MapPermission::W | MapPermission::U,
-            );
+            ) {
+                return false;
+            }
         }
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_framed_area(
+        if !process_inner.memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
-        );
+        ) {
+            if self.owns_ustack {
+                let ustack_bottom_va: VirtAddr =
+                    ustack_bottom_from_tid(self.ustack_base, self.tid).into();
+                process_inner
+                    .memory_set
+                    .remove_area_with_start_vpn(ustack_bottom_va.into());
+            }
+            return false;
+        }
+        true
     }
 
     fn dealloc_user_res(&self) {

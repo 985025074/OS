@@ -16,15 +16,16 @@ use crate::{
 use crate::debug_config::DEBUG_TIMER;
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
+    const ENOMEM: isize = -12;
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
     let ustack_base = task.borrow_mut().res.as_ref().unwrap().ustack_base;
     // create a new thread
-    let new_task = Arc::new(TaskControlBlock::new(
-        Arc::clone(&process),
-        ustack_base,
-        true,
-    ));
+    let Some(new_task) =
+        TaskControlBlock::try_new(Arc::clone(&process), ustack_base, true).map(Arc::new)
+    else {
+        return ENOMEM;
+    };
     // Spread newly created threads across harts (Linux-like: task has a target cpu).
     new_task.set_cpu_id(select_hart_for_new_task());
 

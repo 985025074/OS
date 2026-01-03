@@ -61,17 +61,43 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) {
-        self.push(
-            MapArea::new(start_va, end_va, MapType::Framed, permission),
-            None,
+        assert!(
+            self.try_insert_framed_area(start_va, end_va, permission),
+            "OOM: insert_framed_area({:?}..{:?})",
+            start_va,
+            end_va
         );
     }
-    fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
-        map_area.map(&mut self.page_table);
+
+    /// Try to insert a framed (allocated) area; returns `false` on OOM.
+    pub fn try_insert_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        self.try_push(
+            MapArea::new(start_va, end_va, MapType::Framed, permission),
+            None,
+        )
+    }
+
+    fn push(&mut self, map_area: MapArea, data: Option<&[u8]>) {
+        assert!(
+            self.try_push(map_area, data),
+            "OOM: mapping area failed"
+        );
+    }
+
+    fn try_push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) -> bool {
+        if !map_area.map(&mut self.page_table) {
+            return false;
+        }
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data);
         }
         self.areas.push(map_area);
+        true
     }
 
     /// Push an already-mapped `MapArea` into this address space (used by COW fork).
@@ -586,8 +612,7 @@ impl MemorySet {
             .iter_mut()
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
-            area.append_to(&mut self.page_table, new_end.ceil());
-            true
+            area.append_to(&mut self.page_table, new_end.ceil())
         } else {
             false
         }
@@ -775,12 +800,19 @@ impl MapArea {
     }
 
     /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.
-    pub fn map(&mut self, page_table: &mut PageTable) {
+    pub fn map(&mut self, page_table: &mut PageTable) -> bool {
+        let mut mapped: Vec<VirtPageNum> = Vec::new();
         for vpn in self.vpn_range {
             if !self.map_one(page_table, vpn) {
-                break;
+                // Roll back any partial mappings to avoid leaving an invalid address space.
+                for vpn in mapped {
+                    self.unmap_one_maybe(page_table, vpn);
+                }
+                return false;
             }
+            mapped.push(vpn);
         }
+        true
     }
     #[allow(unused)]
     pub fn unmap(&mut self, page_table: &mut PageTable) {
@@ -796,13 +828,21 @@ impl MapArea {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
-    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
-        for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
+    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) -> bool {
+        let old_end = self.vpn_range.get_end();
+        let mut mapped: Vec<VirtPageNum> = Vec::new();
+        for vpn in VPNRange::new(old_end, new_end) {
             if !self.map_one(page_table, vpn) {
-                break;
+                // Roll back the newly mapped suffix.
+                for vpn in mapped {
+                    self.unmap_one_maybe(page_table, vpn);
+                }
+                return false;
             }
+            mapped.push(vpn);
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        true
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before

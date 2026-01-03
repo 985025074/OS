@@ -21,7 +21,8 @@ pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
 }
 
 pub const CLOCK_FREQ: usize = 12500000;
-pub const MEMORY_END: usize = 0x8800_0000;
+// QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
+pub const MEMORY_END: usize = 0xA000_0000;
 
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine

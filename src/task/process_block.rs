@@ -722,7 +722,7 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Arc<Self> {
+    pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
         let mut parent = self.borrow_mut();
         assert_eq!(parent.thread_count(), 1);
         let sched_policy = parent.sched_policy;
@@ -743,6 +743,15 @@ impl ProcessControlBlock {
                 new_fd_table.push(None);
             }
         }
+        // Remember parent's user-stack base for the main thread.
+        let parent_ustack_base = parent
+            .get_task(0)
+            .borrow_mut()
+            .res
+            .as_ref()
+            .unwrap()
+            .ustack_base();
+
         // create child process pcb
         let child = Arc::new(Self {
             pid,
@@ -777,22 +786,18 @@ impl ProcessControlBlock {
             }),
         });
         crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
-        // add child
-        parent.children.push(Arc::clone(&child));
-        // create main thread of child process
-        let task = Arc::new(TaskControlBlock::new(
+
+        // Drop parent lock before allocating child task resources.
+        drop(parent);
+
+        // create main thread of child process (allocates a fresh kernel stack)
+        let task = Arc::new(TaskControlBlock::try_new(
             Arc::clone(&child),
-            parent
-                .get_task(0)
-                .borrow_mut()
-                .res
-                .as_ref()
-                .unwrap()
-                .ustack_base(),
+            parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
-        ));
+        )?);
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
@@ -815,7 +820,9 @@ impl ProcessControlBlock {
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
-        child
+        // add child to parent's children list (after success)
+        self.borrow_mut().children.push(Arc::clone(&child));
+        Some(child)
     }
 
     pub fn getpid(&self) -> usize {
