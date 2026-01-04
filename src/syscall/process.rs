@@ -191,17 +191,28 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     }
 
     // Fork-like clone (process).
+    let task = current_task().unwrap();
+    let parent_cx = {
+        let inner = task.borrow_mut();
+        *inner.get_trap_cx()
+    };
     let process = current_process();
     let Some(child) = process.fork() else {
         return -12;
     };
 
-    // If userspace provided a stack, set child's user sp to it.
-    if stack != 0 {
+    {
         let task = child.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
-        trap_cx.x[2] = stack;
+        *trap_cx = parent_cx;
+        trap_cx.x[10] = 0; // child returns 0 from syscall
+        if stack != 0 {
+            trap_cx.x[2] = stack;
+        }
+        trap_cx.kernel_satp = kernel_token();
+        trap_cx.kernel_sp = task.kstack.get_top();
+        trap_cx.trap_handler = trap_handler as usize;
     }
     child.getpid() as isize
 }
