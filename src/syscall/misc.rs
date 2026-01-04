@@ -296,6 +296,13 @@ pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize
                 if (pfd.events & POLLOUT) != 0 && sp.poll_writable() {
                     revents |= POLLOUT;
                 }
+            } else if let Some(ns) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
+                if (pfd.events & POLLIN) != 0 && ns.poll_readable() {
+                    revents |= POLLIN;
+                }
+                if (pfd.events & POLLOUT) != 0 && ns.poll_writable() {
+                    revents |= POLLOUT;
+                }
             } else {
                 if (pfd.events & POLLIN) != 0 && file.readable() {
                     revents |= POLLIN;

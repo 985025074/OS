@@ -2,6 +2,7 @@
 mod inode;
 mod pipe;
 mod socketpair;
+mod net_socket;
 mod stdio;
 mod pseudo;
 use crate::mm::UserBuffer;
@@ -24,7 +25,8 @@ pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, 
 pub(crate) use inode::ext4_lock;
 pub use pipe::{Pipe, make_pipe};
 pub use socketpair::{SocketPairEnd, make_socketpair};
+pub use net_socket::{NetSocketFile, NetSocketKind};
 pub use stdio::{Stdin, Stdout};
-pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile};
+pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub use pseudo::PseudoBlock;
 pub use pseudo::{shm_create, shm_get, shm_list, shm_remove};

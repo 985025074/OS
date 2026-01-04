@@ -16,6 +16,7 @@ mod klog;
 mod lang_items;
 mod log;
 mod mm;
+mod net;
 mod sbi;
 mod syscall;
 mod task;

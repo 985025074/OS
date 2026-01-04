@@ -23,6 +23,9 @@ pub const DEBUG_SYSCALL: bool = false;
 /// Verbose filesystem debug logs (open/getdents/lseek).
 pub const DEBUG_FS: bool = false;
 
+/// Verbose network debug logs (socket send/recv).
+pub const DEBUG_NET: bool = false;
+
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
 pub const DEBUG_WATCHDOG: bool = false;
 

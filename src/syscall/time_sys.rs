@@ -120,10 +120,9 @@ pub fn syscall_times(tms_ptr: usize) -> isize {
 
 /// Linux `pselect6` (syscall 72 on riscv64).
 ///
-/// glibc sometimes uses `pselect6(0, NULL, NULL, NULL, &ts, NULL)` as a sleep primitive.
-/// We implement a minimal subset:
-/// - if `timeout` is non-null, sleep for the requested duration and return 0 (timeout);
-/// - otherwise, yield.
+/// Enough for iperf/netperf event loops:
+/// - When fdsets are provided, report readiness based on our fd table.
+/// - When `nfds==0` (or all fdsets are NULL), treat it as a sleep/yield primitive.
 pub fn syscall_pselect6(
     _nfds: usize,
     _readfds: usize,
@@ -132,12 +131,133 @@ pub fn syscall_pselect6(
     timeout_ptr: usize,
     _sigmask: usize,
 ) -> isize {
-    if timeout_ptr != 0 {
-        // Reuse nanosleep implementation (same `timespec` layout).
+    const EBADF: isize = -9;
+
+    let nfds = _nfds;
+    let readfds = _readfds;
+    let writefds = _writefds;
+    let exceptfds = _exceptfds;
+
+    // Sleep primitive: `pselect6(0, NULL, NULL, NULL, &ts, NULL)`.
+    if (nfds == 0 || (readfds == 0 && writefds == 0 && exceptfds == 0)) && timeout_ptr != 0 {
         let _ = syscall_nanosleep(timeout_ptr, 0);
         return 0;
     }
-    // No fds readiness modeled; treat as a scheduler yield.
-    crate::task::processor::suspend_current_and_run_next();
-    0
+
+    if nfds == 0 {
+        crate::task::processor::suspend_current_and_run_next();
+        return 0;
+    }
+
+    let token = crate::trap::get_current_token();
+    let process = crate::task::processor::current_process();
+
+    // Use a byte-sized bitmap (nfds bits).
+    let bytes_len = (nfds + 7) / 8;
+    let mut in_r = alloc::vec![0u8; bytes_len];
+    let mut in_w = alloc::vec![0u8; bytes_len];
+    let mut out_r = alloc::vec![0u8; bytes_len];
+    let mut out_w = alloc::vec![0u8; bytes_len];
+
+    if readfds != 0 {
+        crate::mm::copy_from_user(token, readfds as *const u8, in_r.as_mut_slice());
+    }
+    if writefds != 0 {
+        crate::mm::copy_from_user(token, writefds as *const u8, in_w.as_mut_slice());
+    }
+
+    // If a timeout is provided, we must return early when fds become ready.
+    // Avoid relying on `nanosleep()` here (which can oversleep) and instead
+    // cooperatively yield until either an fd becomes ready or the deadline hits.
+    let deadline_ms = if timeout_ptr == 0 {
+        None
+    } else {
+        let ts = read_user_value(token, timeout_ptr as *const TimeSpec);
+        let ms = (ts.sec.max(0) as usize)
+            .saturating_mul(1000)
+            .saturating_add((ts.nsec.max(0) as usize) / 1_000_000);
+        Some(crate::time::get_time_ms().saturating_add(ms))
+    };
+    loop {
+        let mut ready = 0isize;
+        out_r.fill(0);
+        out_w.fill(0);
+
+        for fd in 0..nfds {
+            let byte = fd / 8;
+            let bit = fd % 8;
+            let mask = 1u8 << bit;
+            let want_r = readfds != 0 && (in_r[byte] & mask) != 0;
+            let want_w = writefds != 0 && (in_w[byte] & mask) != 0;
+            if !want_r && !want_w {
+                continue;
+            }
+            let file = {
+                let inner = process.borrow_mut();
+                if fd >= inner.fd_table.len() {
+                    None
+                } else {
+                    inner.fd_table[fd].clone()
+                }
+            };
+            let Some(file) = file else {
+                return EBADF;
+            };
+
+            let mut r_ok = false;
+            let mut w_ok = false;
+            if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
+                r_ok = pipe.poll_readable();
+                w_ok = pipe.poll_writable();
+            } else if let Some(sp) = file.as_any().downcast_ref::<crate::fs::SocketPairEnd>() {
+                r_ok = sp.poll_readable();
+                w_ok = sp.poll_writable();
+            } else if let Some(ns) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
+                r_ok = ns.poll_readable();
+                w_ok = ns.poll_writable();
+            } else {
+                r_ok = file.readable();
+                w_ok = file.writable();
+            }
+
+            if want_r && r_ok {
+                out_r[byte] |= mask;
+                ready += 1;
+            }
+            if want_w && w_ok {
+                out_w[byte] |= mask;
+                ready += 1;
+            }
+        }
+
+        // Always clear exceptfds (we don't model exceptions).
+        if exceptfds != 0 {
+            let zeros = alloc::vec![0u8; bytes_len];
+            crate::mm::copy_to_user(token, exceptfds as *mut u8, zeros.as_slice());
+        }
+
+        if ready != 0 {
+            if readfds != 0 {
+                crate::mm::copy_to_user(token, readfds as *mut u8, out_r.as_slice());
+            }
+            if writefds != 0 {
+                crate::mm::copy_to_user(token, writefds as *mut u8, out_w.as_slice());
+            }
+            return ready;
+        }
+
+        if let Some(deadline) = deadline_ms {
+            if crate::time::get_time_ms() >= deadline {
+            if readfds != 0 {
+                crate::mm::copy_to_user(token, readfds as *mut u8, out_r.as_slice());
+            }
+            if writefds != 0 {
+                crate::mm::copy_to_user(token, writefds as *mut u8, out_w.as_slice());
+            }
+            return 0;
+            }
+        }
+
+        crate::task::processor::suspend_current_and_run_next();
+    }
 }

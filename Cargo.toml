@@ -14,6 +14,14 @@ ext4-fs = { path = "../ext4-fs" }
 log = "0.4"
 sbi-rt = { version = "0.0.2", features = ["legacy"] }
 spin = "0.7.0"
+smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
+    "alloc",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }
 
 [profile.dev]
 panic = "abort"

@@ -12,6 +12,7 @@ mod thread;
 mod memory;
 mod misc;
 mod socket;
+mod net;
 mod time_sys;
 mod sched;
 pub(crate) mod futex;
@@ -89,7 +90,19 @@ const SYSCALL_SHMGET: usize = 194;
 const SYSCALL_SHMCTL: usize = 195;
 const SYSCALL_SHMAT: usize = 196;
 const SYSCALL_SHMDT: usize = 197;
+const SYSCALL_SOCKET: usize = 198;
 const SYSCALL_SOCKETPAIR: usize = 199;
+const SYSCALL_BIND: usize = 200;
+const SYSCALL_LISTEN: usize = 201;
+const SYSCALL_ACCEPT: usize = 202;
+const SYSCALL_CONNECT: usize = 203;
+const SYSCALL_GETSOCKNAME: usize = 204;
+const SYSCALL_GETPEERNAME: usize = 205;
+const SYSCALL_SENDTO: usize = 206;
+const SYSCALL_RECVFROM: usize = 207;
+const SYSCALL_SETSOCKOPT: usize = 208;
+const SYSCALL_GETSOCKOPT: usize = 209;
+const SYSCALL_SHUTDOWN: usize = 210;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
@@ -225,7 +238,19 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMCTL => sysv_shm::syscall_shmctl(args[0], args[1], args[2]),
         SYSCALL_SHMAT => sysv_shm::syscall_shmat(args[0], args[1], args[2]),
         SYSCALL_SHMDT => sysv_shm::syscall_shmdt(args[0]),
+        SYSCALL_SOCKET => net::syscall_socket(args[0], args[1], args[2]),
         SYSCALL_SOCKETPAIR => socket::syscall_socketpair(args[0], args[1], args[2], args[3]),
+        SYSCALL_BIND => net::syscall_bind(args[0], args[1], args[2]),
+        SYSCALL_LISTEN => net::syscall_listen(args[0], args[1]),
+        SYSCALL_ACCEPT => net::syscall_accept(args[0], args[1], args[2]),
+        SYSCALL_CONNECT => net::syscall_connect(args[0], args[1], args[2]),
+        SYSCALL_GETSOCKNAME => net::syscall_getsockname(args[0], args[1], args[2]),
+        SYSCALL_GETPEERNAME => net::syscall_getpeername(args[0], args[1], args[2]),
+        SYSCALL_SENDTO => net::syscall_sendto(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_RECVFROM => net::syscall_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_SETSOCKOPT => net::syscall_setsockopt(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_GETSOCKOPT => net::syscall_getsockopt(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_SHUTDOWN => net::syscall_shutdown(args[0], args[1]),
         SYSCALL_BRK => memory::syscall_brk(args[0]),
         SYSCALL_MUNMAP => memory::syscall_munmap(args[0], args[1]),
         SYSCALL_MMAP => memory::syscall_mmap(args[0], args[1], args[2], args[3], args[4] as isize, args[5]),

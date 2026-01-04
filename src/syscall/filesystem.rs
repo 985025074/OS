@@ -1719,11 +1719,26 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
             0o100666
         } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
             0o100666
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            match pf.kind_tag() {
+                // /dev/null, /dev/zero, /dev/{u}random should look like character devices
+                // to satisfy glibc helpers such as `daemon()`.
+                crate::fs::PseudoKindTag::Null => 0o020666,
+                crate::fs::PseudoKindTag::Zero | crate::fs::PseudoKindTag::Urandom => 0o020444,
+                crate::fs::PseudoKindTag::Static => 0o100444,
+            }
         } else {
             0o100444
         };
         let st_rdev: u64 = if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
             EXT4_ST_DEV
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            match pf.kind_tag() {
+                crate::fs::PseudoKindTag::Null => 0x103,
+                crate::fs::PseudoKindTag::Zero => 0x105,
+                crate::fs::PseudoKindTag::Urandom => 0x109,
+                crate::fs::PseudoKindTag::Static => 0,
+            }
         } else {
             0
         };

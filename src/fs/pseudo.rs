@@ -19,6 +19,14 @@ pub enum PseudoKind {
     Zero,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoKindTag {
+    Static,
+    Urandom,
+    Null,
+    Zero,
+}
+
 pub struct PseudoFile {
     readable: bool,
     writable: bool,
@@ -350,6 +358,15 @@ impl PseudoFile {
         match &inner.kind {
             PseudoKind::Static(data) => Some(data.len()),
             _ => None,
+        }
+    }
+
+    pub fn kind_tag(&self) -> PseudoKindTag {
+        match &self.inner.lock().kind {
+            PseudoKind::Static(_) => PseudoKindTag::Static,
+            PseudoKind::Urandom(_) => PseudoKindTag::Urandom,
+            PseudoKind::Null => PseudoKindTag::Null,
+            PseudoKind::Zero => PseudoKindTag::Zero,
         }
     }
 }
