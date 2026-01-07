@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::min;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     fs::{
@@ -27,6 +28,8 @@ const O_EXCL: usize = 0x80;
 const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_DIRECTORY: usize = 0x10000;
+// __O_TMPFILE (020000000) | O_DIRECTORY from asm-generic/fcntl.h
+const O_TMPFILE: usize = 0x410000;
 
 // Linux errno (negative return in kernel ABI).
 const EBADF: isize = -9;
@@ -45,6 +48,8 @@ const ENOSYS: isize = -38;
 const ENAMETOOLONG: isize = -36;
 const EOPNOTSUPP: isize = -95;
 const ENOTEMPTY: isize = -39;
+
+static TMPFILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn normalize_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
@@ -280,13 +285,30 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD_CLOEXEC: usize = 1030;
 
     let ret = match cmd {
-        F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
+        F_GETFD | F_SETFD | F_SETFL => {
             // We don't track per-fd flags yet; pretend success.
             if get_fd_file(fd).is_none() {
                 EBADF
             } else {
                 0
             }
+        }
+        F_GETFL => {
+            let Some(file) = get_fd_file(fd) else {
+                return EBADF;
+            };
+            let mut flags = match (file.readable(), file.writable()) {
+                (true, false) => O_RDONLY,
+                (false, true) => O_WRONLY,
+                (true, true) => O_RDWR,
+                (false, false) => O_RDONLY,
+            };
+            if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+                if os_inode.append() {
+                    flags |= O_APPEND;
+                }
+            }
+            flags as isize
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let Some(file) = get_fd_file(fd) else {
@@ -353,9 +375,13 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         Ok(v) => v,
         Err(e) => return e,
     };
+    let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
 
     // Pseudo fs: `/proc`, `/sys`, `/dev`.
     if let AtPath::PseudoAbs(abs) = &at {
+        if tmpfile_requested {
+            return EOPNOTSUPP;
+        }
         // Minimal `/dev/shm` support for POSIX `shm_open` users (e.g., cyclictest).
         // Must handle `O_CREAT|O_EXCL` even when the object already exists.
         let file: alloc::sync::Arc<dyn File + Send + Sync> = if let Some(name) = shm_object_name(abs)
@@ -404,6 +430,36 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         }
         AtPath::PseudoAbs(_) => unreachable!(),
     };
+
+    if tmpfile_requested {
+        let dir_inode = match inode {
+            Some(ref i) => alloc::sync::Arc::clone(i),
+            None => return ENOENT,
+        };
+        if !dir_inode.is_dir() {
+            return ENOTDIR;
+        }
+        let pid = current_process().getpid();
+        let mut created = None;
+        for _ in 0..64 {
+            let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let name = alloc::format!(".tmp.{}.{}", pid, seq);
+            if dir_inode.find(&name).is_some() {
+                continue;
+            }
+            match dir_inode.create_file(&name) {
+                Ok(i) => {
+                    created = Some(i);
+                    break;
+                }
+                Err(e) => return ext4_err_to_errno(e),
+            }
+        }
+        let Some(tmp_inode) = created else {
+            return ENOSPC;
+        };
+        inode = Some(tmp_inode);
+    }
 
     // CREATE: create file if missing (Linux: only affects the final component).
     if inode.is_none() && (flags & O_CREAT != 0) {
@@ -476,7 +532,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         return EACCES;
     }
 
-    if (flags & O_DIRECTORY) != 0 && !inode.is_dir() {
+    if (flags & O_DIRECTORY) != 0 && !tmpfile_requested && !inode.is_dir() {
         return ENOTDIR;
     }
 
@@ -792,7 +848,8 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/proc/meminfo" {
         // Minimal meminfo so busybox `free` works.
-        let mem_total_kb = ((crate::config::MEMORY_END - 0x8000_0000) / 1024) as u64;
+        let mem_total_kb =
+            ((crate::config::phys_mem_end() - crate::config::phys_mem_start()) / 1024) as u64;
         let s = alloc::format!(
             "MemTotal:       {} kB\nMemFree:        {} kB\nBuffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n",
             mem_total_kb,

@@ -4,7 +4,7 @@ use super::{FrameTracker, frame_alloc};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE};
+use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE, phys_mem_end};
 use crate::println;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -78,6 +78,19 @@ impl MemorySet {
     ) -> bool {
         self.try_push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
+            None,
+        )
+    }
+
+    /// Try to insert a lazily-allocated (on-demand) anonymous area.
+    pub fn try_insert_lazy_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        self.try_push(
+            MapArea::new(start_va, end_va, MapType::Lazy, permission),
             None,
         )
     }
@@ -169,7 +182,7 @@ impl MemorySet {
         memory_set.push(
             MapArea::new(
                 (ekernel as usize).into(),
-                MEMORY_END.into(),
+                phys_mem_end().into(),
                 MapType::Identical,
                 MapPermission::R | MapPermission::W,
             ),
@@ -278,12 +291,12 @@ impl MemorySet {
             ),
             None,
         );
-        // used in sbrk
+        // used in sbrk (lazy heap to avoid eager page allocation)
         memory_set.push(
             MapArea::new(
                 user_stack_top.into(),
                 user_stack_top.into(),
-                MapType::Framed,
+                MapType::Lazy,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
             None,
@@ -427,12 +440,12 @@ impl MemorySet {
             ),
             None,
         );
-        // used in sbrk
+        // used in sbrk (lazy heap to avoid eager page allocation)
         memory_set.push(
             MapArea::new(
                 user_stack_top.into(),
                 user_stack_top.into(),
-                MapType::Framed,
+                MapType::Lazy,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
             None,
@@ -465,15 +478,34 @@ impl MemorySet {
             let mut new_area = MapArea::from_another(area);
 
             for vpn in area.vpn_range {
-                let src_pte = user_space.translate(vpn).unwrap();
-                let src_ppn = src_pte.ppn();
-                let mut src_flags = src_pte.flags();
-
                 match area.map_type {
                     MapType::Identical => {
+                        let Some(src_pte) = user_space.translate(vpn) else {
+                            continue;
+                        };
+                        if !src_pte.is_valid() {
+                            continue;
+                        }
+                        let src_ppn = src_pte.ppn();
+                        let src_flags = src_pte.flags();
                         memory_set.page_table.map(vpn, src_ppn, src_flags);
                     }
-                    MapType::Framed => {
+                    MapType::Framed | MapType::Lazy => {
+                        let Some(src_pte) = user_space.translate(vpn) else {
+                            if area.map_type == MapType::Lazy {
+                                continue;
+                            }
+                            continue;
+                        };
+                        if !src_pte.is_valid() {
+                            if area.map_type == MapType::Lazy {
+                                continue;
+                            }
+                            continue;
+                        }
+                        let src_ppn = src_pte.ppn();
+                        let mut src_flags = src_pte.flags();
+
                         // Kernel-only pages must not be shared (e.g., TrapContext is per-thread).
                         if !src_flags.contains(PTEFlags::U) {
                             let Some(frame) = frame_alloc() else {
@@ -562,7 +594,7 @@ impl MemorySet {
 
         // Update the owning MapArea's frame tracker so the old shared frame gets its refcount decremented.
         for area in self.areas.iter_mut() {
-            if area.map_type != MapType::Framed {
+            if area.map_type == MapType::Identical {
                 continue;
             }
             if vpn < area.vpn_range.get_start() || vpn >= area.vpn_range.get_end() {
@@ -577,6 +609,42 @@ impl MemorySet {
             core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
         }
         true
+    }
+
+    /// Resolve a lazy anonymous mapping fault by allocating a page on demand.
+    pub fn resolve_lazy_fault(&mut self, fault_va: usize, access: MapPermission) -> bool {
+        let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
+        for area in self.areas.iter_mut() {
+            if area.map_type != MapType::Lazy {
+                continue;
+            }
+            if vpn < area.vpn_range.get_start() || vpn >= area.vpn_range.get_end() {
+                continue;
+            }
+            if !area.map_perm.contains(access) {
+                return false;
+            }
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() {
+                    return false;
+                }
+            }
+            let Some(frame) = frame_alloc() else {
+                crate::println!(
+                    "[mm] OOM: lazy fault alloc failed for vpn={:?}",
+                    vpn
+                );
+                return false;
+            };
+            let pte_flags = PTEFlags::from_bits(area.map_perm.bits as u16).unwrap();
+            self.page_table.map(vpn, frame.ppn, pte_flags);
+            area.data_frames.insert(vpn, frame);
+            unsafe {
+                core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
+            }
+            return true;
+        }
+        false
     }
     pub fn activate(&self) {
         let satp = self.page_table.token();
@@ -663,7 +731,7 @@ impl MemorySet {
 
             let mut left_frames = BTreeMap::new();
             let mut right_frames = BTreeMap::new();
-            if area.map_type == MapType::Framed {
+            if area.map_type != MapType::Identical {
                 let mut remaining = core::mem::take(&mut area.data_frames);
                 right_frames = remaining.split_off(&ov_end);
                 let overlap = remaining.split_off(&ov_start);
@@ -687,6 +755,132 @@ impl MemorySet {
         }
         self.areas = new_areas;
     }
+
+    /// Update user mapping permissions in `[start_va, end_va)`.
+    ///
+    /// Returns `false` if any portion of the range is not mapped as a user area.
+    pub fn mprotect_user_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        new_perm: MapPermission,
+    ) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn {
+            return true;
+        }
+
+        // Ensure the range is fully covered by user areas.
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let mut covered = false;
+            let mut next = end_vpn;
+            for area in self.areas.iter() {
+                if !area.map_perm.contains(MapPermission::U) {
+                    continue;
+                }
+                let area_start = area.vpn_range.get_start();
+                let area_end = area.vpn_range.get_end();
+                if cursor >= area_start && cursor < area_end {
+                    covered = true;
+                    next = core::cmp::min(area_end, end_vpn);
+                    break;
+                }
+            }
+            if !covered {
+                return false;
+            }
+            cursor = next;
+        }
+
+        let mut new_areas: Vec<MapArea> = Vec::new();
+        let mut areas = core::mem::take(&mut self.areas);
+        for mut area in areas.drain(..) {
+            if !area.map_perm.contains(MapPermission::U) {
+                new_areas.push(area);
+                continue;
+            }
+
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if end_vpn <= area_start || start_vpn >= area_end {
+                new_areas.push(area);
+                continue;
+            }
+
+            let ov_start = core::cmp::max(start_vpn, area_start);
+            let ov_end = core::cmp::min(end_vpn, area_end);
+
+            let mut left_frames = BTreeMap::new();
+            let mut mid_frames = BTreeMap::new();
+            let mut right_frames = BTreeMap::new();
+            if area.map_type != MapType::Identical {
+                let mut remaining = core::mem::take(&mut area.data_frames);
+                right_frames = remaining.split_off(&ov_end);
+                let overlap = remaining.split_off(&ov_start);
+                mid_frames = overlap;
+                left_frames = remaining;
+            }
+
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    if pte.is_valid() {
+                        if new_perm == MapPermission::U {
+                            // PROT_NONE: unmap but keep the frame tracker.
+                            self.page_table.unmap(vpn);
+                            continue;
+                        }
+                        let mut pte_flags =
+                            PTEFlags::from_bits(new_perm.bits as u16).unwrap();
+                        let old_flags = pte.flags();
+                        if old_flags.contains(PTEFlags::COW) {
+                            pte_flags.insert(PTEFlags::COW);
+                            pte_flags.remove(PTEFlags::W);
+                        }
+                        if old_flags.contains(PTEFlags::SHARED) {
+                            pte_flags.insert(PTEFlags::SHARED);
+                        }
+                        let _ = self.page_table.set_flags(vpn, pte_flags);
+                        continue;
+                    }
+                }
+                if new_perm != MapPermission::U {
+                    if let Some(frame) = mid_frames.get(&vpn) {
+                        let pte_flags =
+                            PTEFlags::from_bits(new_perm.bits as u16).unwrap();
+                        self.page_table.map(vpn, frame.ppn, pte_flags);
+                    }
+                }
+            }
+
+            if area_start < ov_start {
+                let mut left = MapArea::from_another(&area);
+                left.vpn_range = VPNRange::new(area_start, ov_start);
+                left.data_frames = left_frames;
+                new_areas.push(left);
+            }
+
+            let mut mid = MapArea::from_another(&area);
+            mid.vpn_range = VPNRange::new(ov_start, ov_end);
+            if ov_start != area_start {
+                mid.start_offset = 0;
+            }
+            mid.map_perm = new_perm;
+            mid.data_frames = mid_frames;
+            new_areas.push(mid);
+
+            if ov_end < area_end {
+                let mut right = MapArea::from_another(&area);
+                right.vpn_range = VPNRange::new(ov_end, area_end);
+                right.start_offset = 0;
+                right.data_frames = right_frames;
+                new_areas.push(right);
+            }
+        }
+        self.areas = new_areas;
+        true
+    }
     pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
         if let Some((idx, area)) = self
             .areas
@@ -703,12 +897,36 @@ impl MemorySet {
         let mut new_memory_set = Self::new_bare();
         new_memory_set.map_trampoline();
         for area in &self.areas {
-            let new_area = MapArea::new(
+            let mut new_area = MapArea::new(
                 VirtAddr::from(area.vpn_range.get_start()),
                 VirtAddr::from(area.vpn_range.get_end()),
                 area.map_type,
                 area.map_perm,
             );
+            if area.map_type == MapType::Lazy {
+                let pte_flags = PTEFlags::from_bits(new_area.map_perm.bits as u16).unwrap();
+                for vpn in area.vpn_range {
+                    let Some(src_pte) = self.page_table.translate(vpn) else {
+                        continue;
+                    };
+                    if !src_pte.is_valid() {
+                        continue;
+                    }
+                    let src_ppn = src_pte.ppn();
+                    let Some(frame) = frame_alloc() else {
+                        continue;
+                    };
+                    frame
+                        .ppn
+                        .get_bytes_array()
+                        .copy_from_slice(src_ppn.get_bytes_array());
+                    new_memory_set.page_table.map(vpn, frame.ppn, pte_flags);
+                    new_area.data_frames.insert(vpn, frame);
+                }
+                new_memory_set.push_mapped(new_area);
+                continue;
+            }
+
             new_memory_set.push(new_area, None);
             //then copy data
 
@@ -766,34 +984,40 @@ impl MapArea {
     }
     /// map _one 两种映射类型.其中恒等映射 本人是不持有 frame 的.
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
-        let ppn: PhysPageNum;
-        match self.map_type {
-            MapType::Identical => {
-                ppn = PhysPageNum(vpn.0);
-            }
+        if self.map_type == MapType::Lazy {
+            return true;
+        }
+        let ppn: PhysPageNum = match self.map_type {
+            MapType::Identical => PhysPageNum(vpn.0),
             MapType::Framed => {
                 let Some(frame) = frame_alloc() else {
                     crate::println!("[mm] OOM: frame_alloc failed for vpn={:?}", vpn);
                     return false;
                 };
-                ppn = frame.ppn;
+                let ppn = frame.ppn;
                 self.data_frames.insert(vpn, frame);
+                ppn
             }
-        }
+            MapType::Lazy => unreachable!(),
+        };
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits as u16).unwrap();
         page_table.map(vpn, ppn, pte_flags);
         true
     }
     #[allow(unused)]
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        if self.map_type == MapType::Framed {
+        if self.map_type != MapType::Identical {
             self.data_frames.remove(&vpn);
         }
-        page_table.unmap(vpn);
+        if self.map_type == MapType::Lazy {
+            page_table.unmap_if_mapped(vpn);
+        } else {
+            page_table.unmap(vpn);
+        }
     }
 
     pub fn unmap_one_maybe(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        if self.map_type == MapType::Framed {
+        if self.map_type != MapType::Identical {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap_if_mapped(vpn);
@@ -801,6 +1025,9 @@ impl MapArea {
 
     /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.
     pub fn map(&mut self, page_table: &mut PageTable) -> bool {
+        if self.map_type == MapType::Lazy {
+            return true;
+        }
         let mut mapped: Vec<VirtPageNum> = Vec::new();
         for vpn in self.vpn_range {
             if !self.map_one(page_table, vpn) {
@@ -829,6 +1056,10 @@ impl MapArea {
     }
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) -> bool {
+        if self.map_type == MapType::Lazy {
+            self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+            return true;
+        }
         let old_end = self.vpn_range.get_end();
         let mut mapped: Vec<VirtPageNum> = Vec::new();
         for vpn in VPNRange::new(old_end, new_end) {
@@ -871,10 +1102,11 @@ impl MapArea {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
-/// map type for memory set: identical or framed
+/// map type for memory set: identical, framed, or lazy (on-demand)
 pub enum MapType {
     Identical,
     Framed,
+    Lazy,
 }
 
 bitflags! {

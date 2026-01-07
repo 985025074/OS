@@ -2,7 +2,8 @@
 
 use crate::{config::PAGE_SIZE, mm::PhysAddr};
 
-use super::{FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
+use super::{FrameTracker, MapPermission, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
+use crate::task::processor::current_process;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -204,6 +205,35 @@ impl PageTable {
     }
 }
 
+fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool {
+    if token != crate::trap::get_current_token() {
+        return false;
+    }
+    let process = current_process();
+    let Some(mut inner) = process.try_borrow_mut() else {
+        return false;
+    };
+    inner.memory_set.resolve_lazy_fault(va, access)
+}
+
+fn translated_address_with(token: usize, ptr: *const u8, access: MapPermission) -> &'static mut u8 {
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(ptr as usize);
+    let vpn = va.floor();
+    let pte = match page_table.translate(vpn) {
+        Some(pte) if pte.is_valid() => pte,
+        _ => {
+            if try_resolve_lazy_page(token, ptr as usize, access) {
+                page_table.translate(vpn).unwrap()
+            } else {
+                page_table.translate(vpn).unwrap()
+            }
+        }
+    };
+    let ppn = pte.ppn();
+    &mut ppn.get_bytes_array()[va.page_offset()]
+}
+
 /// Load a string from other address spaces into kernel space without an end `\0`.
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
     let page_table = PageTable::from_token(token);
@@ -223,7 +253,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
     string
 }
 pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    let real_addr = translated_single_address(token, ptr as *const u8);
+    let real_addr = translated_address_with(token, ptr as *const u8, MapPermission::W);
     unsafe { &mut *(real_addr as *mut u8 as *mut T) }
 }
 
@@ -241,7 +271,17 @@ pub fn copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) {
     while start < end {
         let start_va = VirtAddr::from(start);
         let vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => {
+                if try_resolve_lazy_page(token, start, MapPermission::R) {
+                    page_table.translate(vpn).unwrap()
+                } else {
+                    page_table.translate(vpn).unwrap()
+                }
+            }
+        };
+        let ppn = pte.ppn();
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
@@ -271,7 +311,17 @@ pub fn copy_to_user(token: usize, dst: *mut u8, src: &[u8]) {
     while start < end {
         let start_va = VirtAddr::from(start);
         let vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => {
+                if try_resolve_lazy_page(token, start, MapPermission::W) {
+                    page_table.translate(vpn).unwrap()
+                } else {
+                    page_table.translate(vpn).unwrap()
+                }
+            }
+        };
+        let ppn = pte.ppn();
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
@@ -304,11 +354,7 @@ pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
 }
 /// translate a single pointer
 pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {
-    let page_table = PageTable::from_token(token);
-    let va = VirtAddr::from(ptr as usize);
-    let vpn = va.floor();
-    let ppn = page_table.translate(vpn).unwrap().ppn();
-    &mut ppn.get_bytes_array()[va.page_offset()]
+    translated_address_with(token, ptr, MapPermission::R)
 }
 /// translate a pointer to a mutable u8 Vec through page table
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
@@ -319,7 +365,16 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => {
+                if !try_resolve_lazy_page(token, start, MapPermission::W) {
+                    let _ = try_resolve_lazy_page(token, start, MapPermission::R);
+                }
+                page_table.translate(vpn).unwrap()
+            }
+        };
+        let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));

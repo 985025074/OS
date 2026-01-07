@@ -2,7 +2,7 @@
 //! controls all the frames in the operating system.
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{config::MEMORY_END, println};
+use crate::{config::phys_mem_end, println};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
@@ -121,14 +121,14 @@ lazy_static! {
     pub static ref FRAME_ALLOCATOR: Mutex<FrameAllocatorImpl> = Mutex::new(FrameAllocatorImpl::new());
 }
 
-/// initiate the frame allocator using `ekernel` and `MEMORY_END`
+/// initiate the frame allocator using `ekernel` and detected physical memory end
 pub fn init_frame_allocator() {
     unsafe extern "C" {
         safe fn ekernel();
     }
     FRAME_ALLOCATOR.lock().init(
         PhysAddr::from(ekernel as usize).ceil(),
-        PhysAddr::from(MEMORY_END).floor(),
+        PhysAddr::from(phys_mem_end()).floor(),
     );
 }
 

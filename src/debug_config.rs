@@ -20,6 +20,12 @@ pub const DEBUG_TRAP: bool = false;
 /// Verbose syscall trace (very noisy).
 pub const DEBUG_SYSCALL: bool = false;
 
+/// Verbose pthread/clone lifecycle logs.
+pub const DEBUG_PTHREAD: bool = true;
+
+/// Verbose futex wait/wake logs.
+pub const DEBUG_FUTEX: bool = true;
+
 /// Verbose filesystem debug logs (open/getdents/lseek).
 pub const DEBUG_FS: bool = false;
 

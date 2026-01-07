@@ -2,6 +2,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 
 use crate::{
+    debug_config::DEBUG_PTHREAD,
     fs::ROOT_INODE,
     mm::{kernel_token, translated_single_address, translated_str, write_user_value},
     syscall::misc::encode_linux_tid,
@@ -176,6 +177,19 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             }
             (tid_index, linux_tid)
         };
+
+        if DEBUG_PTHREAD {
+            log::debug!(
+                "[clone] vm flags={:#x} stack={:#x} ptid={:#x} tls={:#x} ctid={:#x} tid={} linux_tid={}",
+                flags,
+                stack,
+                _ptid,
+                _tls,
+                _ctid,
+                _tid_index,
+                linux_tid
+            );
+        }
 
         // Parent/child tid pointers live in the shared address space.
         let token = get_current_token();
@@ -370,6 +384,39 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
         // Pass script path as argv[1] (or argv[2] with opt arg), like Linux.
         new_args.push(path.clone());
         // Append original args after argv[0].
+        for a in args_vec.iter().skip(1) {
+            new_args.push(a.clone());
+        }
+        let process = current_process();
+        process.exec(&interp_data, new_args);
+        return 0;
+    }
+
+    // ExampleOs-style fallback for .sh files without shebangs.
+    // Note: this diverges from Linux (which returns ENOEXEC) but keeps OSComp
+    // scripts working when shells don't retry on ENOEXEC.
+    if path.ends_with(".sh") {
+        let mut interp: Option<(String, Vec<u8>, bool)> = None;
+        if let Some(data) = load_file_from_path("/bin/busybox") {
+            interp = Some((String::from("/bin/busybox"), data, true));
+        } else if let Some(data) = load_file_from_path("/busybox") {
+            interp = Some((String::from("/busybox"), data, true));
+        } else if let Some(data) = load_file_from_path("/bin/sh") {
+            interp = Some((String::from("/bin/sh"), data, false));
+        }
+
+        let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
+            return ENOENT;
+        };
+        if !is_elf(&interp_data) {
+            return ENOEXEC;
+        }
+        let mut new_args: Vec<String> = Vec::new();
+        new_args.push(interp_path.clone());
+        if needs_sh_arg {
+            new_args.push(String::from("sh"));
+        }
+        new_args.push(path.clone());
         for a in args_vec.iter().skip(1) {
             new_args.push(a.clone());
         }

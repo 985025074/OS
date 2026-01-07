@@ -7,6 +7,7 @@
 //! Every task or process has a memory_set to control its virtual memory.
 
 mod address;
+mod dtb;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
@@ -19,6 +20,7 @@ pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use address::{StepByOne, VPNRange};
 use alloc::vec::Vec;
 pub use frame_allocator::{FrameTracker, frame_alloc, frame_dealloc};
+pub use dtb::init_phys_mem_from_dtb;
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);

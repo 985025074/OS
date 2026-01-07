@@ -62,6 +62,10 @@ impl OSInode {
         }
     }
 
+    pub fn append(&self) -> bool {
+        self.append
+    }
+
     /// Read all data inside an inode into vector
     pub fn read_all(&self) -> Vec<u8> {
         let _ = self.flush();

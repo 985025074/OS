@@ -2,7 +2,7 @@ use core::{arch::asm, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 use crate::config::TRAMPOLINE;
 use crate::debug_config::DEBUG_TRAP;
-use crate::mm::{PageTable, VirtAddr};
+use crate::mm::{MapPermission, PageTable, VirtAddr};
 use crate::task::block_sleep::check_timer;
 use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
 use crate::task::signal::check_if_current_signals_error;
@@ -45,6 +45,8 @@ static FIRST_TRAP_RETURN_LOGGED: AtomicBool = AtomicBool::new(false);
 static TRAP_RETURN_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Count trap_handler invocations for debugging.
 static TRAP_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+type KernelTrap = Trap<usize, usize>;
 
 pub fn init_trap() {
     set_kernel_trap_entry();
@@ -93,7 +95,8 @@ fn disable_supervisor_interrupt() {
 pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let scause = scause::read();
     let stval = stval::read();
-    match scause.cause() {
+    let cause = scause.cause();
+    match cause {
         Trap::Interrupt(TIME_INTERVAL) => {
             let hart = {
                 let h: usize;
@@ -125,24 +128,50 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
                 trap_cx.sepc, stval
             );
         }
-        Trap::Exception(INSTRUCTION_PAGE_FAULT)
+        c @ (Trap::Exception(INSTRUCTION_PAGE_FAULT)
         | Trap::Exception(LOAD_PAGE_FAULT)
-        | Trap::Exception(STORE_PAGE_FAULT) => {
+        | Trap::Exception(STORE_PAGE_FAULT)) => {
+            if try_handle_kernel_page_fault(c, stval) {
+                return;
+            }
             panic!(
                 "Kernel page fault: cause = {:?}, sepc = {:#x}, stval = {:#x}",
-                scause.cause(),
+                c,
                 trap_cx.sepc,
                 stval
             );
         }
-        _ => {
+        c => {
             panic!(
                 "Unsupported trap from kernel: {:?}, stval = {:#x}!",
-                scause.cause(),
+                c,
                 stval
             );
         }
     }
+}
+
+fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
+    let Some(task) = crate::task::processor::current_task() else {
+        return false;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    let Some(mut inner) = process.try_borrow_mut() else {
+        return false;
+    };
+    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT)) && inner.memory_set.resolve_cow_fault(stval)
+    {
+        return true;
+    }
+    let access = match cause {
+        Trap::Exception(LOAD_PAGE_FAULT) => MapPermission::R,
+        Trap::Exception(STORE_PAGE_FAULT) => MapPermission::W,
+        Trap::Exception(INSTRUCTION_PAGE_FAULT) => MapPermission::X,
+        _ => return false,
+    };
+    inner.memory_set.resolve_lazy_fault(stval, access)
 }
 // todo : avoid cloning here..
 fn get_trap_context() -> &'static mut TrapContext {
@@ -296,6 +325,19 @@ fn handle_user_exception(code: usize, stval: usize) {
         let process = crate::task::processor::current_process();
         let mut inner = process.borrow_mut();
         if inner.memory_set.resolve_cow_fault(stval) {
+            return;
+        }
+    }
+    if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
+        let process = crate::task::processor::current_process();
+        let mut inner = process.borrow_mut();
+        let access = match code {
+            LOAD_PAGE_FAULT => MapPermission::R,
+            STORE_PAGE_FAULT => MapPermission::W,
+            INSTRUCTION_PAGE_FAULT => MapPermission::X,
+            _ => MapPermission::R,
+        };
+        if inner.memory_set.resolve_lazy_fault(stval, access) {
             return;
         }
     }

@@ -1,7 +1,5 @@
 use alloc::sync::Arc;
 use core::cmp::min;
-use core::arch::asm;
-
 use crate::{
     config::PAGE_SIZE,
     fs::{File, OSInode, ext4_lock},
@@ -16,6 +14,10 @@ const PROT_EXEC: usize = 4;
 
 // Linux `mmap(2)` flags (subset).
 const MAP_FIXED: usize = 0x10;
+const MAP_ANONYMOUS: usize = 0x20;
+const MAP_STACK: usize = 0x20000;
+
+const LARGE_ANON_MMAP: usize = 1 * 1024 * 1024;
 
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
@@ -60,14 +62,19 @@ pub fn syscall_brk(addr: usize) -> isize {
     let heap_start = inner.heap_start;
     let old_end = align_up(old_brk, PAGE_SIZE);
     let new_end = align_up(new_brk, PAGE_SIZE);
-    if new_end > old_end {
-        let _ = inner
+    let ok = if new_end > old_end {
+        inner
             .memory_set
-            .append_to(heap_start.into(), new_end.into());
+            .append_to(heap_start.into(), new_end.into())
     } else if new_end < old_end {
-        let _ = inner
+        inner
             .memory_set
-            .shrink_to(heap_start.into(), new_end.into());
+            .shrink_to(heap_start.into(), new_end.into())
+    } else {
+        true
+    };
+    if !ok {
+        return old_brk as isize;
     }
     inner.brk = new_brk;
     inner.brk as isize
@@ -104,6 +111,25 @@ pub fn syscall_mmap(
     let Some(end) = start.checked_add(map_len) else {
         return ENOMEM;
     };
+    let map_start = start;
+    let map_end = end;
+    let is_anon = fd < 0 || (flags & MAP_ANONYMOUS) != 0;
+    if is_anon && len >= LARGE_ANON_MMAP {
+        let pid = process.getpid();
+        log::info!(
+            "[mmap] pid={} anon len={} map_len={} addr_hint={:#x} start={:#x} prot={:#x} flags={:#x} stack={} fd={} off={:#x}",
+            pid,
+            len,
+            map_len,
+            addr,
+            map_start,
+            prot,
+            flags,
+            (flags & MAP_STACK) != 0,
+            fd,
+            off
+        );
+    }
 
     let mut perm = MapPermission::U;
     if (prot & PROT_READ) != 0 {
@@ -152,10 +178,16 @@ pub fn syscall_mmap(
         inner.mmap_areas = new_areas;
     }
 
-    if !inner
-        .memory_set
-        .try_insert_framed_area(start.into(), end.into(), perm)
-    {
+    let map_ok = if is_anon {
+        inner
+            .memory_set
+            .try_insert_lazy_area(map_start.into(), map_end.into(), perm)
+    } else {
+        inner
+            .memory_set
+            .try_insert_framed_area(map_start.into(), map_end.into(), perm)
+    };
+    if !map_ok {
         return ENOMEM;
     }
     if end > inner.mmap_next {
@@ -165,7 +197,7 @@ pub fn syscall_mmap(
     drop(inner);
 
     // Best-effort: file-backed initial population.
-    if fd >= 0 {
+    if !is_anon && fd >= 0 {
         if let Some(inode) = get_fd_inode(fd as usize) {
             let _ext4_guard = ext4_lock();
             let token = get_current_token();
@@ -229,59 +261,40 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
 /// Linux `mprotect` (syscall 226).
 ///
 /// Many glibc programs call this during startup to set guard pages / adjust
-/// permissions. We currently do not enforce per-page user permissions strictly,
-/// so accept the call and return success.
-pub fn syscall_mprotect(_addr: usize, _len: usize, _prot: usize) -> isize {
-    if _len == 0 {
+/// permissions.
+pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    if len == 0 {
         return 0;
     }
-    if _addr % PAGE_SIZE != 0 {
+    if addr % PAGE_SIZE != 0 {
         return EINVAL;
     }
-    let Some(end) = _addr.checked_add(_len) else {
+    let Some(end) = addr.checked_add(len) else {
         return EINVAL;
     };
-    let start = _addr;
     let end = align_up(end, PAGE_SIZE);
 
-    let mut new_flags = PTEFlags::U;
-    if (_prot & PROT_READ) != 0 {
-        new_flags |= PTEFlags::R;
+    let mut perm = MapPermission::U;
+    if (prot & PROT_READ) != 0 {
+        perm |= MapPermission::R;
     }
-    if (_prot & PROT_WRITE) != 0 {
-        new_flags |= PTEFlags::W;
+    if (prot & PROT_WRITE) != 0 {
+        perm |= MapPermission::W;
     }
-    if (_prot & PROT_EXEC) != 0 {
-        new_flags |= PTEFlags::X;
+    if (prot & PROT_EXEC) != 0 {
+        perm |= MapPermission::X;
     }
 
     let process = current_process();
     let mut inner = process.borrow_mut();
-    let mut addr = start;
-    while addr < end {
-        let vpn = crate::mm::VirtAddr::from(addr).floor();
-        let Some(pte) = inner.memory_set.translate(vpn) else {
-            return ENOMEM;
-        };
-        if !pte.flags().contains(PTEFlags::U) {
-            return ENOMEM;
-        }
-        let old = pte.flags();
-        let mut flags = new_flags;
-        // Preserve software-managed bits (RSW) so that shared/COW mappings keep their nature.
-        if old.contains(PTEFlags::COW) {
-            flags |= PTEFlags::COW;
-        }
-        if old.contains(PTEFlags::SHARED) {
-            flags |= PTEFlags::SHARED;
-        }
-        if !inner.memory_set.set_pte_flags(vpn, flags) {
-            return ENOMEM;
-        }
-        addr += PAGE_SIZE;
+    if !inner
+        .memory_set
+        .mprotect_user_range(addr.into(), end.into(), perm)
+    {
+        return ENOMEM;
     }
     // Ensure permission changes take effect immediately.
-    unsafe { asm!("sfence.vma"); }
+    unsafe { core::arch::asm!("sfence.vma"); }
     0
 }
 

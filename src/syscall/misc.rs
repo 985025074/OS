@@ -1,4 +1,5 @@
 use crate::{
+    debug_config::DEBUG_PTHREAD,
     mm::{translated_byte_buffer, read_user_value, write_user_value},
     task::processor::{current_process, current_task},
     trap::get_current_token,
@@ -146,6 +147,13 @@ pub fn syscall_set_tid_address(_tidptr: usize) -> isize {
         }
         inner.res.as_ref().unwrap().tid
     };
+    if DEBUG_PTHREAD {
+        log::debug!(
+            "[set_tid_address] tidptr={:#x} tid_index={}",
+            _tidptr,
+            tid_index
+        );
+    }
     encode_linux_tid(current_process().getpid(), tid_index) as isize
 }
 
@@ -182,18 +190,51 @@ struct RLimit64 {
     rlim_max: u64,
 }
 
+const RLIMIT_STACK: usize = 3;
+
+fn rlimit_for_resource(resource: usize) -> (u64, u64) {
+    if resource == RLIMIT_STACK {
+        // Keep default thread stacks modest to avoid huge eager mmap costs.
+        (1 * 1024 * 1024, 1 * 1024 * 1024)
+    } else {
+        (u64::MAX, u64::MAX)
+    }
+}
+
 /// Linux `prlimit64(2)` (syscall 261 on riscv64).
 ///
 /// Provide a permissive "unlimited" answer for common queries (e.g. RLIMIT_STACK).
 pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_limit: usize) -> isize {
     if old_limit != 0 {
         let token = get_current_token();
+        let (rlim_cur, rlim_max) = rlimit_for_resource(_resource);
         let rl = RLimit64 {
-            rlim_cur: u64::MAX,
-            rlim_max: u64::MAX,
+            rlim_cur,
+            rlim_max,
         };
         write_user_value(token, old_limit as *mut RLimit64, &rl);
     }
+    0
+}
+
+/// Linux `getrlimit(2)` (syscall 163 on riscv64).
+pub fn syscall_getrlimit(resource: usize, rlim: usize) -> isize {
+    if rlim != 0 {
+        let token = get_current_token();
+        let (rlim_cur, rlim_max) = rlimit_for_resource(resource);
+        let rl = RLimit64 {
+            rlim_cur,
+            rlim_max,
+        };
+        write_user_value(token, rlim as *mut RLimit64, &rl);
+    }
+    0
+}
+
+/// Linux `setrlimit(2)` (syscall 164 on riscv64).
+///
+/// We currently ignore the new limits and return success.
+pub fn syscall_setrlimit(_resource: usize, _rlim: usize) -> isize {
     0
 }
 

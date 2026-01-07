@@ -113,6 +113,8 @@ const SYSCALL_MLOCK: usize = 228;
 const SYSCALL_MUNLOCK: usize = 229;
 const SYSCALL_MLOCKALL: usize = 230;
 const SYSCALL_MUNLOCKALL: usize = 231;
+const SYSCALL_GETRLIMIT: usize = 163;
+const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
@@ -259,6 +261,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNLOCK => memory::syscall_munlock(args[0], args[1]),
         SYSCALL_MLOCKALL => memory::syscall_mlockall(args[0]),
         SYSCALL_MUNLOCKALL => memory::syscall_munlockall(),
+        SYSCALL_GETRLIMIT => misc::syscall_getrlimit(args[0], args[1]),
+        SYSCALL_SETRLIMIT => misc::syscall_setrlimit(args[0], args[1]),
         SYSCALL_PRLIMIT64 => misc::syscall_prlimit64(args[0], args[1], args[2], args[3]),
         SYSCALL_RENAMEAT2 => filesystem::syscall_renameat2(args[0] as isize, args[1], args[2] as isize, args[3], args[4]),
         SYSCALL_GETRANDOM => misc::syscall_getrandom(args[0], args[1], args[2] as u32),

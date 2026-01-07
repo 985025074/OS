@@ -22,7 +22,7 @@ use lazy_static::lazy_static;
 use log;
 use spin::Mutex;
 
-use crate::debug_config::DEBUG_SCHED;
+use crate::debug_config::{DEBUG_PTHREAD, DEBUG_SCHED};
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
     idle_task_context: TaskContext,
@@ -34,6 +34,8 @@ pub struct Processor {
     pending_ready: Option<Arc<TaskControlBlock>>,
     /// A task that is transitioning into Blocked state; finalized after switching to idle.
     pending_blocked: Option<Arc<TaskControlBlock>>,
+    /// A task to drop after switching to idle (safe to free its kernel stack).
+    pending_drop: Option<Arc<TaskControlBlock>>,
 }
 impl Processor {
     pub fn new() -> Self {
@@ -42,6 +44,7 @@ impl Processor {
             idle_task_context: TaskContext::new(),
             pending_ready: None,
             pending_blocked: None,
+            pending_drop: None,
         }
     }
     pub fn get_idle_task_ptr(&mut self) -> *mut TaskContext {
@@ -69,6 +72,14 @@ impl Processor {
 
     pub fn set_pending_blocked(&mut self, task: Arc<TaskControlBlock>) {
         self.pending_blocked = Some(task);
+    }
+
+    pub fn take_pending_drop(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.pending_drop.take()
+    }
+
+    pub fn set_pending_drop(&mut self, task: Arc<TaskControlBlock>) {
+        self.pending_drop = Some(task);
     }
 }
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
@@ -179,6 +190,11 @@ pub fn idle_task() {
             task.wakeup_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             add_task(task);
+        }
+
+        if let Some(task) = local_processor().lock().take_pending_drop() {
+            task.clear_on_cpu();
+            drop(task);
         }
 
         if let Some(task) = fetch_task() {
@@ -386,9 +402,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         (tid, res_to_drop, join_waiters, clear_child_tid)
     }; // task_inner dropped here
 
+    let clear_child_tid_addr = clear_child_tid;
+    let is_linux_thread = clear_child_tid_addr.is_some();
+
     // Linux pthreads expect CLONE_CHILD_CLEARTID/set_tid_address semantics:
     // clear *ctid to 0 and wake any futex waiters.
-    if let Some(ctid) = clear_child_tid {
+    if let Some(ctid) = clear_child_tid_addr {
         let token = {
             let inner = process.borrow_mut();
             inner.memory_set.token()
@@ -399,6 +418,35 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     drop(res_to_drop);
     for waiter in join_waiters {
         wakeup_task(waiter);
+    }
+
+    if tid != 0 {
+        if DEBUG_PTHREAD {
+            log::debug!(
+                "[thread_exit] pid={} tid={} ctid={:#x} linux_thread={}",
+                process.getpid(),
+                tid,
+                clear_child_tid_addr.unwrap_or(0),
+                is_linux_thread
+            );
+        }
+        if is_linux_thread {
+            // For Linux threads, remove from the process task table immediately.
+            // Joiners use futexes instead of waittid, so we don't need the slot.
+            let mut process_inner = process.borrow_mut();
+            if let Some(slot) = process_inner.tasks.get_mut(tid) {
+                if slot
+                    .as_ref()
+                    .map(|t| Arc::ptr_eq(t, &task))
+                    .unwrap_or(false)
+                {
+                    *slot = None;
+                }
+            }
+        }
+        // Defer dropping the exiting task until after we switch to idle so its
+        // kernel stack is no longer in use.
+        local_processor().lock().set_pending_drop(task);
     }
 
     log::debug!(
@@ -508,6 +556,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         }
     }
 
+    if tid != 0 {
+        drop(process);
+        let mut _unused = TaskContext::new();
+        schedule(&mut _unused as *mut _);
+        return;
+    }
     drop(process);
     // we do not have to save task context
     // println!(

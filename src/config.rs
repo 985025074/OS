@@ -1,5 +1,7 @@
 //! Constants used in rCore
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 // Linux userland (busybox/glibc) expects a large initial stack.
 pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
 pub const KERNEL_STACK_SIZE: usize = 4096 * 16;  // Increased from 4 to 16 pages (64KB)
@@ -21,8 +23,28 @@ pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
 }
 
 pub const CLOCK_FREQ: usize = 12500000;
+
 // QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
-pub const MEMORY_END: usize = 0xA000_0000;
+pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
+pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
+
+static PHYS_MEM_START: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_START);
+static PHYS_MEM_END: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_END);
+
+pub fn set_phys_mem_range(start: usize, end: usize) {
+    if end > start {
+        PHYS_MEM_START.store(start, Ordering::SeqCst);
+        PHYS_MEM_END.store(end, Ordering::SeqCst);
+    }
+}
+
+pub fn phys_mem_start() -> usize {
+    PHYS_MEM_START.load(Ordering::SeqCst)
+}
+
+pub fn phys_mem_end() -> usize {
+    PHYS_MEM_END.load(Ordering::SeqCst)
+}
 
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine

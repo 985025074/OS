@@ -7,6 +7,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
+    debug_config::DEBUG_FUTEX,
     mm::read_user_value,
     task::{
         manager::wakeup_task,
@@ -37,6 +38,9 @@ lazy_static! {
 pub(crate) fn futex_wake(pid: usize, uaddr: usize, nr_wake: usize) -> isize {
     if uaddr == 0 {
         return EINVAL;
+    }
+    if DEBUG_FUTEX {
+        log::debug!("[futex_wake] pid={} uaddr={:#x} nr={}", pid, uaddr, nr_wake);
     }
     let key = (pid, uaddr);
     let mut map = FUTEX_QUEUES.lock();
@@ -72,18 +76,49 @@ pub fn syscall_futex(
             if uaddr == 0 {
                 return EINVAL;
             }
-            let token = get_current_token();
-            let cur = read_user_value(token, uaddr as *const i32);
-            if cur != val as i32 {
-                return EAGAIN;
-            }
             let task = current_task().unwrap();
             let pid = current_process().getpid();
-            FUTEX_QUEUES
-                .lock()
-                .entry((pid, uaddr))
+            let token = get_current_token();
+            let mut map = FUTEX_QUEUES.lock();
+            let cur = read_user_value(token, uaddr as *const i32);
+            if cur != val as i32 {
+                if DEBUG_FUTEX {
+                    let tid = task
+                        .borrow_mut()
+                        .res
+                        .as_ref()
+                        .map(|r| r.tid)
+                        .unwrap_or(usize::MAX);
+                    log::debug!(
+                        "[futex_wait] mismatch pid={} tid={} uaddr={:#x} cur={} expected={}",
+                        pid,
+                        tid,
+                        uaddr,
+                        cur,
+                        val
+                    );
+                }
+                return EAGAIN;
+            }
+            if DEBUG_FUTEX {
+                let tid = task
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                log::debug!(
+                    "[futex_wait] pid={} tid={} uaddr={:#x} val={}",
+                    pid,
+                    tid,
+                    uaddr,
+                    val
+                );
+            }
+            map.entry((pid, uaddr))
                 .or_insert_with(VecDeque::new)
                 .push_back(task);
+            drop(map);
             block_current_and_run_next();
             0
         }
