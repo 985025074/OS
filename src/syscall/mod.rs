@@ -61,6 +61,8 @@ const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_GETITIMER: usize = 102;
+const SYSCALL_SETITIMER: usize = 103;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
@@ -171,7 +173,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
     //     "syscall id: {}, args: {},{},{}",
     //     id, args[0], args[1], args[2]
     // );
-    match id {
+    let ret = match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
         SYSCALL_FCNTL => filesystem::syscall_fcntl(args[0], args[1], args[2]),
         SYSCALL_DUP => filesystem::syscall_dup(args[0]),
@@ -211,6 +213,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => misc::syscall_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => misc::syscall_get_robust_list(args[0], args[1], args[2]),
         SYSCALL_NANOSLEEP => time_sys::syscall_nanosleep(args[0], args[1]),
+        SYSCALL_GETITIMER => time_sys::syscall_getitimer(args[0], args[1]),
+        SYSCALL_SETITIMER => time_sys::syscall_setitimer(args[0], args[1], args[2]),
         SYSCALL_CLOCK_GETTIME => time_sys::syscall_clock_gettime(args[0], args[1]),
         SYSCALL_CLOCK_NANOSLEEP => time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3]),
         SYSCALL_SYSLOG => misc::syscall_syslog(args[0], args[1], args[2]),
@@ -323,5 +327,20 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             }
             -38
         }
+    };
+    if ret == -95 && crate::debug_config::DEBUG_NET {
+        let pid = crate::task::processor::current_process().getpid();
+        crate::println!(
+            "[syscall] EOPNOTSUPP pid={} id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+            pid,
+            id,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5]
+        );
     }
+    ret
 }

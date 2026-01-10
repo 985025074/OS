@@ -1,6 +1,6 @@
 //! Centralized debug switches.
 //!
-//! Keep these `false` for normal runs. Flip to `true` temporarily when diagnosing
+//! Keep these `false` for normal runs. Flip to `false` temporarily when diagnosing
 //! hangs or scheduler/timer issues.
 
 /// Default kernel log level when `LOG` is not set at build time.
@@ -15,16 +15,16 @@ pub const DEBUG_TIMER: bool = false;
 pub const DEBUG_SCHED: bool = false;
 
 /// Verbose trap logs (timer/software interrupts, user exceptions).
-pub const DEBUG_TRAP: bool = true;
+pub const DEBUG_TRAP: bool = false;
 
 /// Verbose syscall trace (very noisy).
 pub const DEBUG_SYSCALL: bool = false;
 
 /// Verbose pthread/clone lifecycle logs.
-pub const DEBUG_PTHREAD: bool = true;
+pub const DEBUG_PTHREAD: bool = false;
 
 /// Verbose futex wait/wake logs.
-pub const DEBUG_FUTEX: bool = true;
+pub const DEBUG_FUTEX: bool = false;
 
 /// Verbose filesystem debug logs (open/getdents/lseek).
 pub const DEBUG_FS: bool = false;

@@ -156,10 +156,28 @@ pub fn syscall_listen(fd: usize, backlog: usize) -> isize {
         Some(s) => s,
         None => return ENOTSOCK,
     };
-    match sock.listen(backlog) {
+    if crate::debug_config::DEBUG_NET {
+        crate::println!(
+            "[net] pid={} listen(fd={}, backlog={}) kind={:?}",
+            current_process().pid.0,
+            fd,
+            backlog,
+            sock.kind()
+        );
+    }
+    let r = match sock.listen(backlog) {
         Ok(()) => 0,
         Err(e) => e,
+    };
+    if crate::debug_config::DEBUG_NET {
+        crate::println!(
+            "[net] pid={} listen(fd={}) -> {}",
+            current_process().pid.0,
+            fd,
+            r
+        );
     }
+    r
 }
 
 pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
@@ -171,8 +189,20 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
         Some(s) => s,
         None => return ENOTSOCK,
     };
-    let Ok(new_sock) = sock.accept() else {
-        return EOPNOTSUPP;
+    let new_sock = match sock.accept() {
+        Ok(s) => s,
+        Err(e) => {
+            if crate::debug_config::DEBUG_NET {
+                crate::println!(
+                    "[net] pid={} accept(fd={}) kind={:?} -> {}",
+                    current_process().pid.0,
+                    fd,
+                    sock.kind(),
+                    e
+                );
+            }
+            return e;
+        }
     };
     let peer = new_sock.tcp_endpoints_v4();
     let process = current_process();

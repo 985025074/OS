@@ -1,5 +1,6 @@
 // this is used for sleep (blocked) threads
 use core::{cmp::Ordering, time};
+use core::sync::atomic::Ordering as AtomicOrdering;
 
 use crate::{
     task::{manager::wakeup_task, task_block::TaskControlBlock},
@@ -18,6 +19,7 @@ use crate::{
     syscall::futex::futex_wake,
     task::manager::pid2process,
 };
+use crate::sbi::send_ipi;
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
     pub tid: usize,
@@ -60,6 +62,16 @@ impl Ord for TimeWrap {
 
 lazy_static! {
 pub static ref TIMERS: Mutex<BinaryHeap<TimeWrap>> = Mutex::new(BinaryHeap::<TimeWrap>::new());
+}
+
+#[derive(Clone, Copy)]
+struct AlarmTimer {
+    pid: usize,
+    deadline_ms: usize,
+}
+
+lazy_static! {
+    static ref ALARM_TIMERS: Mutex<Vec<AlarmTimer>> = Mutex::new(Vec::new());
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +130,89 @@ pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
         timer.time_expired
     );
     TIMERS.lock().push(timer);
+}
+
+pub fn set_alarm_timer(pid: usize, delay_ms: Option<usize>) -> usize {
+    let now = get_time_ms();
+    let mut remaining_ms = 0usize;
+    let mut timers = ALARM_TIMERS.lock();
+    if let Some(idx) = timers.iter().position(|t| t.pid == pid) {
+        let old = timers.swap_remove(idx);
+        if old.deadline_ms > now {
+            remaining_ms = old.deadline_ms - now;
+        }
+    }
+    if let Some(delay) = delay_ms {
+        if delay > 0 {
+            timers.push(AlarmTimer {
+                pid,
+                deadline_ms: now.saturating_add(delay),
+            });
+        }
+    }
+    remaining_ms
+}
+
+pub fn alarm_remaining_ms(pid: usize) -> usize {
+    let now = get_time_ms();
+    let timers = ALARM_TIMERS.lock();
+    if let Some(entry) = timers.iter().find(|t| t.pid == pid) {
+        return entry.deadline_ms.saturating_sub(now);
+    }
+    0
+}
+
+fn deliver_alarm(pid: usize) {
+    let Some(proc) = pid2process(pid) else {
+        return;
+    };
+    let task = {
+        let inner = proc.borrow_mut();
+        let mut picked: Option<Arc<TaskControlBlock>> = None;
+        for t in inner.tasks.iter().filter_map(|t| t.as_ref()) {
+            if t.borrow_mut().pending_signal.is_none() {
+                picked = Some(t.clone());
+                break;
+            }
+            if picked.is_none() {
+                picked = Some(t.clone());
+            }
+        }
+        picked
+    };
+    let Some(task) = task else {
+        return;
+    };
+    {
+        let mut inner = task.borrow_mut();
+        inner.pending_signal = Some(14);
+    }
+    let on_cpu = task.on_cpu.load(AtomicOrdering::Acquire);
+    wakeup_task(task.clone());
+    if on_cpu != TaskControlBlock::OFF_CPU {
+        send_ipi(on_cpu);
+    }
+}
+
+fn process_alarm_timers(current_ms: usize) {
+    loop {
+        let expired = {
+            let mut timers = ALARM_TIMERS.lock();
+            if let Some((idx, _)) = timers
+                .iter()
+                .enumerate()
+                .find(|(_, t)| t.deadline_ms <= current_ms)
+            {
+                Some(timers.swap_remove(idx))
+            } else {
+                None
+            }
+        };
+        let Some(timer) = expired else {
+            break;
+        };
+        deliver_alarm(timer.pid);
+    }
 }
 
 pub fn check_timer() {
@@ -196,4 +291,5 @@ pub fn check_timer() {
     }
 
     process_delayed_tid_clears(current_ms);
+    process_alarm_timers(current_ms);
 }

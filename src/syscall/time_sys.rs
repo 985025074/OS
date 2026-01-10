@@ -1,6 +1,7 @@
 use crate::{
     config::CLOCK_FREQ,
     mm::{read_user_value, write_user_value},
+    task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
     syscall::thread,
     time::get_time,
     trap::get_current_token,
@@ -27,6 +28,20 @@ struct Tms {
     tms_stime: i64,
     tms_cutime: i64,
     tms_cstime: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimeVal64 {
+    sec: i64,
+    usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ITimerVal {
+    it_interval: TimeVal64,
+    it_value: TimeVal64,
 }
 
 pub fn syscall_gettimeofday(tv_ptr: usize, _tz: usize) -> isize {
@@ -116,6 +131,69 @@ pub fn syscall_times(tms_ptr: usize) -> isize {
         write_user_value(token, tms_ptr as *mut Tms, &tms);
     }
     crate::time::get_time_ms() as isize
+}
+
+fn timeval_to_ms(tv: TimeVal64) -> Option<usize> {
+    if tv.sec < 0 || tv.usec < 0 || tv.usec >= 1_000_000 {
+        return None;
+    }
+    let ms = (tv.sec as u64)
+        .saturating_mul(1_000)
+        .saturating_add((tv.usec as u64) / 1_000);
+    Some(ms as usize)
+}
+
+fn write_itimerval(ptr: usize, remaining_ms: usize) {
+    if ptr == 0 {
+        return;
+    }
+    let token = get_current_token();
+    let sec = (remaining_ms / 1000) as i64;
+    let usec = ((remaining_ms % 1000) * 1000) as i64;
+    let val = ITimerVal {
+        it_interval: TimeVal64 { sec: 0, usec: 0 },
+        it_value: TimeVal64 { sec, usec },
+    };
+    write_user_value(token, ptr as *mut ITimerVal, &val);
+}
+
+pub fn syscall_getitimer(which: usize, curr_ptr: usize) -> isize {
+    const ITIMER_REAL: usize = 0;
+    const EINVAL: isize = -22;
+    const EFAULT: isize = -14;
+    if which != ITIMER_REAL {
+        return EINVAL;
+    }
+    if curr_ptr == 0 {
+        return EFAULT;
+    }
+    let pid = crate::task::processor::current_process().getpid();
+    let remaining_ms = alarm_remaining_ms(pid);
+    write_itimerval(curr_ptr, remaining_ms);
+    0
+}
+
+pub fn syscall_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
+    const ITIMER_REAL: usize = 0;
+    const EINVAL: isize = -22;
+    const EFAULT: isize = -14;
+    if which != ITIMER_REAL {
+        return EINVAL;
+    }
+    if new_ptr == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let new_val = read_user_value(token, new_ptr as *const ITimerVal);
+    let Some(delay_ms) = timeval_to_ms(new_val.it_value) else {
+        return EINVAL;
+    };
+    let pid = crate::task::processor::current_process().getpid();
+    let prev_ms = set_alarm_timer(pid, if delay_ms == 0 { None } else { Some(delay_ms) });
+    if old_ptr != 0 {
+        write_itimerval(old_ptr, prev_ms);
+    }
+    0
 }
 
 /// Linux `pselect6` (syscall 72 on riscv64).

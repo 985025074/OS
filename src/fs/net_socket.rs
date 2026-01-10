@@ -6,18 +6,35 @@ use core::cmp::min;
 use spin::Mutex;
 
 use crate::mm::UserBuffer;
+use crate::task::processor::current_task;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
-use crate::fs::File;
 
 const TCP_RX_BUF_LEN_IPERF: usize = 128 * 1024;
 const TCP_TX_BUF_LEN_IPERF: usize = 128 * 1024;
 const UDP_RX_BUF_LEN: usize = 64 * 1024;
 const UDP_TX_BUF_LEN: usize = 64 * 1024;
+const EINTR: isize = -4;
+
+fn pending_unmasked_signal() -> bool {
+    crate::task::block_sleep::check_timer();
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let inner = task.borrow_mut();
+    if let Some(sig) = inner.pending_signal {
+        if sig == 0 || sig > 64 {
+            return false;
+        }
+        let bit = 1u64 << (sig - 1);
+        return (inner.signal_mask & bit) == 0;
+    }
+    false
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetSocketKind {
@@ -294,6 +311,9 @@ impl NetSocketFile {
                 }));
             }
             drop(inner);
+            if pending_unmasked_signal() {
+                return Err(EINTR);
+            }
             // Best-effort: yield and try again.
             crate::task::processor::suspend_current_and_run_next();
             // If we are used in non-blocking mode, callers will likely retry.
@@ -349,7 +369,7 @@ impl NetSocketFile {
                 if crate::time::get_time_ms() >= deadline {
                     return Err(ETIMEDOUT);
                 }
-                crate::task::processor::suspend_current_and_run_next();
+                        crate::task::processor::suspend_current_and_run_next();
             }
             return Ok(());
         }
@@ -399,6 +419,9 @@ impl NetSocketFile {
                 Ok(s.send_slice(&data[off..]).unwrap_or(0))
             })?;
             if sent == 0 {
+                if pending_unmasked_signal() {
+                    return Err(EINTR);
+                }
                 crate::task::processor::suspend_current_and_run_next();
                 continue;
             }
@@ -525,6 +548,9 @@ impl NetSocketFile {
                 crate::net::poll();
                 return Ok(data.len());
             }
+            if pending_unmasked_signal() {
+                return Err(EINTR);
+            }
             crate::task::processor::suspend_current_and_run_next();
         }
     }
@@ -558,6 +584,9 @@ impl NetSocketFile {
                     return Ok((n, ip, meta.endpoint.port));
                 }
                 return Ok((n, Ipv4Address::UNSPECIFIED, meta.endpoint.port));
+            }
+            if pending_unmasked_signal() {
+                return Err(EINTR);
             }
             crate::task::processor::suspend_current_and_run_next();
         }
@@ -668,7 +697,7 @@ enum Snapshot {
     ListenerOnly,
 }
 
-impl File for NetSocketFile {
+impl crate::fs::File for NetSocketFile {
     fn readable(&self) -> bool {
         true
     }
