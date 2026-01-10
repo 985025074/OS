@@ -65,6 +65,7 @@ pub struct NetSocketFile {
 pub struct SocketOptions {
     sndbuf: u32,
     rcvbuf: u32,
+    mcast_joined: bool,
 }
 
 impl NetSocketFile {
@@ -80,6 +81,7 @@ impl NetSocketFile {
             opts: Mutex::new(SocketOptions {
                 sndbuf: TCP_TX_BUF_LEN_IPERF as u32,
                 rcvbuf: TCP_RX_BUF_LEN_IPERF as u32,
+                mcast_joined: false,
             }),
         })
     }
@@ -99,6 +101,7 @@ impl NetSocketFile {
             opts: Mutex::new(SocketOptions {
                 sndbuf: UDP_TX_BUF_LEN as u32,
                 rcvbuf: UDP_RX_BUF_LEN as u32,
+                mcast_joined: false,
             }),
         })
     }
@@ -119,6 +122,14 @@ impl NetSocketFile {
 
     pub fn getsockopt_rcvbuf(&self) -> u32 {
         self.opts.lock().rcvbuf
+    }
+
+    pub fn set_multicast_joined(&self, joined: bool) {
+        self.opts.lock().mcast_joined = joined;
+    }
+
+    pub fn multicast_joined(&self) -> bool {
+        self.opts.lock().mcast_joined
     }
 
     pub fn kind(&self) -> NetSocketKind {
@@ -307,6 +318,7 @@ impl NetSocketFile {
                     opts: Mutex::new(SocketOptions {
                         sndbuf: TCP_TX_BUF_LEN_IPERF as u32,
                         rcvbuf: TCP_RX_BUF_LEN_IPERF as u32,
+                        mcast_joined: false,
                     }),
                 }));
             }

@@ -2,8 +2,8 @@ use alloc::sync::Arc;
 use core::cmp::min;
 use crate::{
     config::PAGE_SIZE,
-    fs::{File, OSInode, ext4_lock},
-    mm::{MapPermission, PTEFlags, translated_mutref},
+    fs::{File, OSInode, PseudoShmFile, ext4_lock},
+    mm::{MapPermission, PTEFlags, frame_alloc, translated_mutref},
     task::processor::current_process,
     trap::get_current_token,
 };
@@ -13,6 +13,8 @@ const PROT_WRITE: usize = 2;
 const PROT_EXEC: usize = 4;
 
 // Linux `mmap(2)` flags (subset).
+const MAP_SHARED: usize = 0x01;
+const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_STACK: usize = 0x20000;
@@ -30,13 +32,17 @@ fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
 
-fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
+fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     let process = current_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
         return None;
     }
-    let file = inner.fd_table[fd].as_ref()?.clone();
+    inner.fd_table[fd].clone()
+}
+
+fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
+    let file = get_fd_file(fd)?;
     file.as_any()
         .downcast_ref::<OSInode>()
         .map(|o| {
@@ -91,6 +97,24 @@ pub fn syscall_mmap(
     if len == 0 {
         return EINVAL;
     }
+    if (flags & MAP_SHARED) != 0 && (flags & MAP_PRIVATE) != 0 {
+        return EINVAL;
+    }
+    if fd < 0 && (flags & MAP_ANONYMOUS) == 0 {
+        return EINVAL;
+    }
+    if fd >= 0 && (off % PAGE_SIZE) != 0 {
+        return EINVAL;
+    }
+
+    let is_shared = (flags & MAP_SHARED) != 0;
+    let is_anon = fd < 0 || (flags & MAP_ANONYMOUS) != 0;
+    let file = if !is_anon && fd >= 0 {
+        get_fd_file(fd as usize)
+    } else {
+        None
+    };
+    let map_len = align_up(len, PAGE_SIZE);
 
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -107,13 +131,11 @@ pub fn syscall_mmap(
     } else {
         align_up(inner.mmap_next, PAGE_SIZE)
     };
-    let map_len = align_up(len, PAGE_SIZE);
     let Some(end) = start.checked_add(map_len) else {
         return ENOMEM;
     };
     let map_start = start;
     let map_end = end;
-    let is_anon = fd < 0 || (flags & MAP_ANONYMOUS) != 0;
     if is_anon && len >= LARGE_ANON_MMAP {
         let pid = process.getpid();
         log::info!(
@@ -178,17 +200,51 @@ pub fn syscall_mmap(
         inner.mmap_areas = new_areas;
     }
 
-    let map_ok = if is_anon {
+    if is_shared {
+        let frames = if let Some(file) = &file {
+            if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+                let Some(frames) = shm.shared_frames(off, map_len) else {
+                    return ENOMEM;
+                };
+                frames
+            } else {
+                let pages = map_len / PAGE_SIZE;
+                let mut frames = alloc::vec::Vec::with_capacity(pages);
+                for _ in 0..pages {
+                    let Some(frame) = frame_alloc() else {
+                        return ENOMEM;
+                    };
+                    frames.push(frame);
+                }
+                frames
+            }
+        } else {
+            let pages = map_len / PAGE_SIZE;
+            let mut frames = alloc::vec::Vec::with_capacity(pages);
+            for _ in 0..pages {
+                let Some(frame) = frame_alloc() else {
+                    return ENOMEM;
+                };
+                frames.push(frame);
+            }
+            frames
+        };
         inner
             .memory_set
-            .try_insert_lazy_area(map_start.into(), map_end.into(), perm)
+            .insert_shared_frames_area(map_start.into(), map_end.into(), perm, frames);
     } else {
-        inner
-            .memory_set
-            .try_insert_framed_area(map_start.into(), map_end.into(), perm)
-    };
-    if !map_ok {
-        return ENOMEM;
+        let map_ok = if is_anon {
+            inner
+                .memory_set
+                .try_insert_lazy_area(map_start.into(), map_end.into(), perm)
+        } else {
+            inner
+                .memory_set
+                .try_insert_framed_area(map_start.into(), map_end.into(), perm)
+        };
+        if !map_ok {
+            return ENOMEM;
+        }
     }
     if end > inner.mmap_next {
         inner.mmap_next = end;

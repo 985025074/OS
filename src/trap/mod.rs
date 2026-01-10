@@ -444,6 +444,16 @@ fn handle_user_exception(code: usize, stval: usize) {
             }
         }
     }
+    if let Some(sig) = match code {
+        ILLEGAL_INSTRUCTION => Some(4), // SIGILL
+        INSTRUCTION_PAGE_FAULT | LOAD_PAGE_FAULT | STORE_PAGE_FAULT => Some(11), // SIGSEGV
+        _ => None,
+    } {
+        if let Some(task) = crate::task::processor::current_task() {
+            task.borrow_mut().pending_signal = Some(sig);
+        }
+        return;
+    }
     log::warn!(
         "[user_exn] code={} ({}) sepc={:#x} stval={:#x}",
         code,

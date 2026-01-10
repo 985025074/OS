@@ -24,6 +24,10 @@ use crate::{
 };
 
 const AT_FDCWD: isize = -100;
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+const AT_SYMLINK_FOLLOW: usize = 0x400;
+const AT_NO_AUTOMOUNT: usize = 0x800;
+const AT_EMPTY_PATH: usize = 0x1000;
 
 const O_ACCMODE: usize = 0x3;
 const O_RDONLY: usize = 0x0;
@@ -1050,6 +1054,109 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
         return EACCES;
     }
     0
+}
+
+/// Linux `fchmod(2)` (syscall 52 on riscv64).
+pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
+    let Some(_file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if let Some(inode) = get_fd_inode(fd) {
+        let _ext4_guard = ext4_lock();
+        inode.set_mode(mode as u16);
+    }
+    0
+}
+
+/// Linux `fchmodat(2)` (syscall 53 on riscv64).
+pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
+    let token = get_current_token();
+    let path = translated_str(token, pathname as *const u8);
+    let _ignored_flags = flags;
+    if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+            return syscall_fchmod(dirfd as usize, mode);
+        }
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(name) = shm_object_name(abs) {
+            return if shm_get(name).is_some() { 0 } else { ENOENT };
+        }
+        return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
+    }
+
+    let _ext4_guard = ext4_lock();
+    let inode = match &at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(alloc::sync::Arc::clone(base))
+            } else {
+                base.find_path(rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+    let Some(inode) = inode else {
+        return ENOENT;
+    };
+    inode.set_mode(mode as u16);
+    0
+}
+
+/// Linux `fchown(2)` (syscall 55 on riscv64).
+pub fn syscall_fchown(fd: usize, _uid: usize, _gid: usize) -> isize {
+    if get_fd_file(fd).is_none() {
+        return EBADF;
+    }
+    0
+}
+
+/// Linux `fchownat(2)` (syscall 54 on riscv64).
+pub fn syscall_fchownat(dirfd: isize, pathname: usize, _uid: usize, _gid: usize, flags: usize) -> isize {
+    // Ignore ownership changes (no uid/gid model yet), but validate the path.
+    let token = get_current_token();
+    let path = translated_str(token, pathname as *const u8);
+
+    if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+            return if get_fd_file(dirfd as usize).is_some() { 0 } else { EBADF };
+        }
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(name) = shm_object_name(abs) {
+            return if shm_get(name).is_some() { 0 } else { ENOENT };
+        }
+        return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
+    }
+
+    let _ext4_guard = ext4_lock();
+    let inode = match &at {
+        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(alloc::sync::Arc::clone(base))
+            } else {
+                base.find_path(rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+    if inode.is_some() { 0 } else { ENOENT }
 }
 
 /// Linux `readlinkat(2)` (syscall 78 on riscv64).

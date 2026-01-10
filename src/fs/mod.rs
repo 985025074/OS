@@ -29,4 +29,4 @@ pub use net_socket::{NetSocketFile, NetSocketKind};
 pub use stdio::{Stdin, Stdout};
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub use pseudo::PseudoBlock;
-pub use pseudo::{shm_create, shm_get, shm_list, shm_remove};
+pub(crate) use pseudo::{shm_create, shm_get, shm_list, shm_remove};

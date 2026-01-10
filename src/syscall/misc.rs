@@ -231,12 +231,17 @@ struct RLimit64 {
 }
 
 const RLIMIT_STACK: usize = 3;
+const RLIMIT_CORE: usize = 4;
 const RLIMIT_NOFILE: usize = 7;
 
 fn rlimit_for_resource(resource: usize) -> (u64, u64) {
     if resource == RLIMIT_STACK {
         // Keep default thread stacks modest to avoid huge eager mmap costs.
         (1 * 1024 * 1024, 1 * 1024 * 1024)
+    } else if resource == RLIMIT_CORE {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        (inner.rlimit_core_cur, inner.rlimit_core_max)
     } else if resource == RLIMIT_NOFILE {
         let process = current_process();
         let inner = process.borrow_mut();
@@ -256,7 +261,12 @@ pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_l
         if new.rlim_cur > new.rlim_max {
             return EINVAL;
         }
-        if _resource == RLIMIT_NOFILE {
+        if _resource == RLIMIT_CORE {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner.rlimit_core_cur = new.rlim_cur;
+            inner.rlimit_core_max = new.rlim_max;
+        } else if _resource == RLIMIT_NOFILE {
             let process = current_process();
             let mut inner = process.borrow_mut();
             inner.rlimit_nofile_cur = new.rlim_cur;
@@ -299,7 +309,12 @@ pub fn syscall_setrlimit(_resource: usize, _rlim: usize) -> isize {
         if new.rlim_cur > new.rlim_max {
             return EINVAL;
         }
-        if _resource == RLIMIT_NOFILE {
+        if _resource == RLIMIT_CORE {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner.rlimit_core_cur = new.rlim_cur;
+            inner.rlimit_core_max = new.rlim_max;
+        } else if _resource == RLIMIT_NOFILE {
             let process = current_process();
             let mut inner = process.borrow_mut();
             inner.rlimit_nofile_cur = new.rlim_cur;

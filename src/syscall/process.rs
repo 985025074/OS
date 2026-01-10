@@ -249,12 +249,17 @@ pub fn syscall_vfork() -> isize {
     }
 }
 
+fn is_core_dump_signal(sig: i32) -> bool {
+    matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
+}
+
 pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {
     const WNOHANG: usize = 0x00000001;
     const ECHILD: isize = -10;
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
     let mut temp_signal: Option<i32> = None;
+    let mut temp_coredump = false;
     loop {
         let cur_process = current_process();
         let (has_matching_child, zombie_pid) = {
@@ -281,6 +286,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                             .signals
                             .check_error()
                             .map(|(code, _)| -code);
+                        temp_coredump = temp_signal
+                            .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
+                            .unwrap_or(false);
                         found = Some((index, child.pid.0));
                         break;
                     }
@@ -303,7 +311,11 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                 // - normal exit: (code & 0xff) << 8
                 // - signaled: signal number in low 7 bits
                 let status = if let Some(sig) = temp_signal {
-                    sig & 0x7f
+                    let mut status = sig & 0x7f;
+                    if temp_coredump {
+                        status |= 0x80;
+                    }
+                    status
                 } else {
                     (((temp_exit_code as u32) & 0xff) << 8) as i32
                 };

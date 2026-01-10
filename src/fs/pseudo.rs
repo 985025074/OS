@@ -8,7 +8,8 @@ use core::any::Any;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::mm::UserBuffer;
+use crate::config::PAGE_SIZE;
+use crate::mm::{frame_alloc, FrameTracker, UserBuffer};
 
 use super::File;
 
@@ -149,28 +150,63 @@ impl File for RtcFile {
     }
 }
 
-type ShmData = Arc<Mutex<Vec<u8>>>;
+pub(crate) struct ShmDataInner {
+    len: usize,
+    frames: Vec<FrameTracker>,
+}
+
+impl ShmDataInner {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            frames: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn ensure_len(&mut self, new_len: usize) -> bool {
+        let pages = (new_len + PAGE_SIZE - 1) / PAGE_SIZE;
+        if pages > self.frames.len() {
+            let needed = pages - self.frames.len();
+            for _ in 0..needed {
+                let Some(frame) = frame_alloc() else {
+                    return false;
+                };
+                self.frames.push(frame);
+            }
+        } else if pages < self.frames.len() {
+            self.frames.truncate(pages);
+        }
+        self.len = new_len;
+        true
+    }
+}
+
+pub(crate) type ShmData = Arc<Mutex<ShmDataInner>>;
 
 lazy_static! {
     static ref SHM_OBJECTS: Mutex<BTreeMap<String, ShmData>> = Mutex::new(BTreeMap::new());
 }
 
-pub fn shm_list() -> Vec<String> {
+pub(crate) fn shm_list() -> Vec<String> {
     SHM_OBJECTS.lock().keys().cloned().collect()
 }
 
-pub fn shm_get(name: &str) -> Option<ShmData> {
+pub(crate) fn shm_get(name: &str) -> Option<ShmData> {
     SHM_OBJECTS.lock().get(name).cloned()
 }
 
-pub fn shm_create(name: &str) -> ShmData {
+pub(crate) fn shm_create(name: &str) -> ShmData {
     let mut map = SHM_OBJECTS.lock();
     map.entry(String::from(name))
-        .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+        .or_insert_with(|| Arc::new(Mutex::new(ShmDataInner::new())))
         .clone()
 }
 
-pub fn shm_remove(name: &str) -> bool {
+pub(crate) fn shm_remove(name: &str) -> bool {
     SHM_OBJECTS.lock().remove(name).is_some()
 }
 
@@ -237,11 +273,25 @@ impl PseudoShmFile {
 
     pub fn truncate(&self, new_len: usize) {
         let mut data = self.data.lock();
-        data.resize(new_len, 0);
+        let _ = data.ensure_len(new_len);
         let mut off = self.offset.lock();
         if *off > new_len {
             *off = new_len;
         }
+    }
+
+    pub fn shared_frames(&self, offset: usize, len: usize) -> Option<Vec<FrameTracker>> {
+        let end = offset.checked_add(len)?;
+        let mut data = self.data.lock();
+        if !data.ensure_len(end) {
+            return None;
+        }
+        let start_page = offset / PAGE_SIZE;
+        let end_page = (end + PAGE_SIZE - 1) / PAGE_SIZE;
+        if end_page < start_page || end_page > data.frames.len() {
+            return None;
+        }
+        Some(data.frames[start_page..end_page].iter().cloned().collect())
     }
 }
 
@@ -257,41 +307,78 @@ impl File for PseudoShmFile {
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut off = self.offset.lock();
         let data = self.data.lock();
-        if *off >= data.len() {
+        let mut cur_off = *off;
+        if cur_off >= data.len() {
             return 0;
         }
         let mut total = 0usize;
         for slice in buf.buffers.iter_mut() {
-            if *off >= data.len() {
+            if cur_off >= data.len() {
                 break;
             }
-            let n = core::cmp::min(slice.len(), data.len() - *off);
-            slice[..n].copy_from_slice(&data[*off..*off + n]);
-            *off += n;
-            total += n;
-            if n < slice.len() {
+            let n = core::cmp::min(slice.len(), data.len() - cur_off);
+            let mut remaining = n;
+            let mut dst_off = 0usize;
+            while remaining > 0 {
+                let page = cur_off / PAGE_SIZE;
+                let in_page = cur_off % PAGE_SIZE;
+                if page >= data.frames.len() {
+                    break;
+                }
+                let frame = data.frames[page].ppn.get_bytes_array();
+                let chunk = core::cmp::min(remaining, PAGE_SIZE - in_page);
+                slice[dst_off..dst_off + chunk]
+                    .copy_from_slice(&frame[in_page..in_page + chunk]);
+                cur_off += chunk;
+                dst_off += chunk;
+                remaining -= chunk;
+            }
+            total += dst_off;
+            if dst_off < slice.len() {
                 break;
             }
         }
+        *off = cur_off;
         total
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
         let mut off = self.offset.lock();
         let mut data = self.data.lock();
+        let mut cur_off = *off;
         let mut total = 0usize;
         for slice in buf.buffers.iter() {
             if slice.is_empty() {
                 continue;
             }
-            let end = off.saturating_add(slice.len());
+            let end = cur_off.saturating_add(slice.len());
             if end > data.len() {
-                data.resize(end, 0);
+                if !data.ensure_len(end) {
+                    break;
+                }
             }
-            data[*off..end].copy_from_slice(slice);
-            *off = end;
-            total += slice.len();
+            let mut remaining = slice.len();
+            let mut src_off = 0usize;
+            while remaining > 0 {
+                let page = cur_off / PAGE_SIZE;
+                let in_page = cur_off % PAGE_SIZE;
+                if page >= data.frames.len() {
+                    break;
+                }
+                let frame = data.frames[page].ppn.get_bytes_array();
+                let chunk = core::cmp::min(remaining, PAGE_SIZE - in_page);
+                frame[in_page..in_page + chunk]
+                    .copy_from_slice(&slice[src_off..src_off + chunk]);
+                cur_off += chunk;
+                src_off += chunk;
+                remaining -= chunk;
+            }
+            total += src_off;
+            if src_off < slice.len() {
+                break;
+            }
         }
+        *off = cur_off;
         total
     }
 

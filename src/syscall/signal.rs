@@ -9,8 +9,19 @@ use crate::{
     task::{
         block_sleep::add_timer,
         manager::{pid2process, wakeup_task},
-        processor::{block_current_and_run_next, current_process, current_task},
-        signal::{RtSigAction, SignalAction, RT_SIG_MAX, SIG_DFL, SIG_IGN, kill, set_signal, set_signal_mask},
+        processor::{block_current_and_run_next, current_process, current_task, exit_current_and_run_next},
+        signal::{
+            kill,
+            kill_current,
+            set_signal,
+            set_signal_mask,
+            RtSigAction,
+            SignalAction,
+            SignalFlags,
+            RT_SIG_MAX,
+            SIG_DFL,
+            SIG_IGN,
+        },
         task_block::{SigSavedContext, TaskControlBlock},
     },
     time::get_time_ms,
@@ -572,7 +583,19 @@ pub fn maybe_deliver_signal() {
             action.mask
         );
     }
-    if action.handler == SIG_DFL || action.handler == SIG_IGN {
+    if action.handler == SIG_IGN {
+        return;
+    }
+    if action.handler == SIG_DFL {
+        if signum <= crate::task::signal::MAX_SIG {
+            if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
+                if let Some((errno, msg)) = flag.check_error() {
+                    let _ = kill_current(signum as i32);
+                    crate::println!("[kernel] {}", msg);
+                    exit_current_and_run_next(errno);
+                }
+            }
+        }
         return;
     }
 

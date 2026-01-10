@@ -445,6 +445,9 @@ pub struct ProcessControlBlockInner {
     /// Per-process RLIMIT_NOFILE (soft/hard).
     pub rlimit_nofile_cur: u64,
     pub rlimit_nofile_max: u64,
+    /// Per-process RLIMIT_CORE (soft/hard).
+    pub rlimit_core_cur: u64,
+    pub rlimit_core_max: u64,
     pub cwd: String,
     pub heap_start: usize,
     pub brk: usize,
@@ -563,6 +566,8 @@ impl ProcessControlBlock {
                 fd_flags: vec![0; 3],
                 rlimit_nofile_cur: 1024,
                 rlimit_nofile_max: 1024,
+                rlimit_core_cur: 8 * 1024 * 1024,
+                rlimit_core_max: 8 * 1024 * 1024,
                 cwd: String::from("/user"),
                 heap_start,
                 brk: heap_start,
@@ -796,6 +801,8 @@ impl ProcessControlBlock {
                 fd_flags: new_fd_flags,
                 rlimit_nofile_cur: parent.rlimit_nofile_cur,
                 rlimit_nofile_max: parent.rlimit_nofile_max,
+                rlimit_core_cur: parent.rlimit_core_cur,
+                rlimit_core_max: parent.rlimit_core_max,
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,
                 brk: parent.brk,

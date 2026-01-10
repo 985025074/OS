@@ -2,11 +2,12 @@ use alloc::sync::Arc;
 use core::mem::size_of;
 
 use crate::fs::{File, NetSocketFile};
-use crate::mm::{read_user_value, write_user_value};
+use crate::mm::{read_user_value, write_user_value, try_copy_to_user, try_read_user_value};
 use crate::task::processor::current_process;
 use crate::trap::get_current_token;
 
 const AF_INET: u16 = 2;
+const SOL_IP: usize = 0;
 
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
@@ -18,6 +19,8 @@ const FD_CLOEXEC: u32 = 1;
 const SOL_SOCKET: usize = 1;
 const SO_SNDBUF: usize = 7;
 const SO_RCVBUF: usize = 8;
+const MCAST_JOIN_GROUP: usize = 42;
+const MCAST_LEAVE_GROUP: usize = 45;
 
 const EINVAL: isize = -22;
 const EBADF: isize = -9;
@@ -27,6 +30,7 @@ const ENOTSOCK: isize = -88;
 const EOPNOTSUPP: isize = -95;
 const EISCONN: isize = -106;
 const EMFILE: isize = -24;
+const EADDRNOTAVAIL: isize = -99;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,7 +57,9 @@ fn parse_sockaddr_in(user_ptr: usize, len: usize) -> Result<(smoltcp::wire::Ipv4
     let token = get_current_token();
     let sa = read_user_value(token, user_ptr as *const SockAddrIn);
     if sa.sin_family != AF_INET {
-        return Err(EAFNOSUPPORT);
+        if sa.sin_family != 0 {
+            return Err(EAFNOSUPPORT);
+        }
     }
     let port = u16::from_be(sa.sin_port);
     let ip_raw = u32::from_be(sa.sin_addr);
@@ -189,6 +195,27 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
         Some(s) => s,
         None => return ENOTSOCK,
     };
+    // Validate user-provided address buffer (when present) before blocking in accept().
+    if addr != 0 {
+        if addrlen == 0 {
+            return EINVAL;
+        }
+        let token = get_current_token();
+        let Some(len) = try_read_user_value::<u32>(token, addrlen as *const u32) else {
+            return EINVAL;
+        };
+        if (len as usize) < size_of::<SockAddrIn>() {
+            return EINVAL;
+        }
+        if try_copy_to_user(token, addr as *mut u8, &[0u8]).is_err() {
+            return EINVAL;
+        }
+    }
+    match sock.kind() {
+        crate::fs::NetSocketKind::TcpStream => return EINVAL,
+        crate::fs::NetSocketKind::Udp => return EOPNOTSUPP,
+        crate::fs::NetSocketKind::TcpListener => {}
+    }
     let new_sock = match sock.accept() {
         Ok(s) => s,
         Err(e) => {
@@ -412,25 +439,47 @@ pub fn syscall_setsockopt(
         Some(s) => s,
         None => return ENOTSOCK,
     };
-    if level != SOL_SOCKET {
+    if level == SOL_SOCKET {
+        if optval == 0 || optlen < size_of::<i32>() {
+            return EINVAL;
+        }
+        let token = get_current_token();
+        let v = read_user_value(token, optval as *const i32);
+        if v <= 0 {
+            return 0;
+        }
+        let v = v as u32;
+        if crate::debug_config::DEBUG_NET && (optname == SO_SNDBUF || optname == SO_RCVBUF) {
+            crate::println!(
+                "[net] pid={} setsockopt(fd={}, opt={}) = {}",
+                current_process().pid.0,
+                fd,
+                optname,
+                v
+            );
+        }
+        match optname {
+            SO_SNDBUF => sock.set_sockbuf(Some(v), None),
+            SO_RCVBUF => sock.set_sockbuf(None, Some(v)),
+            _ => {}
+        }
         return 0;
     }
-    if optval == 0 || optlen < size_of::<i32>() {
-        return EINVAL;
-    }
-    let token = get_current_token();
-    let v = read_user_value(token, optval as *const i32);
-    if v <= 0 {
-        return 0;
-    }
-    let v = v as u32;
-    if crate::debug_config::DEBUG_NET && (optname == SO_SNDBUF || optname == SO_RCVBUF) {
-        crate::println!("[net] pid={} setsockopt(fd={}, opt={}) = {}", current_process().pid.0, fd, optname, v);
-    }
-    match optname {
-        SO_SNDBUF => sock.set_sockbuf(Some(v), None),
-        SO_RCVBUF => sock.set_sockbuf(None, Some(v)),
-        _ => {}
+    if level == SOL_IP {
+        match optname {
+            MCAST_JOIN_GROUP => {
+                sock.set_multicast_joined(true);
+                return 0;
+            }
+            MCAST_LEAVE_GROUP => {
+                if sock.multicast_joined() {
+                    sock.set_multicast_joined(false);
+                    return 0;
+                }
+                return EADDRNOTAVAIL;
+            }
+            _ => return 0,
+        }
     }
     0
 }

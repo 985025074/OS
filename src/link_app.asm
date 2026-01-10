@@ -320,9 +320,19 @@ app_31_start:
 app_31_end:
 .section .rodata
 .align 3
+app_32_name:
+    .asciz "basename"
+.align 3
+.section .data
+app_32_start:
+    .incbin "./results/basename.bin"
+.align 3
+app_32_end:
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 32
+    .quad 33
     .quad app_0_start
     .quad app_0_end
     .quad app_0_name
@@ -419,3 +429,6 @@ num_user_apps:
     .quad app_31_start
     .quad app_31_end
     .quad app_31_name
+    .quad app_32_start
+    .quad app_32_end
+    .quad app_32_name
