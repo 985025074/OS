@@ -82,6 +82,12 @@ restore:
     ld sp, 2*8(sp)
     sret
 
+    .align 2
+    .globl sigreturn_trampoline
+sigreturn_trampoline:
+    li a7, 139
+    ecall
+
     .section .text
     .align 2
 alltraps_k:

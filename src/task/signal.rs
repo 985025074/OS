@@ -1,4 +1,7 @@
 pub const MAX_SIG: usize = 31;
+pub const RT_SIG_MAX: usize = 64;
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
 use bitflags::bitflags;
 
 use crate::{
@@ -86,6 +89,15 @@ impl Default for SignalAction {
             mask: SignalFlags { bits: 0 },
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RtSigAction {
+    pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
+    pub mask: u64,
 }
 
 pub struct SignalActions {

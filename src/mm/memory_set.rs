@@ -4,7 +4,9 @@ use super::{FrameTracker, frame_alloc};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE, phys_mem_end};
+use crate::config::{
+    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE, phys_mem_end,
+};
 use crate::println;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -125,10 +127,18 @@ impl MemorySet {
             PTEFlags::R | PTEFlags::X,
         );
     }
+
+    fn map_sigreturn_trampoline_user(&mut self) {
+        self.page_table.map(
+            VirtAddr::from(SIGRETURN_TRAMPOLINE).into(),
+            PhysAddr::from(strampoline as usize).into(),
+            PTEFlags::R | PTEFlags::X | PTEFlags::U,
+        );
+    }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
-        // map trampoline
+        // map trampoline (kernel-only)
         memory_set.map_trampoline();
         // map kernel sections
         println!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
@@ -207,8 +217,9 @@ impl MemorySet {
     /// 用户占 被设计为 程序地址 (虚拟地址) 的最高端.
     pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize, ElfAux) {
         let mut memory_set = Self::new_bare();
-        // map trampoline
+        // map trap trampoline (kernel-only) and sigreturn trampoline (user accessible)
         memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
         // map program headers of elf, with U flag
         let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
         let load_bias: usize = match elf.header.pt2.type_().as_type() {
@@ -305,7 +316,7 @@ impl MemorySet {
         memory_set.push(
             MapArea::new(
                 TRAP_CONTEXT.into(),
-                TRAMPOLINE.into(),
+                SIGRETURN_TRAMPOLINE.into(),
                 MapType::Framed,
                 MapPermission::R | MapPermission::W,
             ),
@@ -401,6 +412,7 @@ impl MemorySet {
     ) -> (Self, usize, usize, usize, ElfAux, usize) {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
 
         let main = xmas_elf::ElfFile::new(main_elf).unwrap();
         let interp = xmas_elf::ElfFile::new(interp_elf).unwrap();
@@ -454,7 +466,7 @@ impl MemorySet {
         memory_set.push(
             MapArea::new(
                 TRAP_CONTEXT.into(),
-                TRAMPOLINE.into(),
+                SIGRETURN_TRAMPOLINE.into(),
                 MapType::Framed,
                 MapPermission::R | MapPermission::W,
             ),
@@ -471,6 +483,7 @@ impl MemorySet {
     pub fn from_existed_user_cow(user_space: &mut MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
 
         let mut parent_updates: Vec<(VirtPageNum, PTEFlags)> = Vec::new();
 
@@ -895,7 +908,14 @@ impl MemorySet {
 
     pub fn clone(&self) -> Self {
         let mut new_memory_set = Self::new_bare();
+        let has_user = self
+            .areas
+            .iter()
+            .any(|area| area.map_perm.contains(MapPermission::U));
         new_memory_set.map_trampoline();
+        if has_user {
+            new_memory_set.map_sigreturn_trampoline_user();
+        }
         for area in &self.areas {
             let mut new_area = MapArea::new(
                 VirtAddr::from(area.vpn_range.get_start()),

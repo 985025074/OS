@@ -13,7 +13,7 @@ use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
 use crate::task::manager::{add_task, insert_into_pid2process, select_hart_for_new_task};
 use crate::task::semaphore::Semaphore;
-use crate::task::signal::{SignalActions, SignalFlags};
+use crate::task::signal::{RtSigAction, SignalActions, SignalFlags, RT_SIG_MAX};
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
@@ -440,6 +440,11 @@ pub struct ProcessControlBlockInner {
     pub start_time_ms: usize,
     //
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    /// Per-fd flags (e.g., FD_CLOEXEC, O_NONBLOCK).
+    pub fd_flags: Vec<u32>,
+    /// Per-process RLIMIT_NOFILE (soft/hard).
+    pub rlimit_nofile_cur: u64,
+    pub rlimit_nofile_max: u64,
     pub cwd: String,
     pub heap_start: usize,
     pub brk: usize,
@@ -451,6 +456,8 @@ pub struct ProcessControlBlockInner {
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
     pub handling_signal: i32,
+    /// Linux rt_sigaction handlers indexed by signal number.
+    pub rt_sig_handlers: Vec<RtSigAction>,
     /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
     pub sched_policy: i32,
     pub sched_priority: i32,
@@ -471,12 +478,24 @@ impl ProcessControlBlockInner {
         self.memory_set.token()
     }
 
-    pub fn alloc_fd(&mut self) -> usize {
+    pub fn alloc_fd(&mut self) -> Option<usize> {
+        let limit = self.rlimit_nofile_cur as usize;
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            fd
+            if fd >= limit {
+                return None;
+            }
+            if fd >= self.fd_flags.len() {
+                self.fd_flags.resize(self.fd_table.len(), 0);
+            }
+            self.fd_flags[fd] = 0;
+            Some(fd)
         } else {
+            if self.fd_table.len() >= limit {
+                return None;
+            }
             self.fd_table.push(None);
-            self.fd_table.len() - 1
+            self.fd_flags.push(0);
+            Some(self.fd_table.len() - 1)
         }
     }
 
@@ -541,6 +560,9 @@ impl ProcessControlBlock {
                     // 2 -> stderr
                     Some(Arc::new(Stdout)),
                 ],
+                fd_flags: vec![0; 3],
+                rlimit_nofile_cur: 1024,
+                rlimit_nofile_max: 1024,
                 cwd: String::from("/user"),
                 heap_start,
                 brk: heap_start,
@@ -552,6 +574,7 @@ impl ProcessControlBlock {
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
+                rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
                 sched_policy: 0,
                 sched_priority: 0,
                 tasks: Vec::new(),
@@ -727,6 +750,7 @@ impl ProcessControlBlock {
         assert_eq!(parent.thread_count(), 1);
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
+        let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
         // Fork address space using copy-on-write for user pages to avoid huge copies
@@ -736,12 +760,17 @@ impl ProcessControlBlock {
         let pid = pid_alloc();
         // copy fd table
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        let mut new_fd_flags: Vec<u32> = Vec::new();
         for fd in parent.fd_table.iter() {
             if let Some(file) = fd {
                 new_fd_table.push(Some(file.clone()));
             } else {
                 new_fd_table.push(None);
             }
+        }
+        new_fd_flags.extend(parent.fd_flags.iter().copied());
+        if new_fd_flags.len() < new_fd_table.len() {
+            new_fd_flags.resize(new_fd_table.len(), 0);
         }
         // Remember parent's user-stack base for the main thread.
         let parent_ustack_base = parent
@@ -764,6 +793,9 @@ impl ProcessControlBlock {
                 argv,
                 start_time_ms: crate::time::get_time_ms(),
                 fd_table: new_fd_table,
+                fd_flags: new_fd_flags,
+                rlimit_nofile_cur: parent.rlimit_nofile_cur,
+                rlimit_nofile_max: parent.rlimit_nofile_max,
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,
                 brk: parent.brk,
@@ -775,6 +807,7 @@ impl ProcessControlBlock {
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
+                rt_sig_handlers,
                 sched_policy,
                 sched_priority,
                 tasks: Vec::new(),

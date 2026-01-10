@@ -1,9 +1,9 @@
 use crate::{
     config::MAX_HARTS,
-    mm::write_user_value,
     println,
     sbi::shutdown,
     task::{
+        block_sleep::schedule_tid_clear,
         INITPROC,
         id::TaskUserRes,
         manager::{
@@ -89,7 +89,14 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     task
 }
 pub fn current_process() -> Arc<ProcessControlBlock> {
-    current_task().unwrap().process.upgrade().unwrap()
+    current_task()
+        .and_then(|task| task.process.upgrade())
+        .unwrap_or_else(|| {
+            if DEBUG_SCHED {
+                log::warn!("[sched] no current task, fall back to init process");
+            }
+            INITPROC.clone()
+        })
 }
 
 // todo
@@ -216,6 +223,8 @@ pub fn idle_task() {
                     task_inner.task_cx.sp
                 );
             }
+            // Keep kernel tp (hart id) in the trap context in sync for migrations.
+            task_inner.get_trap_cx().kernel_tp = hart_id();
             task.mark_on_cpu(hart_id());
             task_inner.task_status = TaskStatus::Running;
 
@@ -384,43 +393,61 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
     // This task will never be scheduled again; ensure it is considered off CPU.
     task.clear_on_cpu();
-    let process = task.process.upgrade().unwrap();
+    let Some(process) = task.process.upgrade() else {
+        if DEBUG_SCHED {
+            log::warn!("[exit] task lost process; dropping task and scheduling idle");
+        }
+        // Defer dropping the task until after switching to idle to avoid freeing
+        // its kernel stack while still running on it.
+        local_processor().lock().set_pending_drop(task);
+        let mut _unused = TaskContext::new();
+        schedule(&mut _unused as *mut _);
+        return;
+    };
 
     // Extract tid in a separate scope to release the borrow early.
     // Also drop TaskUserRes *after* releasing the TCB lock to avoid deadlocks with sys_waittid.
-    let (tid, res_to_drop, join_waiters, clear_child_tid) = {
+    let (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head) = {
         let mut task_inner = task.borrow_mut();
         task_inner.exit_code = Some(exit_code);
-        let tid = task_inner
-            .res
-            .as_ref()
-            .expect("task user resource should exist before exit")
-            .tid;
+        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         let res_to_drop = task_inner.res.take();
         let clear_child_tid = task_inner.clear_child_tid.take();
+        let robust_list_head = task_inner.robust_list_head;
         let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
-        (tid, res_to_drop, join_waiters, clear_child_tid)
+        (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head)
     }; // task_inner dropped here
 
     let clear_child_tid_addr = clear_child_tid;
     let is_linux_thread = clear_child_tid_addr.is_some();
 
+    let token = {
+        let inner = process.borrow_mut();
+        inner.memory_set.token()
+    };
+
+    if robust_list_head != 0 {
+        let linux_tid = crate::syscall::misc::encode_linux_tid(process.getpid(), tid) as u32;
+        crate::syscall::robust_list::exit_robust_list(
+            process.getpid(),
+            token,
+            robust_list_head,
+            linux_tid,
+        );
+    }
+
     // Linux pthreads expect CLONE_CHILD_CLEARTID/set_tid_address semantics:
     // clear *ctid to 0 and wake any futex waiters.
+    const CLEAR_CHILD_TID_DELAY_MS: usize = 10;
     if let Some(ctid) = clear_child_tid_addr {
-        let token = {
-            let inner = process.borrow_mut();
-            inner.memory_set.token()
-        };
-        write_user_value(token, ctid as *mut i32, &0);
-        let _ = crate::syscall::futex::futex_wake(process.getpid(), ctid, 1);
+        schedule_tid_clear(process.getpid(), ctid, CLEAR_CHILD_TID_DELAY_MS);
     }
     drop(res_to_drop);
     for waiter in join_waiters {
         wakeup_task(waiter);
     }
 
-    if tid != 0 {
+    if tid != 0 && tid != usize::MAX {
         if DEBUG_PTHREAD {
             log::debug!(
                 "[thread_exit] pid={} tid={} ctid={:#x} linux_thread={}",
@@ -546,6 +573,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         process_inner.memory_set.recycle_data_pages();
         // drop file descriptors
         process_inner.fd_table.clear();
+        process_inner.fd_flags.clear();
         // Remove all tasks except for the main thread itself.
         // This is because we are still using the kstack under the TCB
         // of the main thread. This TCB, including its kstack, will be

@@ -421,6 +421,24 @@ pub struct TaskControlBlockInner {
     pub join_waiters: VecDeque<Arc<TaskControlBlock>>,
     /// Linux `CLONE_CHILD_CLEARTID`/`set_tid_address` target address (user VA).
     pub clear_child_tid: Option<usize>,
+    /// Linux robust futex list head (user VA) and length.
+    pub robust_list_head: usize,
+    pub robust_list_len: usize,
+    /// Pending POSIX signal for this thread (best-effort, single-slot).
+    pub pending_signal: Option<usize>,
+    /// Signal mask for this thread (bitmask of blocked signals).
+    pub signal_mask: u64,
+    /// Saved user context when running a signal handler.
+    pub sig_saved_ctx: Option<SigSavedContext>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SigSavedContext {
+    pub trap_cx: TrapContext,
+    pub mask: u64,
+    pub ucontext_ptr: usize,
+    pub uses_ucontext: bool,
+    pub signum: usize,
 }
 
 impl TaskControlBlockInner {
@@ -459,6 +477,11 @@ impl TaskControlBlock {
                 exit_code: None,
                 join_waiters: VecDeque::new(),
                 clear_child_tid: None,
+                robust_list_head: 0,
+                robust_list_len: 0,
+                pending_signal: None,
+                signal_mask: 0,
+                sig_saved_ctx: None,
             }),
         })
     }
@@ -498,6 +521,11 @@ impl TaskControlBlock {
                 exit_code: None,
                 join_waiters: VecDeque::new(),
                 clear_child_tid: None,
+                robust_list_head: 0,
+                robust_list_len: 0,
+                pending_signal: None,
+                signal_mask: 0,
+                sig_saved_ctx: None,
             }),
         })
     }

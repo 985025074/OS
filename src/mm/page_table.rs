@@ -3,7 +3,7 @@
 use crate::{config::PAGE_SIZE, mm::PhysAddr};
 
 use super::{FrameTracker, MapPermission, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
-use crate::task::processor::current_process;
+use crate::task::processor::current_task;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -206,13 +206,18 @@ impl PageTable {
 }
 
 fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool {
-    if token != crate::trap::get_current_token() {
+    let Some(task) = current_task() else {
         return false;
-    }
-    let process = current_process();
+    };
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
     let Some(mut inner) = process.try_borrow_mut() else {
         return false;
     };
+    if token != inner.memory_set.token() {
+        return false;
+    }
     inner.memory_set.resolve_lazy_fault(va, access)
 }
 
@@ -297,6 +302,50 @@ pub fn copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) {
     }
 }
 
+/// Copy bytes from user space into a kernel buffer.
+///
+/// Returns `Err(())` if any user page in the range is unmapped.
+pub fn try_copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) -> Result<(), ()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = src as usize;
+    let end = start.checked_add(dst.len()).ok_or(())?;
+    let mut written = 0usize;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => {
+                if try_resolve_lazy_page(token, start, MapPermission::R) {
+                    match page_table.translate(vpn) {
+                        Some(pte) if pte.is_valid() => pte,
+                        _ => return Err(()),
+                    }
+                } else {
+                    return Err(());
+                }
+            }
+        };
+        let ppn = pte.ppn();
+        let pa: PhysAddr = ppn.into();
+        let page_off = start_va.page_offset();
+        let n = min(PAGE_SIZE - page_off, end - start);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (pa.0 + page_off) as *const u8,
+                dst.as_mut_ptr().add(written),
+                n,
+            );
+        }
+        start += n;
+        written += n;
+    }
+    Ok(())
+}
+
 /// Copy bytes from a kernel buffer into user space.
 ///
 /// Panics if any user page in the range is unmapped.
@@ -337,6 +386,50 @@ pub fn copy_to_user(token: usize, dst: *mut u8, src: &[u8]) {
     }
 }
 
+/// Copy bytes from a kernel buffer into user space.
+///
+/// Returns `Err(())` if any user page in the range is unmapped.
+pub fn try_copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = dst as usize;
+    let end = start.checked_add(src.len()).ok_or(())?;
+    let mut read = 0usize;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => {
+                if try_resolve_lazy_page(token, start, MapPermission::W) {
+                    match page_table.translate(vpn) {
+                        Some(pte) if pte.is_valid() => pte,
+                        _ => return Err(()),
+                    }
+                } else {
+                    return Err(());
+                }
+            }
+        };
+        let ppn = pte.ppn();
+        let pa: PhysAddr = ppn.into();
+        let page_off = start_va.page_offset();
+        let n = min(PAGE_SIZE - page_off, end - start);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(read),
+                (pa.0 + page_off) as *mut u8,
+                n,
+            );
+        }
+        start += n;
+        read += n;
+    }
+    Ok(())
+}
+
 pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     let mut value = MaybeUninit::<T>::uninit();
     let dst_bytes = unsafe {
@@ -346,11 +439,29 @@ pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     unsafe { value.assume_init() }
 }
 
+pub fn try_read_user_value<T: Copy>(token: usize, src: *const T) -> Option<T> {
+    let mut value = MaybeUninit::<T>::uninit();
+    let dst_bytes = unsafe {
+        core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
+    };
+    if try_copy_from_user(token, src as *const u8, dst_bytes).is_err() {
+        return None;
+    }
+    Some(unsafe { value.assume_init() })
+}
+
 pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
     let src_bytes = unsafe {
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };
     copy_to_user(token, dst as *mut u8, src_bytes);
+}
+
+pub fn try_write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) -> Result<(), ()> {
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
+    };
+    try_copy_to_user(token, dst as *mut u8, src_bytes)
 }
 /// translate a single pointer
 pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {

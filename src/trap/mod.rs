@@ -134,6 +134,26 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             if try_handle_kernel_page_fault(c, stval) {
                 return;
             }
+            if DEBUG_TRAP {
+                let satp = riscv::register::satp::read().bits();
+                let sstatus_bits = sstatus::read().bits();
+                let stvec_bits = riscv::register::stvec::read().bits();
+                let sp: usize;
+                unsafe { asm!("mv {}, sp", out(reg) sp) };
+                let ra = trap_cx.x[1];
+                log::error!(
+                    "[kpf] cause={:?} scause={:#x} stval={:#x} sepc={:#x} sstatus={:#x} satp={:#x} stvec={:#x} sp={:#x} ra={:#x}",
+                    c,
+                    scause.bits(),
+                    stval,
+                    trap_cx.sepc,
+                    sstatus_bits,
+                    satp,
+                    stvec_bits,
+                    sp,
+                    ra
+                );
+            }
             panic!(
                 "Kernel page fault: cause = {:?}, sepc = {:#x}, stval = {:#x}",
                 c,
@@ -285,6 +305,7 @@ pub fn trap_handler() {
     // This avoids long-running syscall-heavy workloads (e.g., hackbench fork storms)
     // from starving `sleep()/nanosleep()` wakeups.
     check_timer();
+    crate::syscall::signal::maybe_deliver_signal();
     trap_return();
 }
 
@@ -320,6 +341,11 @@ fn handle_user_exception(code: usize, stval: usize) {
         Some(u64::from_le_bytes(bytes))
     }
 
+    if code == INSTRUCTION_PAGE_FAULT && stval == 0 {
+        if crate::syscall::signal::try_sigreturn_from_fault() {
+            return;
+        }
+    }
     // Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
         let process = crate::task::processor::current_process();
@@ -457,11 +483,24 @@ pub fn trap_return() -> ! {
 
     // Get the trap context virtual address for the current thread
     let task = crate::task::processor::current_task().unwrap();
-    let task_inner = task.borrow_mut();
-    let trap_cx_ptr = task_inner.res.as_ref().unwrap().trap_cx_user_va();
-    drop(task_inner);
+    let trap_cx_ptr = {
+        let task_inner = task.borrow_mut();
+        if let Some(res) = task_inner.res.as_ref() {
+            res.trap_cx_user_va()
+        } else {
+            drop(task_inner);
+            exit_current_and_run_next(-1);
+            unreachable!("exit_current_and_run_next should not return");
+        }
+    };
 
-    let user_satp = get_current_token();
+    let user_satp = task
+        .process
+        .upgrade()
+        .unwrap()
+        .borrow_mut()
+        .memory_set
+        .token();
 
     let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
     if DEBUG_TRAP && cnt < 4 {
@@ -492,6 +531,27 @@ pub fn trap_return() -> ! {
                 user_satp,
             );
         }
+        let tramp_vpn = VirtAddr::from(TRAMPOLINE).floor();
+        let kernel_satp = riscv::register::satp::read().bits();
+        let kernel_pt = PageTable::from_token(kernel_satp);
+        let user_pt = PageTable::from_token(user_satp);
+        let kernel_pte = kernel_pt
+            .translate(tramp_vpn)
+            .filter(|pte| pte.is_valid())
+            .map(|pte| (pte.ppn(), pte.flags()));
+        let user_pte = user_pt
+            .translate(tramp_vpn)
+            .filter(|pte| pte.is_valid())
+            .map(|pte| (pte.ppn(), pte.flags()));
+        log::debug!(
+            "[trap_return#{}] tramp vpn={:?} kernel_satp={:#x} user_satp={:#x} kernel_pte={:?} user_pte={:?}",
+            cnt,
+            tramp_vpn,
+            kernel_satp,
+            user_satp,
+            kernel_pte,
+            user_pte
+        );
     }
 
     unsafe extern "C" {

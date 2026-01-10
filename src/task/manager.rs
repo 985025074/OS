@@ -260,6 +260,9 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     fn wake_if_blocked(task: Arc<TaskControlBlock>) {
         let mut task_inner = task.borrow_mut();
+        if task_inner.res.is_none() {
+            return;
+        }
         if task_inner.task_status == TaskStatus::Blocked {
             task_inner.task_status = TaskStatus::Ready;
             task.wakeup_pending
@@ -339,6 +342,7 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     // 这里可能会加入 todo
+    crate::syscall::futex::remove_futex_waiters(&task);
     remove_timer(task.clone());
     remove_task(task.clone());
 }

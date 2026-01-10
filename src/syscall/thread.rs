@@ -166,6 +166,23 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     if prev_sie {
         unsafe { riscv::register::sstatus::set_sie() };
     }
+    const EINTR: isize = -4;
+    let interrupted = {
+        let inner = task.borrow_mut();
+        if let Some(sig) = inner.pending_signal {
+            if sig == 0 || sig > 64 {
+                false
+            } else {
+                let bit = 1u64 << (sig - 1);
+                (inner.signal_mask & bit) == 0
+            }
+        } else {
+            false
+        }
+    };
+    if interrupted {
+        return EINTR;
+    }
     if DEBUG_TIMER {
         let tid = task
             .borrow_mut()

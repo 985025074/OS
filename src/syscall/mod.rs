@@ -7,14 +7,15 @@ mod mutex;
 mod process;
 mod semaphore;
 mod smp;
-mod signal;
+pub(crate) mod signal;
 mod thread;
 mod memory;
-mod misc;
+pub(crate) mod misc;
 mod socket;
 mod net;
 mod time_sys;
 mod sched;
+pub(crate) mod robust_list;
 pub(crate) mod futex;
 pub(crate) mod sysv_shm;
 const SYSCALL_GETCWD: usize = 17;
@@ -58,6 +59,7 @@ const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
+const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
@@ -121,8 +123,10 @@ const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
+const SYSCALL_SIGTIMEDWAIT: usize = 137; // rt_sigtimedwait
 const SYSCALL_SIGRETURN: usize = 139; // rt_sigreturn
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_TKILL: usize = 130;
 const SYSCALL_TGKILL: usize = 131;
 // thread
 const SYSCALL_THREAD_CREATE: usize = 1000;
@@ -205,6 +209,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_TID_ADDRESS => misc::syscall_set_tid_address(args[0]),
         SYSCALL_FUTEX => futex::syscall_futex(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_SET_ROBUST_LIST => misc::syscall_set_robust_list(args[0], args[1]),
+        SYSCALL_GET_ROBUST_LIST => misc::syscall_get_robust_list(args[0], args[1], args[2]),
         SYSCALL_NANOSLEEP => time_sys::syscall_nanosleep(args[0], args[1]),
         SYSCALL_CLOCK_GETTIME => time_sys::syscall_clock_gettime(args[0], args[1]),
         SYSCALL_CLOCK_NANOSLEEP => time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3]),
@@ -271,10 +276,14 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PIPE2 => filesystem::syscall_pipe2(args[0], args[1]),
 
         SYSCALL_KILL => signal::syscall_kill(args[0], args[1] as i32),
+        SYSCALL_TKILL => signal::syscall_tkill(args[0], args[1] as i32),
         SYSCALL_TGKILL => signal::syscall_tgkill(args[0], args[1], args[2] as i32),
 
         SYSCALL_SIGACTION => signal::syscall_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::syscall_rt_sigprocmask(args[0], args[1], args[2], args[3]),
+        SYSCALL_SIGTIMEDWAIT => {
+            signal::syscall_rt_sigtimedwait(args[0], args[1], args[2], args[3])
+        }
         SYSCALL_SIGRETURN => signal::syscall_rt_sigreturn(),
         SYSCALL_THREAD_CREATE => thread::sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => thread::sys_gettid(),

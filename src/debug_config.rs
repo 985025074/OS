@@ -15,7 +15,7 @@ pub const DEBUG_TIMER: bool = false;
 pub const DEBUG_SCHED: bool = false;
 
 /// Verbose trap logs (timer/software interrupts, user exceptions).
-pub const DEBUG_TRAP: bool = false;
+pub const DEBUG_TRAP: bool = true;
 
 /// Verbose syscall trace (very noisy).
 pub const DEBUG_SYSCALL: bool = false;

@@ -9,9 +9,15 @@ use lazy_static::*;
 use spin::Mutex;
 
 use alloc::{collections::BinaryHeap, sync::Arc};
+use alloc::vec::Vec;
 
 use crate::debug_config::DEBUG_TIMER;
 use crate::task::process_block::ProcessControlBlock;
+use crate::{
+    mm::write_user_value,
+    syscall::futex::futex_wake,
+    task::manager::pid2process,
+};
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
     pub tid: usize,
@@ -53,7 +59,52 @@ impl Ord for TimeWrap {
 }
 
 lazy_static! {
-    pub static ref TIMERS: Mutex<BinaryHeap<TimeWrap>> = Mutex::new(BinaryHeap::<TimeWrap>::new());
+pub static ref TIMERS: Mutex<BinaryHeap<TimeWrap>> = Mutex::new(BinaryHeap::<TimeWrap>::new());
+}
+
+#[derive(Clone, Copy)]
+struct DelayedTidClear {
+    pid: usize,
+    ctid: usize,
+    deadline_ms: usize,
+}
+
+lazy_static! {
+    static ref DELAYED_TID_CLEARS: Mutex<Vec<DelayedTidClear>> = Mutex::new(Vec::new());
+}
+
+pub fn schedule_tid_clear(pid: usize, ctid: usize, delay_ms: usize) {
+    if ctid == 0 {
+        return;
+    }
+    let deadline_ms = get_time_ms().saturating_add(delay_ms);
+    DELAYED_TID_CLEARS
+        .lock()
+        .push(DelayedTidClear { pid, ctid, deadline_ms });
+}
+
+fn process_delayed_tid_clears(current_ms: usize) {
+    let mut due = Vec::new();
+    {
+        let mut clears = DELAYED_TID_CLEARS.lock();
+        let mut i = 0;
+        while i < clears.len() {
+            if clears[i].deadline_ms <= current_ms {
+                due.push(clears.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    for entry in due {
+        let Some(proc) = pid2process(entry.pid) else {
+            continue;
+        };
+        let token = proc.borrow_mut().get_user_token();
+        write_user_value(token, entry.ctid as *mut i32, &0);
+        let _ = futex_wake(entry.pid, entry.ctid, 1);
+    }
 }
 
 pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
@@ -143,4 +194,6 @@ pub fn check_timer() {
         }
         break;
     }
+
+    process_delayed_tid_clears(current_ms);
 }

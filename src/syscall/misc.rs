@@ -1,6 +1,7 @@
 use crate::{
     debug_config::DEBUG_PTHREAD,
     mm::{translated_byte_buffer, read_user_value, write_user_value},
+    syscall::robust_list::ROBUST_LIST_HEAD_LEN,
     task::processor::{current_process, current_task},
     trap::get_current_token,
     time::get_time,
@@ -17,9 +18,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // - unique across all threads in the system.
 //
 // To avoid refactoring the internal resource indexing, we encode non-main thread IDs into
-// a 32-bit range with a magic bit so they won't collide with normal PIDs.
-const LINUX_TID_MAGIC: usize = 1 << 30;
-// Use 15 bits for per-process thread index to avoid overlapping the magic bit:
+// a 32-bit range derived from (tgid << 15) | tid_index, keeping bit 30 clear so
+// futex owner bits (OWNER_DIED/WAITERS) remain usable.
 // (tgid << 15) occupies bits [15..29] for typical OSComp PID ranges (< 32768).
 const LINUX_TID_PID_SHIFT: usize = 15;
 
@@ -27,8 +27,19 @@ pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
     if tid_index == 0 {
         tgid
     } else {
-        LINUX_TID_MAGIC | (tgid << LINUX_TID_PID_SHIFT) | (tid_index & 0x7fff)
+        (tgid << LINUX_TID_PID_SHIFT) | (tid_index & 0x7fff)
     }
+}
+
+pub(crate) fn decode_linux_tid(tgid: usize, tid: usize) -> Option<usize> {
+    if tid == tgid {
+        return Some(0);
+    }
+    let pid_part = tid >> LINUX_TID_PID_SHIFT;
+    if pid_part != tgid {
+        return None;
+    }
+    Some(tid & 0x7fff)
 }
 
 fn current_tid_index() -> usize {
@@ -175,11 +186,40 @@ pub fn syscall_gettid_linux() -> isize {
     current_linux_tid() as isize
 }
 
+const EINVAL: isize = -22;
+
 /// Linux `set_robust_list(2)` (syscall 99 on riscv64).
 ///
-/// glibc uses this for mutex robustness; we don't implement robust futexes yet,
-/// but returning success keeps single-threaded apps progressing.
+/// glibc uses this for mutex robustness; we store the head pointer for
+/// best-effort cleanup on thread exit.
 pub fn syscall_set_robust_list(_head: usize, _len: usize) -> isize {
+    if _len != ROBUST_LIST_HEAD_LEN {
+        return EINVAL;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.borrow_mut();
+    inner.robust_list_head = _head;
+    inner.robust_list_len = _len;
+    0
+}
+
+/// Linux `get_robust_list(2)` (syscall 100 on riscv64).
+///
+/// We only support querying the current thread (pid=0).
+pub fn syscall_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> isize {
+    const ESRCH: isize = -3;
+    if pid != 0 {
+        return ESRCH;
+    }
+    let task = current_task().unwrap();
+    let inner = task.borrow_mut();
+    let token = get_current_token();
+    if head_ptr != 0 {
+        write_user_value(token, head_ptr as *mut usize, &inner.robust_list_head);
+    }
+    if len_ptr != 0 {
+        write_user_value(token, len_ptr as *mut usize, &inner.robust_list_len);
+    }
     0
 }
 
@@ -191,11 +231,16 @@ struct RLimit64 {
 }
 
 const RLIMIT_STACK: usize = 3;
+const RLIMIT_NOFILE: usize = 7;
 
 fn rlimit_for_resource(resource: usize) -> (u64, u64) {
     if resource == RLIMIT_STACK {
         // Keep default thread stacks modest to avoid huge eager mmap costs.
         (1 * 1024 * 1024, 1 * 1024 * 1024)
+    } else if resource == RLIMIT_NOFILE {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        (inner.rlimit_nofile_cur, inner.rlimit_nofile_max)
     } else {
         (u64::MAX, u64::MAX)
     }
@@ -205,6 +250,19 @@ fn rlimit_for_resource(resource: usize) -> (u64, u64) {
 ///
 /// Provide a permissive "unlimited" answer for common queries (e.g. RLIMIT_STACK).
 pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_limit: usize) -> isize {
+    if _new_limit != 0 {
+        let token = get_current_token();
+        let new = read_user_value(token, _new_limit as *const RLimit64);
+        if new.rlim_cur > new.rlim_max {
+            return EINVAL;
+        }
+        if _resource == RLIMIT_NOFILE {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner.rlimit_nofile_cur = new.rlim_cur;
+            inner.rlimit_nofile_max = new.rlim_max;
+        }
+    }
     if old_limit != 0 {
         let token = get_current_token();
         let (rlim_cur, rlim_max) = rlimit_for_resource(_resource);
@@ -235,6 +293,19 @@ pub fn syscall_getrlimit(resource: usize, rlim: usize) -> isize {
 ///
 /// We currently ignore the new limits and return success.
 pub fn syscall_setrlimit(_resource: usize, _rlim: usize) -> isize {
+    if _rlim != 0 {
+        let token = get_current_token();
+        let new = read_user_value(token, _rlim as *const RLimit64);
+        if new.rlim_cur > new.rlim_max {
+            return EINVAL;
+        }
+        if _resource == RLIMIT_NOFILE {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner.rlimit_nofile_cur = new.rlim_cur;
+            inner.rlimit_nofile_max = new.rlim_max;
+        }
+    }
     0
 }
 

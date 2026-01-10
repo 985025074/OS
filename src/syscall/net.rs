@@ -10,6 +10,10 @@ const AF_INET: u16 = 2;
 
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const SOCK_NONBLOCK: usize = 0x800;
+const SOCK_CLOEXEC: usize = 0x80000;
+const O_NONBLOCK: u32 = 0x800;
+const FD_CLOEXEC: u32 = 1;
 
 const SOL_SOCKET: usize = 1;
 const SO_SNDBUF: usize = 7;
@@ -22,6 +26,7 @@ const EPROTONOSUPPORT: isize = -93;
 const ENOTSOCK: isize = -88;
 const EOPNOTSUPP: isize = -95;
 const EISCONN: isize = -106;
+const EMFILE: isize = -24;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -86,6 +91,8 @@ pub fn syscall_socket(domain: usize, socket_type: usize, _protocol: usize) -> is
         return EAFNOSUPPORT;
     }
     let st = socket_type & 0xff;
+    let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
+    let nonblock = (socket_type & SOCK_NONBLOCK) != 0;
     let file: Arc<dyn File + Send + Sync> = match st {
         SOCK_STREAM => NetSocketFile::new_tcp(),
         SOCK_DGRAM => NetSocketFile::new_udp(),
@@ -93,8 +100,18 @@ pub fn syscall_socket(domain: usize, socket_type: usize, _protocol: usize) -> is
     };
     let process = current_process();
     let mut inner = process.borrow_mut();
-    let fd = inner.alloc_fd();
+    let Some(fd) = inner.alloc_fd() else {
+        return EMFILE;
+    };
     inner.fd_table[fd] = Some(file);
+    let mut fd_flags = 0u32;
+    if cloexec {
+        fd_flags |= FD_CLOEXEC;
+    }
+    if nonblock {
+        fd_flags |= O_NONBLOCK;
+    }
+    inner.fd_flags[fd] = fd_flags;
     if crate::debug_config::DEBUG_NET {
         crate::println!("[net] pid={} socket() -> fd={} type={}", process.pid.0, fd, st);
     }
@@ -160,8 +177,17 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
     let peer = new_sock.tcp_endpoints_v4();
     let process = current_process();
     let mut inner = process.borrow_mut();
-    let newfd = inner.alloc_fd();
+    if fd >= inner.fd_flags.len() {
+        let len = inner.fd_table.len();
+        inner.fd_flags.resize(len, 0);
+    }
+    let mut inherited_flags = inner.fd_flags.get(fd).copied().unwrap_or(0);
+    inherited_flags &= !FD_CLOEXEC;
+    let Some(newfd) = inner.alloc_fd() else {
+        return EMFILE;
+    };
     inner.fd_table[newfd] = Some(new_sock);
+    inner.fd_flags[newfd] = inherited_flags;
     drop(inner);
     if let Some((_lip, _lport, rip, rport)) = peer {
         write_sockaddr_in(addr, addrlen, rip, rport);
@@ -307,6 +333,10 @@ pub fn syscall_getsockname(fd: usize, addr: usize, addrlen: usize) -> isize {
         None => return ENOTSOCK,
     };
     if let Some((lip, lport, _rip, _rport)) = sock.tcp_endpoints_v4() {
+        write_sockaddr_in(addr, addrlen, lip, lport);
+        return 0;
+    }
+    if let Some((lip, lport)) = sock.tcp_local_endpoint_v4() {
         write_sockaddr_in(addr, addrlen, lip, lport);
         return 0;
     }

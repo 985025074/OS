@@ -190,7 +190,9 @@ impl TaskUserRes {
 
     fn dealloc_user_res(&self) {
         // dealloc tid
-        let process = self.process.upgrade().unwrap();
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
         let mut process_inner = process.borrow_mut();
         if self.owns_ustack {
             // dealloc ustack manually
@@ -209,11 +211,15 @@ impl TaskUserRes {
 
     #[allow(unused)]
     pub fn alloc_tid(&mut self) {
-        self.tid = self.process.upgrade().unwrap().borrow_mut().alloc_tid();
+        if let Some(process) = self.process.upgrade() {
+            self.tid = process.borrow_mut().alloc_tid();
+        }
     }
 
     pub fn dealloc_tid(&self) {
-        let process = self.process.upgrade().unwrap();
+        let Some(process) = self.process.upgrade() else {
+            return;
+        };
         let mut process_inner = process.borrow_mut();
         process_inner.dealloc_tid(self.tid);
     }
@@ -223,7 +229,7 @@ impl TaskUserRes {
     }
 
     pub fn trap_cx_ppn(&self) -> PhysPageNum {
-        let process = self.process.upgrade().unwrap();
+        let process = self.process.upgrade().expect("process already dropped");
         let process_inner = process.borrow_mut();
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
         process_inner

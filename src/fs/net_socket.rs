@@ -153,8 +153,12 @@ impl NetSocketFile {
     pub fn bind_v4(&self, ip: Ipv4Address, port: u16) -> Result<(), isize> {
         const EINVAL: isize = -22;
         const EOPNOTSUPP: isize = -95;
-        if port == 0 {
-            return Err(EINVAL);
+        let ephemeral = port == 0;
+        let mut port = port;
+        // Linux allows port 0 and picks an ephemeral port. Mirror that behavior
+        // so libc tests that bind with port 0 succeed.
+        if ephemeral {
+            port = crate::net::alloc_ephemeral_port();
         }
         crate::net::poll();
         let mut inner = self.inner.lock();
@@ -170,17 +174,34 @@ impl NetSocketFile {
                 Ok(())
             }
             Inner::Udp { handle, .. } => {
-                let r = crate::net::with_sockets_mut(|_iface, _dev, sockets| {
-                    let s = sockets.get_mut::<udp::Socket>(*handle);
-                    if ip == Ipv4Address::UNSPECIFIED {
-                        // Loopback-only: bind to 127.0.0.1 explicitly.
-                        s.bind((IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), port))
+                let mut last_err = EINVAL;
+                // If port was zero, try a few ephemeral ports to avoid collisions.
+                for _ in 0..32 {
+                    let try_port = if ephemeral {
+                        crate::net::alloc_ephemeral_port()
                     } else {
-                        s.bind((IpAddress::Ipv4(ip), port))
+                        port
+                    };
+                    let r = crate::net::with_sockets_mut(|_iface, _dev, sockets| {
+                        let s = sockets.get_mut::<udp::Socket>(*handle);
+                        if ip == Ipv4Address::UNSPECIFIED {
+                            // Loopback-only: bind to 127.0.0.1 explicitly.
+                            s.bind((IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), try_port))
+                        } else {
+                            s.bind((IpAddress::Ipv4(ip), try_port))
+                        }
+                    });
+                    match r {
+                        Ok(()) => return Ok(()),
+                        Err(_) => {
+                            last_err = EINVAL;
+                            if !ephemeral {
+                                break;
+                            }
+                        }
                     }
-                });
-                r.map_err(|_| EINVAL)?;
-                Ok(())
+                }
+                Err(last_err)
             }
             Inner::TcpListener { .. } => Err(EOPNOTSUPP),
         }
@@ -556,6 +577,30 @@ impl NetSocketFile {
             let IpAddress::Ipv4(rip) = remote.addr else { return None };
             Some((lip, local.port, rip, remote.port))
         })
+    }
+
+    pub fn tcp_local_endpoint_v4(&self) -> Option<(Ipv4Address, u16)> {
+        crate::net::poll();
+        match &*self.inner.lock() {
+            Inner::TcpStream { handle } => crate::net::with_sockets_mut(|_iface, _dev, sockets| {
+                let s = sockets.get::<tcp::Socket>(*handle);
+                if let Some(local) = s.local_endpoint() {
+                    if let IpAddress::Ipv4(ip) = local.addr {
+                        return Some((ip, local.port));
+                    }
+                }
+                let bound = s.get_bound_endpoint();
+                let ip = match bound.addr {
+                    Some(IpAddress::Ipv4(ip)) => ip,
+                    _ => Ipv4Address::UNSPECIFIED,
+                };
+                Some((ip, bound.port))
+            }),
+            Inner::TcpListener { port, .. } => {
+                Some((Ipv4Address::new(127, 0, 0, 1), *port))
+            }
+            _ => None,
+        }
     }
 
     pub fn udp_endpoint_v4(&self) -> Option<(Ipv4Address, u16)> {

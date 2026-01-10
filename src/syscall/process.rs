@@ -133,6 +133,10 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     if (flags & CLONE_VM) != 0 {
         const ENOMEM: isize = -12;
         let task = current_task().unwrap();
+        let parent_mask = {
+            let inner = task.borrow_mut();
+            inner.signal_mask
+        };
         let parent_cx = {
             let inner = task.borrow_mut();
             *inner.get_trap_cx()
@@ -160,6 +164,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
                 tasks[tid_index] = Some(Arc::clone(&new_task));
             }
 
+            new_inner.signal_mask = parent_mask;
             let trap_cx = new_inner.get_trap_cx();
             *trap_cx = parent_cx;
             trap_cx.x[10] = 0; // child returns 0 from syscall
@@ -249,6 +254,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
     const ECHILD: isize = -10;
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
+    let mut temp_signal: Option<i32> = None;
     loop {
         let cur_process = current_process();
         let (has_matching_child, zombie_pid) = {
@@ -271,6 +277,10 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                     }
                     if matches && child_inner.is_zombie {
                         temp_exit_code = child_inner.exit_code;
+                        temp_signal = child_inner
+                            .signals
+                            .check_error()
+                            .map(|(code, _)| -code);
                         found = Some((index, child.pid.0));
                         break;
                     }
@@ -292,10 +302,10 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                 // Linux wait status encoding:
                 // - normal exit: (code & 0xff) << 8
                 // - signaled: signal number in low 7 bits
-                let status = if temp_exit_code >= 0 {
-                    (temp_exit_code & 0xff) << 8
+                let status = if let Some(sig) = temp_signal {
+                    sig & 0x7f
                 } else {
-                    (-temp_exit_code) & 0x7f
+                    (((temp_exit_code as u32) & 0xff) << 8) as i32
                 };
                 write_user_value(token, wstatus_ptr as *mut i32, &status);
             }

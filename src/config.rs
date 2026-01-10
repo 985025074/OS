@@ -11,7 +11,9 @@ pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
-pub const TRAP_CONTEXT: usize = TRAMPOLINE - PAGE_SIZE;
+/// User-accessible sigreturn trampoline page (separate from kernel trap trampoline).
+pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
+pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 pub const MAX_HARTS: usize = 4;
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
 /// Return (bottom, top) of a kernel stack in kernel space. Bottom is smaller while top is bigger.
@@ -51,4 +53,4 @@ pub const MMIO: &[(usize, usize)] = &[
     (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
 ];
 
-pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
+pub const TRAP_CONTEXT_BASE: usize = TRAP_CONTEXT;
