@@ -5,6 +5,7 @@ mod socketpair;
 mod net_socket;
 mod stdio;
 mod pseudo;
+mod dummy;
 use crate::mm::UserBuffer;
 use core::any::Any;
 
@@ -29,4 +30,5 @@ pub use net_socket::{NetSocketFile, NetSocketKind};
 pub use stdio::{Stdin, Stdout};
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub use pseudo::PseudoBlock;
+pub use dummy::DummyFile;
 pub(crate) use pseudo::{shm_create, shm_get, shm_list, shm_remove};

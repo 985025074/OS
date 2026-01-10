@@ -1,11 +1,12 @@
 use alloc::sync::Arc;
 use core::mem::size_of;
 
-use crate::fs::{File, NetSocketFile};
+use crate::fs::{File, NetSocketFile, make_socketpair};
 use crate::mm::{read_user_value, write_user_value, try_copy_to_user, try_read_user_value};
 use crate::task::processor::current_process;
 use crate::trap::get_current_token;
 
+const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
 const SOL_IP: usize = 0;
 
@@ -14,6 +15,7 @@ const SOCK_DGRAM: usize = 2;
 const SOCK_NONBLOCK: usize = 0x800;
 const SOCK_CLOEXEC: usize = 0x80000;
 const O_NONBLOCK: u32 = 0x800;
+const O_PATH: u32 = 0x200000;
 const FD_CLOEXEC: u32 = 1;
 
 const SOL_SOCKET: usize = 1;
@@ -45,6 +47,9 @@ fn get_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
     let process = current_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
+        return Err(EBADF);
+    }
+    if fd < inner.fd_flags.len() && (inner.fd_flags[fd] & O_PATH) != 0 {
         return Err(EBADF);
     }
     inner.fd_table[fd].clone().ok_or(EBADF)
@@ -92,17 +97,27 @@ fn write_sockaddr_in(user_ptr: usize, user_len_ptr: usize, ip: smoltcp::wire::Ip
     write_user_value(token, user_len_ptr as *mut u32, &(size_of::<SockAddrIn>() as u32));
 }
 
-pub fn syscall_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
-    if domain as u16 != AF_INET {
-        return EAFNOSUPPORT;
-    }
+pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
     let st = socket_type & 0xff;
     let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
     let nonblock = (socket_type & SOCK_NONBLOCK) != 0;
-    let file: Arc<dyn File + Send + Sync> = match st {
-        SOCK_STREAM => NetSocketFile::new_tcp(),
-        SOCK_DGRAM => NetSocketFile::new_udp(),
-        _ => return EPROTONOSUPPORT,
+    let file: Arc<dyn File + Send + Sync> = match domain as u16 {
+        AF_INET => match st {
+            SOCK_STREAM => NetSocketFile::new_tcp(),
+            SOCK_DGRAM => NetSocketFile::new_udp(),
+            _ => return EPROTONOSUPPORT,
+        },
+        AF_UNIX => {
+            if protocol != 0 {
+                return EPROTONOSUPPORT;
+            }
+            if st != SOCK_STREAM {
+                return EPROTONOSUPPORT;
+            }
+            let (end0, _end1) = make_socketpair();
+            end0
+        }
+        _ => return EAFNOSUPPORT,
     };
     let process = current_process();
     let mut inner = process.borrow_mut();

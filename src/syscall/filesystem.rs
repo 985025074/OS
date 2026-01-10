@@ -38,6 +38,7 @@ const O_EXCL: usize = 0x80;
 const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_NONBLOCK: usize = 0x800;
+const O_PATH: usize = 0x200000;
 const O_DIRECTORY: usize = 0x10000;
 const O_CLOEXEC: usize = 0x80000;
 // __O_TMPFILE (020000000) | O_DIRECTORY from asm-generic/fcntl.h
@@ -174,6 +175,15 @@ fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     inner.fd_table[fd].clone()
 }
 
+fn fd_has_o_path(fd: usize) -> bool {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    if fd >= inner.fd_flags.len() {
+        return false;
+    }
+    (inner.fd_flags[fd] & O_PATH as u32) != 0
+}
+
 fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
     let file = get_fd_file(fd)?;
     file.as_any()
@@ -188,6 +198,8 @@ fn is_pseudo_path(abs: &str) -> bool {
         || abs.starts_with("/proc/")
         || abs == "/dev"
         || abs.starts_with("/dev/")
+        || abs == "/etc"
+        || abs.starts_with("/etc/")
 }
 
 enum AtPath {
@@ -402,6 +414,9 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if (cur_flags & O_NONBLOCK as u32) != 0 {
                 flags |= O_NONBLOCK;
             }
+            if (cur_flags & O_PATH as u32) != 0 {
+                flags |= O_PATH;
+            }
             if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
                 if os_inode.append() {
                     flags |= O_APPEND;
@@ -463,6 +478,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         return ENOENT;
     }
 
+    let o_path = (flags & O_PATH) != 0;
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if path == "." || path == "/proc" || path == "/proc/" || path == "/sys" || path == "/dev" {
@@ -476,13 +492,17 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         }
     }
 
-    let (readable, writable) = match flags & O_ACCMODE {
-        O_RDONLY => (true, false),
-        O_WRONLY => (false, true),
-        O_RDWR => (true, true),
-        _ => (true, false),
+    let (readable, writable) = if o_path {
+        (false, false)
+    } else {
+        match flags & O_ACCMODE {
+            O_RDONLY => (true, false),
+            O_WRONLY => (false, true),
+            O_RDWR => (true, true),
+            _ => (true, false),
+        }
     };
-    let append = (flags & O_APPEND) != 0;
+    let append = !o_path && (flags & O_APPEND) != 0;
 
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
@@ -528,6 +548,9 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         }
         if (flags & O_NONBLOCK) != 0 {
             fd_flags |= O_NONBLOCK as u32;
+        }
+        if o_path {
+            fd_flags |= O_PATH as u32;
         }
         inner.fd_flags[fd] = fd_flags;
         if crate::debug_config::DEBUG_FS {
@@ -639,7 +662,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     };
 
     // Linux: opening a directory for write is not allowed.
-    if inode.is_dir() && (flags & O_ACCMODE) != O_RDONLY {
+    if !o_path && inode.is_dir() && (flags & O_ACCMODE) != O_RDONLY {
         return EISDIR;
     }
 
@@ -659,7 +682,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         return ENOTDIR;
     }
 
-    if (flags & O_TRUNC) != 0 && writable && inode.is_file() {
+    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
         if let Err(e) = inode.clear() {
             return ext4_err_to_errno(e);
         }
@@ -679,6 +702,9 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     }
     if (flags & O_NONBLOCK) != 0 {
         fd_flags |= O_NONBLOCK as u32;
+    }
+    if o_path {
+        fd_flags |= O_PATH as u32;
     }
     inner.fd_flags[fd] = fd_flags;
     if crate::debug_config::DEBUG_FS {
@@ -726,6 +752,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
             PseudoDirent { name: alloc::string::String::from("mounts"), ino: (pid as u64) << 32 | 4, dtype: 8 },
+            PseudoDirent { name: alloc::string::String::from("maps"), ino: (pid as u64) << 32 | 5, dtype: 8 },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/self", entries)));
     }
@@ -796,6 +823,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                         PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
                         PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
                         PseudoDirent { name: alloc::string::String::from("mounts"), ino: (pid as u64) << 32 | 4, dtype: 8 },
+                        PseudoDirent { name: alloc::string::String::from("maps"), ino: (pid as u64) << 32 | 5, dtype: 8 },
                     ];
                     let p = alloc::format!("/proc/{}", pid);
                     return Some(alloc::sync::Arc::new(PseudoDir::new(&p, entries)));
@@ -883,6 +911,11 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                     );
                     return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
                 }
+                Some("maps") if it.next().is_none() => {
+                    return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+                        "00000000-00000000 r--p 00000000 00:00 0 \n",
+                    )));
+                }
                 _ => {}
             }
         }
@@ -926,6 +959,25 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent { name: alloc::string::String::from("rtc"), ino: 2, dtype: 8 },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/misc", entries)));
+    }
+    if path == "/etc" || path == "/etc/" {
+        let entries = alloc::vec![
+            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
+            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
+            PseudoDirent { name: alloc::string::String::from("passwd"), ino: 2, dtype: 8 },
+            PseudoDirent { name: alloc::string::String::from("group"), ino: 3, dtype: 8 },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/etc", entries)));
+    }
+    if path == "/etc/passwd" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+            "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:\n",
+        )));
+    }
+    if path == "/etc/group" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+            "root:x:0:\nnobody:x:65534:\nnogroup:x:65534:\n",
+        )));
     }
 
     // /sys/devices/system/cpu/*
@@ -1323,6 +1375,9 @@ pub fn syscall_close(fd: usize) -> isize {
 }
 
 pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
@@ -1338,6 +1393,9 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
 }
 
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
@@ -1361,6 +1419,9 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     }
     if len == 0 {
         return 0;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
     }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
@@ -1433,6 +1494,9 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     }
     if len == 0 {
         return 0;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
     }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;

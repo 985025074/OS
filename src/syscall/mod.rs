@@ -18,6 +18,12 @@ mod sched;
 pub(crate) mod robust_list;
 pub(crate) mod futex;
 pub(crate) mod sysv_shm;
+mod dummy;
+const SYSCALL_EVENTFD2: usize = 19;
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+const SYSCALL_EPOLL_CTL: usize = 21;
+const SYSCALL_EPOLL_PWAIT: usize = 22;
+const SYSCALL_INOTIFY_INIT1: usize = 26;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_DUP: usize = 23;
@@ -49,11 +55,13 @@ const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
+const SYSCALL_SIGNALFD4: usize = 74;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
+const SYSCALL_TIMERFD_CREATE: usize = 85;
 // riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
@@ -127,6 +135,17 @@ const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
+const SYSCALL_MEMFD_CREATE: usize = 279;
+const SYSCALL_BPF: usize = 280;
+const SYSCALL_USERFAULTFD: usize = 282;
+const SYSCALL_PERF_EVENT_OPEN: usize = 241;
+const SYSCALL_FANOTIFY_INIT: usize = 262;
+const SYSCALL_IO_URING_SETUP: usize = 425;
+const SYSCALL_OPEN_TREE: usize = 428;
+const SYSCALL_FSOPEN: usize = 430;
+const SYSCALL_FSPICK: usize = 433;
+const SYSCALL_PIDFD_OPEN: usize = 434;
+const SYSCALL_MEMFD_SECRET: usize = 447;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
 const SYSCALL_SIGTIMEDWAIT: usize = 137; // rt_sigtimedwait
@@ -183,6 +202,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP => filesystem::syscall_dup(args[0]),
         SYSCALL_DUP3 => filesystem::syscall_dup3(args[0], args[1], args[2]),
         SYSCALL_IOCTL => misc::syscall_ioctl(args[0], args[1], args[2]),
+        SYSCALL_EVENTFD2 => dummy::syscall_eventfd2(args[0] as u64, args[1]),
+        SYSCALL_EPOLL_CREATE1 => dummy::syscall_epoll_create1(args[0]),
+        SYSCALL_EPOLL_CTL => -38,
+        SYSCALL_EPOLL_PWAIT => -38,
+        SYSCALL_INOTIFY_INIT1 => dummy::syscall_inotify_init1(args[0]),
         SYSCALL_MKDIRAT => filesystem::syscall_mkdirat(args[0] as isize, args[1], args[2]),
         SYSCALL_UNLINKAT => filesystem::syscall_unlinkat(args[0] as isize, args[1], args[2]),
         SYSCALL_FCHMOD => filesystem::syscall_fchmod(args[0], args[1]),
@@ -204,6 +228,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PWRITE64 => filesystem::syscall_pwrite64(args[0], args[1], args[2], args[3] as isize),
         SYSCALL_PSELECT6 => time_sys::syscall_pselect6(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_PPOLL => misc::syscall_ppoll(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_SIGNALFD4 => dummy::syscall_signalfd4(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_GETDENTS64 => filesystem::syscall_getdents64(args[0], args[1], args[2]),
         SYSCALL_LSEEK => filesystem::syscall_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READLINKAT => filesystem::syscall_readlinkat(args[0] as isize, args[1], args[2], args[3]),
@@ -213,6 +238,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FDATASYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FSTATFS => filesystem::syscall_fstatfs(args[0], args[1]),
         SYSCALL_STATFS => filesystem::syscall_statfs(args[0], args[1]),
+        SYSCALL_TIMERFD_CREATE => dummy::syscall_timerfd_create(args[0], args[1]),
         SYSCALL_UTIMENSAT => filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit(args[0]),
@@ -283,9 +309,20 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PRLIMIT64 => misc::syscall_prlimit64(args[0], args[1], args[2], args[3]),
         SYSCALL_RENAMEAT2 => filesystem::syscall_renameat2(args[0] as isize, args[1], args[2] as isize, args[3], args[4]),
         SYSCALL_GETRANDOM => misc::syscall_getrandom(args[0], args[1], args[2] as u32),
+        SYSCALL_MEMFD_CREATE => dummy::syscall_memfd_create(args[0], args[1]),
+        SYSCALL_BPF => dummy::syscall_bpf(args[0], args[1], args[2]),
+        SYSCALL_USERFAULTFD => dummy::syscall_userfaultfd(args[0]),
+        SYSCALL_PERF_EVENT_OPEN => dummy::syscall_perf_event_open(args[0], args[1] as isize, args[2] as isize, args[3] as isize, args[4]),
+        SYSCALL_FANOTIFY_INIT => dummy::syscall_fanotify_init(args[0], args[1]),
         SYSCALL_CLOSE => filesystem::syscall_close(args[0]),
         SYSCALL_VFORK => process::syscall_vfork(),
         SYSCALL_PIPE2 => filesystem::syscall_pipe2(args[0], args[1]),
+        SYSCALL_IO_URING_SETUP => dummy::syscall_io_uring_setup(args[0], args[1]),
+        SYSCALL_OPEN_TREE => dummy::syscall_open_tree(args[0] as isize, args[1], args[2]),
+        SYSCALL_FSOPEN => dummy::syscall_fsopen(args[0], args[1]),
+        SYSCALL_FSPICK => dummy::syscall_fspick(args[0] as isize, args[1], args[2]),
+        SYSCALL_PIDFD_OPEN => dummy::syscall_pidfd_open(args[0], args[1]),
+        SYSCALL_MEMFD_SECRET => dummy::syscall_memfd_secret(args[0]),
 
         SYSCALL_KILL => signal::syscall_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => signal::syscall_tkill(args[0], args[1] as i32),
