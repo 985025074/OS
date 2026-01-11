@@ -27,13 +27,13 @@ fn main() {
 
                 writeln!(file, "app_{}_name:", num).unwrap();
                 writeln!(file, "    .asciz \"{}\"", app_name).unwrap();
-                writeln!(file, ".align 3");
+                // writeln!(file, ".align 3");
 
-                writeln!(file, ".section .data").unwrap();
-                writeln!(file, "app_{}_start:", num).unwrap();
-                writeln!(file, "    .incbin \"{}/{}\"", user_app_dir, file_name).unwrap();
-                writeln!(file, ".align 3");
-                writeln!(file, "app_{}_end:", num).unwrap();
+                // writeln!(file, ".section .data").unwrap();
+                // writeln!(file, "app_{}_start:", num).unwrap();
+                // writeln!(file, "    .incbin \"{}/{}\"", user_app_dir, file_name).unwrap();
+                // writeln!(file, ".align 3");
+                // writeln!(file, "app_{}_end:", num).unwrap();
                 num_app += 1;
             }
         }
@@ -44,8 +44,8 @@ fn main() {
     writeln!(file, "num_user_apps:").unwrap();
     writeln!(file, "    .quad {}", num_app).unwrap();
     for i in 0..num_app {
-        writeln!(file, "    .quad app_{}_start", i).unwrap();
-        writeln!(file, "    .quad app_{}_end", i).unwrap();
+        // writeln!(file, "    .quad app_{}_start", i).unwrap();
+        // writeln!(file, "    .quad app_{}_end", i).unwrap();
         writeln!(file, "    .quad app_{}_name", i).unwrap();
     }
     // list dir
