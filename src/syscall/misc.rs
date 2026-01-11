@@ -1,6 +1,6 @@
 use crate::{
     debug_config::DEBUG_PTHREAD,
-    mm::{translated_byte_buffer, read_user_value, write_user_value},
+    mm::{translated_byte_buffer, read_user_value, write_user_value, MapPermission},
     syscall::robust_list::ROBUST_LIST_HEAD_LEN,
     task::processor::{current_process, current_task},
     trap::get_current_token,
@@ -335,7 +335,7 @@ pub fn syscall_getrandom(buf: usize, len: usize, _flags: u32) -> isize {
     let mut seed = (get_time() as u64)
         ^ ((current_process().getpid() as u64) << 32)
         ^ (current_linux_tid() as u64);
-    let chunks = translated_byte_buffer(token, buf as *mut u8, len);
+    let chunks = translated_byte_buffer(token, buf as *mut u8, len, MapPermission::W);
     let mut written = 0usize;
     for chunk in chunks {
         for b in chunk {
@@ -566,7 +566,7 @@ pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
     };
 
     let token = get_current_token();
-    let bufs = translated_byte_buffer(token, bufp as *mut u8, len);
+    let bufs = translated_byte_buffer(token, bufp as *mut u8, len, MapPermission::W);
     let mut off = 0usize;
     for b in bufs {
         if off >= data.len() {

@@ -15,7 +15,7 @@ pub const DEBUG_TIMER: bool = false;
 pub const DEBUG_SCHED: bool = false;
 
 /// Verbose trap logs (timer/software interrupts, user exceptions).
-pub const DEBUG_TRAP: bool = false;
+pub const DEBUG_TRAP: bool = true;
 
 /// Verbose syscall trace (very noisy).
 pub const DEBUG_SYSCALL: bool = false;
@@ -31,6 +31,9 @@ pub const DEBUG_FS: bool = false;
 
 /// Verbose network debug logs (socket send/recv).
 pub const DEBUG_NET: bool = false;
+
+/// Targeted logs for UnixBench hangs (alarm/pipe/signal).
+pub const DEBUG_UNIXBENCH: bool = true;
 
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
 pub const DEBUG_WATCHDOG: bool = false;

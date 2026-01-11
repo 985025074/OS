@@ -1,5 +1,6 @@
 use crate::{
     config::CLOCK_FREQ,
+    debug_config::DEBUG_UNIXBENCH,
     mm::{read_user_value, write_user_value},
     task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
     syscall::thread,
@@ -190,6 +191,14 @@ pub fn syscall_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize 
     };
     let pid = crate::task::processor::current_process().getpid();
     let prev_ms = set_alarm_timer(pid, if delay_ms == 0 { None } else { Some(delay_ms) });
+    crate::log_if!(
+        DEBUG_UNIXBENCH,
+        info,
+        "[alarm] set pid={} delay_ms={} prev_ms={}",
+        pid,
+        delay_ms,
+        prev_ms
+    );
     if old_ptr != 0 {
         write_itimerval(old_ptr, prev_ms);
     }

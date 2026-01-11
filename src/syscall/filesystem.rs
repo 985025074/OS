@@ -15,8 +15,8 @@ use crate::{
         make_pipe, open_file,
     },
     mm::{
-        UserBuffer, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,
-        translated_mutref, translated_str, write_user_value,
+        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, write_user_value,
     },
     task::processor::current_process,
     time::get_time,
@@ -1388,6 +1388,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         get_current_token(),
         buffer as *mut u8,
         len,
+        MapPermission::W,
     ));
     file.read(buf) as isize
 }
@@ -1406,6 +1407,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         get_current_token(),
         buffer as *mut u8,
         len,
+        MapPermission::R,
     ));
     file.write(buf) as isize
 }
@@ -1476,6 +1478,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             get_current_token(),
             buffer as *mut u8,
             len,
+            MapPermission::W,
         ));
         let n = file.read(buf) as isize;
         pf.set_offset(old);
@@ -1556,6 +1559,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             get_current_token(),
             buffer as *mut u8,
             len,
+            MapPermission::R,
         ));
         let n = file.write(buf) as isize;
         pf.set_offset(old);
@@ -1632,6 +1636,12 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
     }
     if oldfd >= inner.fd_table.len() || inner.fd_table[oldfd].is_none() {
         return EBADF;
+    }
+    if newfd < inner.fd_table.len() && inner.fd_table[newfd].is_some() {
+        inner.fd_table[newfd] = None;
+        if newfd < inner.fd_flags.len() {
+            inner.fd_flags[newfd] = 0;
+        }
     }
     let file = inner.fd_table[oldfd].as_ref().unwrap().clone();
     if oldfd >= inner.fd_flags.len() {
@@ -2157,7 +2167,7 @@ pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
     }
     let to_copy = min(cwd.len() + 1, size);
     let token = get_current_token();
-    let dst = translated_byte_buffer(token, buf as *mut u8, to_copy);
+    let dst = translated_byte_buffer(token, buf as *mut u8, to_copy, MapPermission::W);
 
     let mut copied = 0usize;
     for chunk in dst {
@@ -2544,7 +2554,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
             index += 1;
         }
 
-        let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written);
+        let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
         let mut src_off = 0usize;
         for ub in user_bufs {
             let end = src_off + ub.len();
@@ -2630,7 +2640,8 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
                 if written + reclen > len {
                     // Caller buffer full; keep current offset for next call.
                     os_inode.set_dir_offset(block_start + pos);
-                    let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written);
+                    let user_bufs =
+                        translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
                     let mut src_off = 0usize;
                     for ub in user_bufs {
                         let end = src_off + ub.len();
@@ -2662,7 +2673,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     }
 
     // Copy back to user buffer with per-page translation, avoiding per-byte translation overhead.
-    let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written);
+    let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
     let mut src_off = 0usize;
     for ub in user_bufs {
         let end = src_off + ub.len();

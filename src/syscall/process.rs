@@ -1,8 +1,11 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::mem::size_of;
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
-    debug_config::DEBUG_PTHREAD,
+    debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
     fs::ROOT_INODE,
     mm::{kernel_token, translated_single_address, translated_str, write_user_value},
     syscall::misc::encode_linux_tid,
@@ -73,6 +76,8 @@ fn load_file_from_path(path: &str) -> Option<Vec<u8>> {
     }
     None
 }
+
+static MUSL_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F']
@@ -216,12 +221,11 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         *inner.get_trap_cx()
     };
     let process = current_process();
-    let Some(child) = process.fork() else {
+    let Some((child, task)) = process.fork_with_task() else {
         return -12;
     };
 
     {
-        let task = child.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
         *trap_cx = parent_cx;
@@ -233,6 +237,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         trap_cx.kernel_sp = task.kstack.get_top();
         trap_cx.trap_handler = trap_handler as usize;
     }
+    add_task(task);
     child.getpid() as isize
 }
 
@@ -256,53 +261,74 @@ fn is_core_dump_signal(sig: i32) -> bool {
 pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {
     const WNOHANG: usize = 0x00000001;
     const ECHILD: isize = -10;
+    const EINTR: isize = -4;
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
     let mut temp_signal: Option<i32> = None;
     let mut temp_coredump = false;
     loop {
         let cur_process = current_process();
-        let (has_matching_child, zombie_pid) = {
-            let mut process_inner = cur_process.borrow_mut();
-            if process_inner.children.is_empty() {
-                (false, None)
-            } else {
-                let mut found: Option<(usize, usize)> = None; // (index, pid)
-                let mut has_match = false;
-                for (index, child) in process_inner.children.iter().enumerate() {
-                    let child_inner = child.borrow_mut();
-                    let matches = match pid {
-                        -1 => true, // any child
-                        0 => true,  // treat as any (pgid not modeled)
-                        p if p > 0 => child.pid.0 == p as usize,
-                        _ => true, // negative pgid not modeled; treat as any
-                    };
-                    if matches {
-                        has_match = true;
-                    }
-                    if matches && child_inner.is_zombie {
-                        temp_exit_code = child_inner.exit_code;
-                        temp_signal = child_inner
-                            .signals
-                            .check_error()
-                            .map(|(code, _)| -code);
-                        temp_coredump = temp_signal
-                            .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
-                            .unwrap_or(false);
-                        found = Some((index, child.pid.0));
-                        break;
-                    }
-                }
-                if let Some((index, pid)) = found {
-                    process_inner.children.remove(index);
-                    (true, Some(pid))
+        let task = current_task().unwrap();
+        let pending_unmasked = {
+            let inner = task.borrow_mut();
+            if let Some(sig) = inner.pending_signal {
+                if sig == 0 || sig > 64 {
+                    true
                 } else {
-                    (has_match, None)
+                    let bit = 1u64 << (sig - 1);
+                    (inner.signal_mask & bit) == 0
                 }
+            } else {
+                false
+            }
+        };
+        let mut process_inner = cur_process.borrow_mut();
+        if pending_unmasked {
+            process_inner
+                .wait_queue
+                .retain(|t| !Arc::ptr_eq(t, &task));
+            drop(process_inner);
+            return EINTR;
+        }
+        let (has_matching_child, zombie_pid) = if process_inner.children.is_empty() {
+            (false, None)
+        } else {
+            let mut found: Option<(usize, usize)> = None; // (index, pid)
+            let mut has_match = false;
+            for (index, child) in process_inner.children.iter().enumerate() {
+                let child_inner = child.borrow_mut();
+                let matches = match pid {
+                    -1 => true, // any child
+                    0 => true,  // treat as any (pgid not modeled)
+                    p if p > 0 => child.pid.0 == p as usize,
+                    _ => true, // negative pgid not modeled; treat as any
+                };
+                if matches {
+                    has_match = true;
+                }
+                if matches && child_inner.is_zombie {
+                    temp_exit_code = child_inner.exit_code;
+                    temp_signal = child_inner
+                        .signals
+                        .check_error()
+                        .map(|(code, _)| -code);
+                    temp_coredump = temp_signal
+                        .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
+                        .unwrap_or(false);
+                    found = Some((index, child.pid.0));
+                    break;
+                }
+            }
+            if let Some((index, pid)) = found {
+                process_inner.children.remove(index);
+                (true, Some(pid))
+            } else {
+                (has_match, None)
             }
         };
 
         if let Some(pid) = zombie_pid {
+            drop(process_inner);
             // Keep exited processes visible (e.g., for `kill $!`) until they are reaped.
             // Reaping happens here (wait4), so remove it from the global PID table now.
             crate::task::manager::remove_from_pid2process(pid);
@@ -325,25 +351,24 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
         }
 
         if !has_matching_child {
+            drop(process_inner);
             return ECHILD;
         }
 
         // Non-blocking wait: return immediately if no child has exited yet.
         if (_options & WNOHANG) != 0 {
+            drop(process_inner);
             return 0;
         }
 
         // Block until a child exits.
-        {
-            let task = current_task().unwrap();
-            let mut process_inner = cur_process.borrow_mut();
-            process_inner.wait_queue.push_back(task);
-        }
+        process_inner.wait_queue.push_back(task);
+        drop(process_inner);
         block_current_and_run_next();
     }
 }
 
-pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isize {
+pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     const ENOEXEC: isize = -8;
     const ENOENT: isize = -2;
     let token = get_current_token();
@@ -365,6 +390,19 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
         args_vec.push(path.clone());
     }
 
+    let mut envs_vec: Vec<String> = Vec::new();
+    if envp_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            let env_ptr = read_usize_user(token, envp_ptr + i * size_of::<usize>());
+            if env_ptr == 0 {
+                break;
+            }
+            envs_vec.push(translated_str(token, env_ptr as *const u8));
+            i += 1;
+        }
+    }
+
     let Some(file_data) = load_file_from_path(&path) else {
         return ENOENT;
     };
@@ -374,18 +412,30 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
         // Dynamic ELF: map both main program and interpreter, and start at the
         // interpreter entry with a Linux-like auxv (AT_PHDR/AT_ENTRY/AT_BASE).
         if let Some(interp) = elf_interp_path(&file_data) {
-            let Some(interp_data) = load_file_from_path(&interp) else {
+            let mut interp_data = load_file_from_path(&interp);
+            if interp_data.is_none() && interp.starts_with("/lib/ld-musl") {
+                const MUSL_FALLBACK: &str = "/lib/libc.so";
+                interp_data = load_file_from_path(MUSL_FALLBACK);
+                if DEBUG_UNIXBENCH && !MUSL_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                    log::info!(
+                        "[execve] missing interp={}, fallback={}",
+                        interp,
+                        MUSL_FALLBACK
+                    );
+                }
+            }
+            let Some(interp_data) = interp_data else {
                 return ENOENT;
             };
             if !is_elf(&interp_data) {
                 return ENOEXEC;
             }
             let process = current_process();
-            process.exec_dyn(&file_data, &interp_data, args_vec);
+            process.exec_dyn(&file_data, &interp_data, args_vec, envs_vec);
             return 0;
         }
         let process = current_process();
-        process.exec(&file_data, args_vec);
+        process.exec(&file_data, args_vec, envs_vec);
         return 0;
     }
 
@@ -410,7 +460,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
             new_args.push(a.clone());
         }
         let process = current_process();
-        process.exec(&interp_data, new_args);
+        process.exec(&interp_data, new_args, envs_vec);
         return 0;
     }
 
@@ -443,7 +493,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, _envp_ptr: usize) -> isi
             new_args.push(a.clone());
         }
         let process = current_process();
-        process.exec(&interp_data, new_args);
+        process.exec(&interp_data, new_args, envs_vec);
         return 0;
     }
 

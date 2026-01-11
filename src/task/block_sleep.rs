@@ -12,7 +12,7 @@ use spin::Mutex;
 use alloc::{collections::BinaryHeap, sync::Arc};
 use alloc::vec::Vec;
 
-use crate::debug_config::DEBUG_TIMER;
+use crate::debug_config::{DEBUG_TIMER, DEBUG_UNIXBENCH};
 use crate::task::process_block::ProcessControlBlock;
 use crate::{
     mm::write_user_value,
@@ -164,6 +164,7 @@ pub fn alarm_remaining_ms(pid: usize) -> usize {
 
 fn deliver_alarm(pid: usize) {
     let Some(proc) = pid2process(pid) else {
+        crate::log_if!(DEBUG_UNIXBENCH, info, "[alarm] drop pid={} (no process)", pid);
         return;
     };
     let task = {
@@ -181,13 +182,23 @@ fn deliver_alarm(pid: usize) {
         picked
     };
     let Some(task) = task else {
+        crate::log_if!(DEBUG_UNIXBENCH, info, "[alarm] drop pid={} (no task)", pid);
         return;
     };
-    {
+    let (tid, on_cpu) = {
         let mut inner = task.borrow_mut();
         inner.pending_signal = Some(14);
-    }
-    let on_cpu = task.on_cpu.load(AtomicOrdering::Acquire);
+        let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        (tid, task.on_cpu.load(AtomicOrdering::Acquire))
+    };
+    crate::log_if!(
+        DEBUG_UNIXBENCH,
+        info,
+        "[alarm] fire pid={} tid={} on_cpu={}",
+        pid,
+        tid,
+        on_cpu
+    );
     wakeup_task(task.clone());
     if on_cpu != TaskControlBlock::OFF_CPU {
         send_ipi(on_cpu);

@@ -221,34 +221,88 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     inner.memory_set.resolve_lazy_fault(va, access)
 }
 
-fn translated_address_with(token: usize, ptr: *const u8, access: MapPermission) -> &'static mut u8 {
+fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    let Some(mut inner) = process.try_borrow_mut() else {
+        return false;
+    };
+    if token != inner.memory_set.token() {
+        return false;
+    }
+    if access.contains(MapPermission::W) && inner.memory_set.resolve_cow_fault(va) {
+        return true;
+    }
+    inner.memory_set.resolve_lazy_fault(va, access)
+}
+
+fn user_access_fail(va: usize, access: MapPermission) -> ! {
+    const EFAULT: i32 = -14;
+    log::error!(
+        "[uaccess] invalid user access addr={:#x} access={:?}",
+        va,
+        access
+    );
+    crate::task::processor::exit_current_and_run_next(EFAULT);
+    unreachable!("killed current task due to invalid user access")
+}
+
+fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<PageTableEntry, ()> {
     let page_table = PageTable::from_token(token);
-    let va = VirtAddr::from(ptr as usize);
-    let vpn = va.floor();
-    let pte = match page_table.translate(vpn) {
+    let vpn = VirtAddr::from(va).floor();
+    let mut pte = match page_table.translate(vpn) {
         Some(pte) if pte.is_valid() => pte,
         _ => {
-            if try_resolve_lazy_page(token, ptr as usize, access) {
-                page_table.translate(vpn).unwrap()
+            if try_resolve_user_page(token, va, access) {
+                match page_table.translate(vpn) {
+                    Some(pte) if pte.is_valid() => pte,
+                    _ => return Err(()),
+                }
             } else {
-                page_table.translate(vpn).unwrap()
+                return Err(());
             }
         }
     };
+    let mut flags = pte.flags();
+    if access.contains(MapPermission::W) && !flags.contains(PTEFlags::W) {
+        if flags.contains(PTEFlags::COW) && try_resolve_user_page(token, va, access) {
+            pte = page_table.translate(vpn).ok_or(())?;
+            flags = pte.flags();
+        }
+    }
+    if !flags.contains(PTEFlags::U) {
+        return Err(());
+    }
+    if access.contains(MapPermission::R) && !flags.contains(PTEFlags::R) {
+        return Err(());
+    }
+    if access.contains(MapPermission::W) && !flags.contains(PTEFlags::W) {
+        return Err(());
+    }
+    if access.contains(MapPermission::X) && !flags.contains(PTEFlags::X) {
+        return Err(());
+    }
+    Ok(pte)
+}
+
+fn translated_address_with(token: usize, ptr: *const u8, access: MapPermission) -> &'static mut u8 {
+    let va = ptr as usize;
+    let pte = resolve_user_pte(token, va, access).unwrap_or_else(|_| user_access_fail(va, access));
     let ppn = pte.ppn();
-    &mut ppn.get_bytes_array()[va.page_offset()]
+    let page_off = VirtAddr::from(va).page_offset();
+    &mut ppn.get_bytes_array()[page_off]
 }
 
 /// Load a string from other address spaces into kernel space without an end `\0`.
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
-    let page_table = PageTable::from_token(token);
     let mut string = String::new();
     let mut va = ptr as usize;
     loop {
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_mut());
+        let ch: u8 = *translated_address_with(token, va as *const u8, MapPermission::R);
         if ch == 0 {
             break;
         }
@@ -264,41 +318,10 @@ pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
 
 /// Copy bytes from user space into a kernel buffer.
 ///
-/// Panics if any user page in the range is unmapped.
+/// Terminates the current task if any user page in the range is invalid.
 pub fn copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) {
-    if dst.is_empty() {
-        return;
-    }
-    let page_table = PageTable::from_token(token);
-    let mut start = src as usize;
-    let end = start + dst.len();
-    let mut written = 0usize;
-    while start < end {
-        let start_va = VirtAddr::from(start);
-        let vpn = start_va.floor();
-        let pte = match page_table.translate(vpn) {
-            Some(pte) if pte.is_valid() => pte,
-            _ => {
-                if try_resolve_lazy_page(token, start, MapPermission::R) {
-                    page_table.translate(vpn).unwrap()
-                } else {
-                    page_table.translate(vpn).unwrap()
-                }
-            }
-        };
-        let ppn = pte.ppn();
-        let pa: PhysAddr = ppn.into();
-        let page_off = start_va.page_offset();
-        let n = min(PAGE_SIZE - page_off, end - start);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (pa.0 + page_off) as *const u8,
-                dst.as_mut_ptr().add(written),
-                n,
-            );
-        }
-        start += n;
-        written += n;
+    if try_copy_from_user(token, src, dst).is_err() {
+        user_access_fail(src as usize, MapPermission::R);
     }
 }
 
@@ -309,26 +332,12 @@ pub fn try_copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) -> Resul
     if dst.is_empty() {
         return Ok(());
     }
-    let page_table = PageTable::from_token(token);
     let mut start = src as usize;
     let end = start.checked_add(dst.len()).ok_or(())?;
     let mut written = 0usize;
     while start < end {
         let start_va = VirtAddr::from(start);
-        let vpn = start_va.floor();
-        let pte = match page_table.translate(vpn) {
-            Some(pte) if pte.is_valid() => pte,
-            _ => {
-                if try_resolve_lazy_page(token, start, MapPermission::R) {
-                    match page_table.translate(vpn) {
-                        Some(pte) if pte.is_valid() => pte,
-                        _ => return Err(()),
-                    }
-                } else {
-                    return Err(());
-                }
-            }
-        };
+        let pte = resolve_user_pte(token, start, MapPermission::R)?;
         let ppn = pte.ppn();
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
@@ -348,41 +357,10 @@ pub fn try_copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) -> Resul
 
 /// Copy bytes from a kernel buffer into user space.
 ///
-/// Panics if any user page in the range is unmapped.
+/// Terminates the current task if any user page in the range is invalid.
 pub fn copy_to_user(token: usize, dst: *mut u8, src: &[u8]) {
-    if src.is_empty() {
-        return;
-    }
-    let page_table = PageTable::from_token(token);
-    let mut start = dst as usize;
-    let end = start + src.len();
-    let mut read = 0usize;
-    while start < end {
-        let start_va = VirtAddr::from(start);
-        let vpn = start_va.floor();
-        let pte = match page_table.translate(vpn) {
-            Some(pte) if pte.is_valid() => pte,
-            _ => {
-                if try_resolve_lazy_page(token, start, MapPermission::W) {
-                    page_table.translate(vpn).unwrap()
-                } else {
-                    page_table.translate(vpn).unwrap()
-                }
-            }
-        };
-        let ppn = pte.ppn();
-        let pa: PhysAddr = ppn.into();
-        let page_off = start_va.page_offset();
-        let n = min(PAGE_SIZE - page_off, end - start);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr().add(read),
-                (pa.0 + page_off) as *mut u8,
-                n,
-            );
-        }
-        start += n;
-        read += n;
+    if try_copy_to_user(token, dst, src).is_err() {
+        user_access_fail(dst as usize, MapPermission::W);
     }
 }
 
@@ -393,26 +371,12 @@ pub fn try_copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()
     if src.is_empty() {
         return Ok(());
     }
-    let page_table = PageTable::from_token(token);
     let mut start = dst as usize;
     let end = start.checked_add(src.len()).ok_or(())?;
     let mut read = 0usize;
     while start < end {
         let start_va = VirtAddr::from(start);
-        let vpn = start_va.floor();
-        let pte = match page_table.translate(vpn) {
-            Some(pte) if pte.is_valid() => pte,
-            _ => {
-                if try_resolve_lazy_page(token, start, MapPermission::W) {
-                    match page_table.translate(vpn) {
-                        Some(pte) if pte.is_valid() => pte,
-                        _ => return Err(()),
-                    }
-                } else {
-                    return Err(());
-                }
-            }
-        };
+        let pte = resolve_user_pte(token, start, MapPermission::W)?;
         let ppn = pte.ppn();
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
@@ -468,23 +432,27 @@ pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u
     translated_address_with(token, ptr, MapPermission::R)
 }
 /// translate a pointer to a mutable u8 Vec through page table
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
-    let page_table = PageTable::from_token(token);
+pub fn translated_byte_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: MapPermission,
+) -> Vec<&'static mut [u8]> {
+    if len == 0 {
+        return Vec::new();
+    }
     let mut start = ptr as usize;
-    let end = start + len;
+    let end = match start.checked_add(len) {
+        Some(v) => v,
+        None => user_access_fail(start, access),
+    };
     let mut v = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let pte = match page_table.translate(vpn) {
-            Some(pte) if pte.is_valid() => pte,
-            _ => {
-                if !try_resolve_lazy_page(token, start, MapPermission::W) {
-                    let _ = try_resolve_lazy_page(token, start, MapPermission::R);
-                }
-                page_table.translate(vpn).unwrap()
-            }
-        };
+        let pte = resolve_user_pte(token, start, access).unwrap_or_else(|_| {
+            user_access_fail(start, access);
+        });
         let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();

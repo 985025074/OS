@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::{
     config::MAX_HARTS,
-    mm::{read_user_value, translated_byte_buffer, write_user_value},
+    mm::{read_user_value, translated_byte_buffer, write_user_value, MapPermission},
     task::{manager::pid2process, processor::current_process, ProcessControlBlock},
     trap::get_current_token,
 };
@@ -131,7 +131,12 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         tmp[cpu / 8] |= 1u8 << (cpu % 8);
     }
     let token = get_current_token();
-    let bufs = translated_byte_buffer(token, mask_ptr as *mut u8, cpusetsize);
+    let bufs = translated_byte_buffer(
+        token,
+        mask_ptr as *mut u8,
+        cpusetsize,
+        MapPermission::W,
+    );
     let mut off = 0usize;
     for b in bufs {
         let n = core::cmp::min(b.len(), cpusetsize - off);

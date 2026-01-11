@@ -1,7 +1,19 @@
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use spin::Mutex;
 
-use crate::{fs::File, mm::UserBuffer, task::processor::suspend_current_and_run_next};
+use crate::{
+    debug_config::DEBUG_UNIXBENCH,
+    fs::File,
+    mm::UserBuffer,
+    task::{
+        manager::{wakeup_task, PID2PCB},
+        processor::{current_task, suspend_current_and_run_next},
+    },
+};
 
 // A small pipe buffer makes typical shell pipelines (busybox/ash, rt-tests) extremely
 // slow and can even deadlock if producers/consumers don't run concurrently.
@@ -59,6 +71,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
+    read_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
+    write_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
 }
 
 impl PipeRingBuffer {
@@ -70,6 +84,8 @@ impl PipeRingBuffer {
             status: RingBufferStatus::EMPTY,
             read_end: None,
             write_end: None,
+            read_waiters: VecDeque::new(),
+            write_waiters: VecDeque::new(),
         }
     }
 
@@ -126,6 +142,92 @@ impl PipeRingBuffer {
     pub fn all_read_ends_closed(&self) -> bool {
         self.read_end.as_ref().unwrap().upgrade().is_none()
     }
+
+    fn read_end_count(&self) -> usize {
+        self.read_end
+            .as_ref()
+            .map(|w| w.strong_count())
+            .unwrap_or(0)
+    }
+
+    fn write_end_count(&self) -> usize {
+        self.write_end
+            .as_ref()
+            .map(|w| w.strong_count())
+            .unwrap_or(0)
+    }
+
+    fn push_reader(&mut self, task: Arc<crate::task::task_block::TaskControlBlock>) -> bool {
+        if self.read_waiters.iter().any(|t| Arc::ptr_eq(t, &task)) {
+            return false;
+        }
+        self.read_waiters.push_back(task);
+        true
+    }
+
+    fn push_writer(&mut self, task: Arc<crate::task::task_block::TaskControlBlock>) -> bool {
+        if self.write_waiters.iter().any(|t| Arc::ptr_eq(t, &task)) {
+            return false;
+        }
+        self.write_waiters.push_back(task);
+        true
+    }
+
+    fn pop_reader(&mut self) -> Option<Arc<crate::task::task_block::TaskControlBlock>> {
+        self.read_waiters.pop_front()
+    }
+
+    fn pop_writer(&mut self) -> Option<Arc<crate::task::task_block::TaskControlBlock>> {
+        self.write_waiters.pop_front()
+    }
+
+    fn drain_readers(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
+        self.read_waiters.drain(..).collect()
+    }
+
+    fn drain_writers(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
+        self.write_waiters.drain(..).collect()
+    }
+}
+
+fn log_pipe_end_owners(end: &Arc<Pipe>, label: &str) {
+    if !DEBUG_UNIXBENCH {
+        return;
+    }
+    let end_ptr = Arc::as_ptr(end);
+    let map = PID2PCB.lock();
+    let mut owners = Vec::new();
+    let mut total = 0usize;
+    for (pid, pcb) in map.iter() {
+        let Some(inner) = pcb.try_borrow_mut() else {
+            continue;
+        };
+        for (fd, file) in inner.fd_table.iter().enumerate() {
+            let Some(file) = file else {
+                continue;
+            };
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                continue;
+            };
+            if (pipe as *const Pipe) == end_ptr {
+                total += 1;
+                if owners.len() < 8 {
+                    owners.push((*pid, fd));
+                }
+            }
+        }
+    }
+    drop(map);
+    if total > 0 {
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[pipe] {} owners={:?} total={}",
+            label,
+            owners,
+            total
+        );
+    }
 }
 
 /// Return (read_end, write_end)
@@ -151,14 +253,60 @@ impl File for Pipe {
     fn read(&self, buf: UserBuffer) -> usize {
         assert!(self.readable());
         let want_to_read = buf.len();
+        if want_to_read == 0 {
+            return 0;
+        }
+        let has_pending_signal = || {
+            current_task()
+                .map(|t| t.borrow_mut().pending_signal.is_some())
+                .unwrap_or(false)
+        };
         loop {
             let mut ring_buffer = self.buffer.lock();
             let avail = ring_buffer.available_read();
             if avail == 0 {
-                if ring_buffer.all_write_ends_closed() {
+                if has_pending_signal() {
+                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] read abort (pending signal)");
                     return 0;
                 }
+                if ring_buffer.all_write_ends_closed() {
+                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] read EOF");
+                    return 0;
+                }
+                let task = current_task().unwrap();
+                let task_for_log = task.clone();
+                let inserted = ring_buffer.push_reader(task);
+                let waiters = ring_buffer.read_waiters.len();
+                let writers = ring_buffer.write_end_count();
+                let write_end = ring_buffer.write_end.as_ref().and_then(|w| w.upgrade());
                 drop(ring_buffer);
+                if DEBUG_UNIXBENCH && inserted {
+                    let pid = task_for_log
+                        .process
+                        .upgrade()
+                        .map(|p| p.getpid())
+                        .unwrap_or(usize::MAX);
+                    let tid = task_for_log
+                        .borrow_mut()
+                        .res
+                        .as_ref()
+                        .map(|r| r.tid)
+                        .unwrap_or(usize::MAX);
+                    crate::log_if!(
+                        DEBUG_UNIXBENCH,
+                        info,
+                        "[pipe] wait read pid={} tid={} waiters={} writers={}",
+                        pid,
+                        tid,
+                        waiters,
+                        writers
+                    );
+                    if writers > 0 {
+                        if let Some(end) = write_end {
+                            log_pipe_end_owners(&end, "write");
+                        }
+                    }
+                }
                 suspend_current_and_run_next();
                 continue;
             }
@@ -176,43 +324,138 @@ impl File for Pipe {
                 }
                 read_now += 1;
             }
+            let writer = if read_now > 0 {
+                ring_buffer.pop_writer()
+            } else {
+                None
+            };
+            drop(ring_buffer);
+            if let Some(writer) = writer {
+                wakeup_task(writer);
+            }
             return read_now;
         }
     }
     fn write(&self, buf: UserBuffer) -> usize {
         assert!(self.writable());
         let want_to_write = buf.len();
-        let mut buf_iter = buf.into_iter();
+        if want_to_write == 0 {
+            return 0;
+        }
+        let has_pending_signal = || {
+            current_task()
+                .map(|t| t.borrow_mut().pending_signal.is_some())
+                .unwrap_or(false)
+        };
+        // Copy user data up front to avoid holding user pointers across blocking writes.
+        let mut data = Vec::with_capacity(want_to_write);
+        for byte_ref in buf.into_iter() {
+            unsafe {
+                data.push(*byte_ref);
+            }
+        }
+        let mut buf_iter = data.into_iter();
         let mut already_write = 0usize;
         loop {
             let mut ring_buffer = self.buffer.lock();
             let loop_write = ring_buffer.available_write();
             if loop_write == 0 {
-                if ring_buffer.all_read_ends_closed() {
+                if has_pending_signal() {
+                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write abort (pending signal)");
                     return already_write;
                 }
+                if ring_buffer.all_read_ends_closed() {
+                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write to closed read end");
+                    return already_write;
+                }
+                let task = current_task().unwrap();
+                let task_for_log = task.clone();
+                let inserted = ring_buffer.push_writer(task);
+                let waiters = ring_buffer.write_waiters.len();
+                let readers = ring_buffer.read_end_count();
+                let read_end = ring_buffer.read_end.as_ref().and_then(|w| w.upgrade());
                 drop(ring_buffer);
+                if DEBUG_UNIXBENCH && inserted {
+                    let pid = task_for_log
+                        .process
+                        .upgrade()
+                        .map(|p| p.getpid())
+                        .unwrap_or(usize::MAX);
+                    let tid = task_for_log
+                        .borrow_mut()
+                        .res
+                        .as_ref()
+                        .map(|r| r.tid)
+                        .unwrap_or(usize::MAX);
+                    crate::log_if!(
+                        DEBUG_UNIXBENCH,
+                        info,
+                        "[pipe] wait write pid={} tid={} waiters={} readers={}",
+                        pid,
+                        tid,
+                        waiters,
+                        readers
+                    );
+                    if readers > 0 {
+                        if let Some(end) = read_end {
+                            log_pipe_end_owners(&end, "read");
+                        }
+                    }
+                }
                 suspend_current_and_run_next();
                 continue;
             }
             // write at most loop_write bytes
+            let mut reader_to_wake: Option<Arc<crate::task::task_block::TaskControlBlock>> = None;
             for _ in 0..loop_write {
-                if let Some(byte_ref) = buf_iter.next() {
-                    unsafe {
-                        ring_buffer.write_byte(*byte_ref);
-                    }
+                if let Some(byte) = buf_iter.next() {
+                    ring_buffer.write_byte(byte);
                     already_write += 1;
+                    if reader_to_wake.is_none() {
+                        reader_to_wake = ring_buffer.pop_reader();
+                    }
                     if already_write == want_to_write {
+                        drop(ring_buffer);
+                        if let Some(reader) = reader_to_wake {
+                            wakeup_task(reader);
+                        }
                         return want_to_write;
                     }
                 } else {
+                    drop(ring_buffer);
+                    if let Some(reader) = reader_to_wake {
+                        wakeup_task(reader);
+                    }
                     return already_write;
                 }
+            }
+            drop(ring_buffer);
+            if let Some(reader) = reader_to_wake {
+                wakeup_task(reader);
             }
         }
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        let mut ring = self.buffer.lock();
+        if self.readable {
+            let writers = ring.drain_writers();
+            drop(ring);
+            for task in writers {
+                wakeup_task(task);
+            }
+        } else if self.writable {
+            let readers = ring.drain_readers();
+            drop(ring);
+            for task in readers {
+                wakeup_task(task);
+            }
+        }
     }
 }

@@ -476,6 +476,19 @@ pub struct ProcessControlBlockInner {
 }
 
 impl ProcessControlBlockInner {
+    fn close_cloexec_fds(&mut self) {
+        const FD_CLOEXEC: u32 = 1;
+        if self.fd_flags.len() < self.fd_table.len() {
+            self.fd_flags.resize(self.fd_table.len(), 0);
+        }
+        for (idx, flags) in self.fd_flags.iter_mut().enumerate() {
+            if (*flags & FD_CLOEXEC) != 0 {
+                self.fd_table[idx] = None;
+                *flags = 0;
+            }
+        }
+    }
+
     #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
@@ -639,7 +652,7 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) {
+    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         assert_eq!(self.borrow_mut().thread_count(), 1);
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
@@ -648,6 +661,7 @@ impl ProcessControlBlock {
         // substitute memory_set
         {
             let mut inner = self.borrow_mut();
+            inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
             inner.memory_set = memory_set;
@@ -669,11 +683,11 @@ impl ProcessControlBlock {
         // Build a Linux-like initial stack layout so both:
         // - C runtime can read argc/argv from `sp` (as in oscomp ulib), and
         // - Rust runtime can read argc/argv from a0/a1.
-    let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
+        let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             &args,
-            &[],
+            &envs,
             elf_aux,
             entry_point,
             0,
@@ -696,7 +710,13 @@ impl ProcessControlBlock {
     /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
     /// map both the main program and the interpreter, then start at the interpreter entry
     /// while exposing the main program metadata via auxv (AT_PHDR/AT_ENTRY) and AT_BASE.
-    pub fn exec_dyn(self: &Arc<Self>, elf_data: &[u8], interp_data: &[u8], args: Vec<String>) {
+    pub fn exec_dyn(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        interp_data: &[u8],
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) {
         assert_eq!(self.borrow_mut().thread_count(), 1);
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
             MemorySet::from_elf_with_interp(elf_data, interp_data);
@@ -704,6 +724,7 @@ impl ProcessControlBlock {
         let heap_start = ustack_base + USER_STACK_SIZE;
         {
             let mut inner = self.borrow_mut();
+            inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
             inner.memory_set = memory_set;
@@ -728,7 +749,7 @@ impl ProcessControlBlock {
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             &args,
-            &[],
+            &envs,
             main_aux,
             main_entry,
             interp_base,
@@ -749,8 +770,7 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
     }
 
-    /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
+    fn fork_impl(self: &Arc<Self>) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
         let mut parent = self.borrow_mut();
         assert_eq!(parent.thread_count(), 1);
         let sched_policy = parent.sched_policy;
@@ -858,11 +878,22 @@ impl ProcessControlBlock {
 
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        // add this thread to scheduler
-        add_task(task);
         // add child to parent's children list (after success)
         self.borrow_mut().children.push(Arc::clone(&child));
+        Some((child, task))
+    }
+
+    /// Only support processes with a single thread.
+    pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
+        let (child, task) = self.fork_impl()?;
+        // add this thread to scheduler
+        add_task(task);
         Some(child)
+    }
+
+    /// Fork and return both the child process and its main task, without scheduling it.
+    pub fn fork_with_task(self: &Arc<Self>) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+        self.fork_impl()
     }
 
     pub fn getpid(&self) -> usize {

@@ -491,6 +491,11 @@ pub fn trap_return() -> ! {
     disable_supervisor_interrupt();
     set_user_trap_entry();
 
+    // Ensure we always return to user mode even if the trap context got corrupted.
+    let cx = get_trap_context();
+    cx.sstatus.set_spp(sstatus::SPP::User);
+    cx.sstatus.set_spie(true);
+
     // Get the trap context virtual address for the current thread
     let task = crate::task::processor::current_task().unwrap();
     let trap_cx_ptr = {

@@ -1,33 +1,27 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
+use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::{
-    debug_config::DEBUG_PTHREAD,
+    debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
     mm::{read_user_value, try_read_user_value, write_user_value},
     sbi::send_ipi,
     syscall::misc::decode_linux_tid,
     task::{
         block_sleep::add_timer,
         manager::{pid2process, wakeup_task},
-        processor::{block_current_and_run_next, current_process, current_task, exit_current_and_run_next},
+        processor::{
+            block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
+        },
         signal::{
-            kill,
-            kill_current,
-            set_signal,
-            set_signal_mask,
-            RtSigAction,
-            SignalAction,
-            SignalFlags,
-            RT_SIG_MAX,
-            SIG_DFL,
-            SIG_IGN,
+            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SignalAction, SignalFlags, kill,
+            kill_current, set_signal, set_signal_mask,
         },
         task_block::{SigSavedContext, TaskControlBlock},
     },
     time::get_time_ms,
     trap::get_current_token,
 };
-use crate::config::SIGRETURN_TRAMPOLINE;
 
 fn sigreturn_trampoline_va() -> usize {
     unsafe extern "C" {
@@ -57,7 +51,11 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
 /// Delivers a signal to a specific thread (Linux-style tid encoding).
 pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     if sig == 0 {
-        return if pid2process(tgid).is_some() { 0 } else { ESRCH };
+        return if pid2process(tgid).is_some() {
+            0
+        } else {
+            ESRCH
+        };
     }
     if DEBUG_PTHREAD {
         crate::println!("[tgkill] tgid={} tid={} sig={}", tgid, tid, sig);
@@ -124,6 +122,18 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
     }
     if act != 0 {
         let new = read_user_value(token, act as *const RtSigAction);
+        if DEBUG_UNIXBENCH && signum == 14 {
+            crate::log_if!(
+                DEBUG_UNIXBENCH,
+                info,
+                "[signal] sigaction sig={} handler={:#x} flags={:#x} restorer={:#x} mask={:#x}",
+                signum,
+                new.handler,
+                new.flags,
+                new.restorer,
+                new.mask
+            );
+        }
         if DEBUG_PTHREAD {
             crate::println!(
                 "[rt_sigaction] signo={} handler={:#x} flags={:#x} restorer={:#x} mask={:#x}",
@@ -161,9 +171,9 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
             );
         }
         match how {
-            0 => inner.signal_mask |= new_mask,       // SIG_BLOCK
-            1 => inner.signal_mask &= !new_mask,      // SIG_UNBLOCK
-            2 => inner.signal_mask = new_mask,        // SIG_SETMASK
+            0 => inner.signal_mask |= new_mask,  // SIG_BLOCK
+            1 => inner.signal_mask &= !new_mask, // SIG_UNBLOCK
+            2 => inner.signal_mask = new_mask,   // SIG_SETMASK
             _ => return EINVAL,
         }
     }
@@ -175,53 +185,58 @@ pub fn syscall_rt_sigreturn() -> isize {
     let task = current_task().unwrap();
     let mut inner = task.borrow_mut();
     if DEBUG_PTHREAD {
-        crate::println!("[rt_sigreturn] tid={}", inner.res.as_ref().map(|r| r.tid).unwrap_or(0));
+        crate::println!(
+            "[rt_sigreturn] tid={}",
+            inner.res.as_ref().map(|r| r.tid).unwrap_or(0)
+        );
     }
-    if let Some(saved) = inner.sig_saved_ctx.take() {
-        if saved.uses_ucontext && saved.ucontext_ptr != 0 {
-            let token = get_current_token();
-            let sp = inner.get_trap_cx().x[2];
-            let a2 = inner.get_trap_cx().x[12];
-            let uc = try_read_user_value(token, saved.ucontext_ptr as *const UContext)
-                .or_else(|| try_read_user_value(token, sp as *const UContext));
-            if let Some(uc) = uc {
-                if DEBUG_PTHREAD && saved.signum == 33 {
-                    let tp = saved.trap_cx.x[4];
-                    let cancel = try_read_user_value(token, tp.wrapping_sub(156) as *const i32);
-                    let canceldisable = try_read_user_value(token, tp.wrapping_sub(152) as *const u8);
-                    let cancelasync = try_read_user_value(token, tp.wrapping_sub(151) as *const u8);
-                    let sig_ctx = uc.uc_mcontext;
-                    log::debug!(
-                        "[sigcancel] ucontext ptr={:#x} sp={:#x} a2={:#x} sepc {:#x}->{:#x} a0 {:#x}->{:#x} mask {:#x}->{:#x} tp {:#x}->{:#x} flags={:?}/{:?}/{:?}",
-                        saved.ucontext_ptr,
-                        sp,
-                        a2,
-                        saved.trap_cx.sepc,
-                        sig_ctx.regs.pc,
-                        saved.trap_cx.x[10],
-                        sig_ctx.regs.a0,
-                        saved.mask,
-                        uc.uc_sigmask,
-                        saved.trap_cx.x[4],
-                        sig_ctx.regs.tp,
-                        cancel,
-                        canceldisable,
-                        cancelasync
-                    );
-                }
-                let mut restored = saved.trap_cx;
+    let Some(saved) = inner.sig_saved_ctx.take() else {
+        drop(inner);
+        exit_current_and_run_next(-1);
+        unreachable!("exit_current_and_run_next should not return");
+    };
+    if saved.uses_ucontext && saved.ucontext_ptr != 0 {
+        let token = get_current_token();
+        let sp = inner.get_trap_cx().x[2];
+        let a2 = inner.get_trap_cx().x[12];
+        let uc = try_read_user_value(token, saved.ucontext_ptr as *const UContext)
+            .or_else(|| try_read_user_value(token, sp as *const UContext));
+        if let Some(uc) = uc {
+            if DEBUG_PTHREAD && saved.signum == 33 {
+                let tp = saved.trap_cx.x[4];
+                let cancel = try_read_user_value(token, tp.wrapping_sub(156) as *const i32);
+                let canceldisable = try_read_user_value(token, tp.wrapping_sub(152) as *const u8);
+                let cancelasync = try_read_user_value(token, tp.wrapping_sub(151) as *const u8);
                 let sig_ctx = uc.uc_mcontext;
-                sig_ctx.regs.write_to_trap(&mut restored);
-                *inner.get_trap_cx() = restored;
-                inner.signal_mask = uc.uc_sigmask;
-                return restored.x[10] as isize;
+                log::debug!(
+                    "[sigcancel] ucontext ptr={:#x} sp={:#x} a2={:#x} sepc {:#x}->{:#x} a0 {:#x}->{:#x} mask {:#x}->{:#x} tp {:#x}->{:#x} flags={:?}/{:?}/{:?}",
+                    saved.ucontext_ptr,
+                    sp,
+                    a2,
+                    saved.trap_cx.sepc,
+                    sig_ctx.regs.pc,
+                    saved.trap_cx.x[10],
+                    sig_ctx.regs.a0,
+                    saved.mask,
+                    uc.uc_sigmask,
+                    saved.trap_cx.x[4],
+                    sig_ctx.regs.tp,
+                    cancel,
+                    canceldisable,
+                    cancelasync
+                );
             }
+            let mut restored = saved.trap_cx;
+            let sig_ctx = uc.uc_mcontext;
+            sig_ctx.regs.write_to_trap(&mut restored);
+            *inner.get_trap_cx() = restored;
+            inner.signal_mask = uc.uc_sigmask;
+            return restored.x[10] as isize;
         }
-        *inner.get_trap_cx() = saved.trap_cx;
-        inner.signal_mask = saved.mask;
-        return saved.trap_cx.x[10] as isize;
     }
-    0
+    *inner.get_trap_cx() = saved.trap_cx;
+    inner.signal_mask = saved.mask;
+    saved.trap_cx.x[10] as isize
 }
 
 #[repr(C, align(16))]
@@ -439,7 +454,12 @@ fn remove_waiter(task: &Arc<TaskControlBlock>) {
 }
 
 /// Linux `rt_sigtimedwait` (syscall 137).
-pub fn syscall_rt_sigtimedwait(set: usize, info: usize, timeout: usize, sigsetsize: usize) -> isize {
+pub fn syscall_rt_sigtimedwait(
+    set: usize,
+    info: usize,
+    timeout: usize,
+    sigsetsize: usize,
+) -> isize {
     let _ = info;
     let _ = sigsetsize;
     if set == 0 {
@@ -545,6 +565,23 @@ pub fn maybe_deliver_signal() {
         inner.pending_signal = None;
         sig
     };
+    if DEBUG_UNIXBENCH && signum == 14 {
+        let pid = current_process().getpid();
+        let tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[signal] deliver pid={} tid={} sig={}",
+            pid,
+            tid,
+            signum
+        );
+    }
     if DEBUG_PTHREAD {
         let mask = task.borrow_mut().signal_mask;
         crate::println!("[signal] deliver sig={} mask={:#x}", signum, mask);
