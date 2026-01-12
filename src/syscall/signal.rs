@@ -77,6 +77,23 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
         let mut inner = task.borrow_mut();
         inner.pending_signal = Some(sig as usize);
     }
+    if DEBUG_PTHREAD && sig == 33 {
+        let (tid_idx, status, on_cpu) = {
+            let inner = task.borrow_mut();
+            (
+                inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                inner.task_status,
+                task.on_cpu.load(Ordering::Acquire),
+            )
+        };
+        log::debug!(
+            "[tgkill] sigcancel pid={} tid_index={} status={:?} on_cpu={}",
+            tgid,
+            tid_idx,
+            status,
+            on_cpu
+        );
+    }
     let on_cpu = task.on_cpu.load(Ordering::Acquire);
     wakeup_task(task);
     if on_cpu != TaskControlBlock::OFF_CPU {

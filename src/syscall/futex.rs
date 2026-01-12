@@ -162,6 +162,28 @@ pub fn syscall_futex(
                     EAGAIN
                 };
             }
+            if crate::debug_config::DEBUG_PTHREAD {
+                let (tid, pending_sig, mask) = {
+                    let inner = task.borrow_mut();
+                    (
+                        inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                        inner.pending_signal,
+                        inner.signal_mask,
+                    )
+                };
+                log::debug!(
+                    "[futex_wait] pid={} tid={} uaddr={:#x} val={} pending_sig={:?} mask={:#x}",
+                    pid,
+                    tid,
+                    uaddr,
+                    val,
+                    pending_sig,
+                    mask
+                );
+            }
+            if pending_unmasked_signal() {
+                return EINTR;
+            }
             if DEBUG_FUTEX {
                 let tid = task
                     .borrow_mut()
@@ -212,6 +234,23 @@ pub fn syscall_futex(
                 add_timer(Arc::clone(&task), wait_ms);
             }
             block_current_and_run_next();
+            if crate::debug_config::DEBUG_PTHREAD {
+                let (tid, pending_sig, mask) = {
+                    let inner = task.borrow_mut();
+                    (
+                        inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                        inner.pending_signal,
+                        inner.signal_mask,
+                    )
+                };
+                log::debug!(
+                    "[futex_wait] pid={} tid={} woke pending_sig={:?} mask={:#x}",
+                    pid,
+                    tid,
+                    pending_sig,
+                    mask
+                );
+            }
             if pending_unmasked_signal() {
                 remove_waiter(pid, uaddr, &task);
                 return EINTR;

@@ -1,10 +1,17 @@
 use crate::{
     debug_config::DEBUG_PTHREAD,
-    mm::{translated_byte_buffer, read_user_value, write_user_value, MapPermission},
-    syscall::robust_list::ROBUST_LIST_HEAD_LEN,
+    fs::{ROOT_INODE, ext4_lock},
+    mm::{
+        MapPermission, read_user_value, translated_byte_buffer, translated_str,
+        try_write_user_value, write_user_value,
+    },
+    syscall::{
+        filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
+        robust_list::ROBUST_LIST_HEAD_LEN,
+    },
     task::processor::{current_process, current_task},
-    trap::get_current_token,
     time::get_time,
+    trap::get_current_token,
 };
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +29,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // futex owner bits (OWNER_DIED/WAITERS) remain usable.
 // (tgid << 15) occupies bits [15..29] for typical OSComp PID ranges (< 32768).
 const LINUX_TID_PID_SHIFT: usize = 15;
+
+static UMASK: AtomicUsize = AtomicUsize::new(0);
+
+const EPERM: isize = -1;
+const EFAULT: isize = -14;
+const ENOENT: isize = -2;
+const ENOTDIR: isize = -20;
 
 pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
     if tid_index == 0 {
@@ -109,16 +123,59 @@ pub fn syscall_mount(
     _flags: usize,
     _data: usize,
 ) -> isize {
+    const MS_RDONLY: usize = 0x1;
+    if current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+    let token = get_current_token();
+    let dir = translated_str(token, _dir as *const u8);
+    if dir.is_empty() {
+        return ENOENT;
+    }
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let abs = normalize_path(&cwd, &dir);
+    let _ext4_guard = ext4_lock();
+    let inode = match ROOT_INODE.find_path(&abs) {
+        Some(v) => v,
+        None => return ENOENT,
+    };
+    if !inode.is_dir() {
+        return ENOTDIR;
+    }
+    if (_flags & MS_RDONLY) != 0 {
+        register_rofs_mount(&abs);
+    } else {
+        unregister_rofs_mount(&abs);
+    }
     0
 }
 
 pub fn syscall_umount2(_special: usize, _flags: usize) -> isize {
+    if current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+    let token = get_current_token();
+    let path = translated_str(token, _special as *const u8);
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let abs = normalize_path(&cwd, &path);
+    unregister_rofs_mount(&abs);
     0
 }
 
 pub fn syscall_getppid() -> isize {
     let process = current_process();
-    let parent = { process.borrow_mut().parent.as_ref().and_then(|p| p.upgrade()) };
+    let parent = {
+        process
+            .borrow_mut()
+            .parent
+            .as_ref()
+            .and_then(|p| p.upgrade())
+    };
     parent.map(|p| p.getpid() as isize).unwrap_or(0)
 }
 
@@ -169,15 +226,305 @@ pub fn syscall_set_tid_address(_tidptr: usize) -> isize {
 }
 
 pub fn syscall_getuid() -> isize {
-    0
+    let process = current_process();
+    process.borrow_mut().uid as isize
 }
 pub fn syscall_geteuid() -> isize {
-    0
+    let process = current_process();
+    process.borrow_mut().euid as isize
 }
 pub fn syscall_getgid() -> isize {
-    0
+    let process = current_process();
+    process.borrow_mut().gid as isize
 }
 pub fn syscall_getegid() -> isize {
+    let process = current_process();
+    process.borrow_mut().egid as isize
+}
+
+pub fn current_real_uid_gid() -> (u32, u32) {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    (inner.uid, inner.gid)
+}
+
+pub fn current_effective_uid_gid() -> (u32, u32) {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    (inner.euid, inner.egid)
+}
+
+pub fn current_fsuid_gid() -> (u32, u32) {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    (inner.fsuid, inner.fsgid)
+}
+
+fn uid_allowed(uid: u32, ruid: u32, euid: u32, suid: u32) -> bool {
+    uid == ruid || uid == euid || uid == suid
+}
+
+fn gid_allowed(gid: u32, rgid: u32, egid: u32, sgid: u32) -> bool {
+    gid == rgid || gid == egid || gid == sgid
+}
+
+/// Linux `setuid(2)` (syscall 146 on riscv64).
+pub fn syscall_setuid(uid: usize) -> isize {
+    let uid = uid as u32;
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid == 0 {
+        inner.uid = uid;
+        inner.euid = uid;
+        inner.suid = uid;
+        inner.fsuid = uid;
+        return 0;
+    }
+    if uid_allowed(uid, inner.uid, inner.euid, inner.suid) {
+        inner.euid = uid;
+        inner.suid = uid;
+        inner.fsuid = uid;
+        return 0;
+    }
+    EPERM
+}
+
+/// Linux `setgid(2)` (syscall 144 on riscv64).
+pub fn syscall_setgid(gid: usize) -> isize {
+    let gid = gid as u32;
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid == 0 {
+        inner.gid = gid;
+        inner.egid = gid;
+        inner.sgid = gid;
+        inner.fsgid = gid;
+        return 0;
+    }
+    if gid_allowed(gid, inner.gid, inner.egid, inner.sgid) {
+        inner.egid = gid;
+        inner.sgid = gid;
+        inner.fsgid = gid;
+        return 0;
+    }
+    EPERM
+}
+
+/// Linux `setreuid(2)` (syscall 145 on riscv64).
+pub fn syscall_setreuid(ruid: usize, euid: usize) -> isize {
+    let new_ruid = if ruid == usize::MAX {
+        None
+    } else {
+        Some(ruid as u32)
+    };
+    let new_euid = if euid == usize::MAX {
+        None
+    } else {
+        Some(euid as u32)
+    };
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid != 0 {
+        if let Some(r) = new_ruid {
+            if r != inner.uid && r != inner.euid {
+                return EPERM;
+            }
+        }
+        if let Some(e) = new_euid {
+            if !uid_allowed(e, inner.uid, inner.euid, inner.suid) {
+                return EPERM;
+            }
+        }
+    }
+    if let Some(r) = new_ruid {
+        inner.uid = r;
+    }
+    if let Some(e) = new_euid {
+        inner.euid = e;
+        inner.suid = e;
+        inner.fsuid = e;
+    }
+    0
+}
+
+/// Linux `setregid(2)` (syscall 143 on riscv64).
+pub fn syscall_setregid(rgid: usize, egid: usize) -> isize {
+    let new_rgid = if rgid == usize::MAX {
+        None
+    } else {
+        Some(rgid as u32)
+    };
+    let new_egid = if egid == usize::MAX {
+        None
+    } else {
+        Some(egid as u32)
+    };
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid != 0 {
+        if let Some(r) = new_rgid {
+            if r != inner.gid && r != inner.egid {
+                return EPERM;
+            }
+        }
+        if let Some(e) = new_egid {
+            if !gid_allowed(e, inner.gid, inner.egid, inner.sgid) {
+                return EPERM;
+            }
+        }
+    }
+    if let Some(r) = new_rgid {
+        inner.gid = r;
+    }
+    if let Some(e) = new_egid {
+        inner.egid = e;
+        inner.sgid = e;
+        inner.fsgid = e;
+    }
+    0
+}
+
+/// Linux `setresuid(2)` (syscall 147 on riscv64).
+pub fn syscall_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
+    let new_ruid = if ruid == usize::MAX {
+        None
+    } else {
+        Some(ruid as u32)
+    };
+    let new_euid = if euid == usize::MAX {
+        None
+    } else {
+        Some(euid as u32)
+    };
+    let new_suid = if suid == usize::MAX {
+        None
+    } else {
+        Some(suid as u32)
+    };
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid != 0 {
+        for cand in [new_ruid, new_euid, new_suid] {
+            if let Some(v) = cand {
+                if !uid_allowed(v, inner.uid, inner.euid, inner.suid) {
+                    return EPERM;
+                }
+            }
+        }
+    }
+    if let Some(r) = new_ruid {
+        inner.uid = r;
+    }
+    if let Some(e) = new_euid {
+        inner.euid = e;
+        inner.fsuid = e;
+    }
+    if let Some(s) = new_suid {
+        inner.suid = s;
+    } else if new_euid.is_some() {
+        inner.suid = inner.euid;
+    }
+    0
+}
+
+/// Linux `setresgid(2)` (syscall 149 on riscv64).
+pub fn syscall_setresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
+    let new_rgid = if rgid == usize::MAX {
+        None
+    } else {
+        Some(rgid as u32)
+    };
+    let new_egid = if egid == usize::MAX {
+        None
+    } else {
+        Some(egid as u32)
+    };
+    let new_sgid = if sgid == usize::MAX {
+        None
+    } else {
+        Some(sgid as u32)
+    };
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid != 0 {
+        for cand in [new_rgid, new_egid, new_sgid] {
+            if let Some(v) = cand {
+                if !gid_allowed(v, inner.gid, inner.egid, inner.sgid) {
+                    return EPERM;
+                }
+            }
+        }
+    }
+    if let Some(r) = new_rgid {
+        inner.gid = r;
+    }
+    if let Some(e) = new_egid {
+        inner.egid = e;
+        inner.fsgid = e;
+    }
+    if let Some(s) = new_sgid {
+        inner.sgid = s;
+    } else if new_egid.is_some() {
+        inner.sgid = inner.egid;
+    }
+    0
+}
+
+/// Linux `setfsuid(2)` (syscall 151 on riscv64).
+pub fn syscall_setfsuid(uid: usize) -> isize {
+    let uid = uid as u32;
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    let prev = inner.fsuid;
+    if inner.euid == 0 || uid_allowed(uid, inner.uid, inner.euid, inner.suid) {
+        inner.fsuid = uid;
+    }
+    prev as isize
+}
+
+/// Linux `setfsgid(2)` (syscall 152 on riscv64).
+pub fn syscall_setfsgid(gid: usize) -> isize {
+    let gid = gid as u32;
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    let prev = inner.fsgid;
+    if inner.euid == 0 || gid_allowed(gid, inner.gid, inner.egid, inner.sgid) {
+        inner.fsgid = gid;
+    }
+    prev as isize
+}
+
+/// Linux `getresuid(2)` (syscall 148 on riscv64).
+pub fn syscall_getresuid(ruid: usize, euid: usize, suid: usize) -> isize {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    let token = get_current_token();
+    if ruid != 0 && try_write_user_value(token, ruid as *mut u32, &inner.uid).is_err() {
+        return EFAULT;
+    }
+    if euid != 0 && try_write_user_value(token, euid as *mut u32, &inner.euid).is_err() {
+        return EFAULT;
+    }
+    if suid != 0 && try_write_user_value(token, suid as *mut u32, &inner.suid).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+/// Linux `getresgid(2)` (syscall 150 on riscv64).
+pub fn syscall_getresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    let token = get_current_token();
+    if rgid != 0 && try_write_user_value(token, rgid as *mut u32, &inner.gid).is_err() {
+        return EFAULT;
+    }
+    if egid != 0 && try_write_user_value(token, egid as *mut u32, &inner.egid).is_err() {
+        return EFAULT;
+    }
+    if sgid != 0 && try_write_user_value(token, sgid as *mut u32, &inner.sgid).is_err() {
+        return EFAULT;
+    }
     0
 }
 
@@ -254,7 +601,12 @@ fn rlimit_for_resource(resource: usize) -> (u64, u64) {
 /// Linux `prlimit64(2)` (syscall 261 on riscv64).
 ///
 /// Provide a permissive "unlimited" answer for common queries (e.g. RLIMIT_STACK).
-pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_limit: usize) -> isize {
+pub fn syscall_prlimit64(
+    _pid: usize,
+    _resource: usize,
+    _new_limit: usize,
+    old_limit: usize,
+) -> isize {
     if _new_limit != 0 {
         let token = get_current_token();
         let new = read_user_value(token, _new_limit as *const RLimit64);
@@ -276,10 +628,7 @@ pub fn syscall_prlimit64(_pid: usize, _resource: usize, _new_limit: usize, old_l
     if old_limit != 0 {
         let token = get_current_token();
         let (rlim_cur, rlim_max) = rlimit_for_resource(_resource);
-        let rl = RLimit64 {
-            rlim_cur,
-            rlim_max,
-        };
+        let rl = RLimit64 { rlim_cur, rlim_max };
         write_user_value(token, old_limit as *mut RLimit64, &rl);
     }
     0
@@ -290,10 +639,7 @@ pub fn syscall_getrlimit(resource: usize, rlim: usize) -> isize {
     if rlim != 0 {
         let token = get_current_token();
         let (rlim_cur, rlim_max) = rlimit_for_resource(resource);
-        let rl = RLimit64 {
-            rlim_cur,
-            rlim_max,
-        };
+        let rl = RLimit64 { rlim_cur, rlim_max };
         write_user_value(token, rlim as *mut RLimit64, &rl);
     }
     0
@@ -365,7 +711,13 @@ struct PollFd {
 ///
 /// Minimal readiness reporting for shells (busybox/ash) and glibc helpers.
 /// We conservatively mark fds as ready if they are readable/writable.
-pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize, _sigsetsize: usize) -> isize {
+pub fn syscall_ppoll(
+    fds_ptr: usize,
+    nfds: usize,
+    _tmo_p: usize,
+    _sigmask: usize,
+    _sigsetsize: usize,
+) -> isize {
     const POLLIN: i16 = 0x0001;
     const POLLOUT: i16 = 0x0004;
     const EBADF: isize = -9;
@@ -455,11 +807,14 @@ pub fn syscall_ppoll(fds_ptr: usize, nfds: usize, _tmo_p: usize, _sigmask: usize
     }
 }
 
+pub fn current_umask() -> usize {
+    UMASK.load(Ordering::Relaxed)
+}
+
 /// Linux `umask(2)` (syscall 166 on riscv64).
 ///
 /// A minimal implementation for daemon() and common utilities.
 pub fn syscall_umask(mask: usize) -> isize {
-    static UMASK: AtomicUsize = AtomicUsize::new(0);
     let prev = UMASK.swap(mask & 0o777, Ordering::Relaxed);
     prev as isize
 }

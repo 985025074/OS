@@ -6,9 +6,10 @@ use core::{
 
 use crate::{
     debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
-    fs::ROOT_INODE,
+    fs::ext4_lock,
     mm::{kernel_token, translated_single_address, translated_str, write_user_value},
     syscall::misc::encode_linux_tid,
+    syscall::filesystem::resolve_exec_inode,
     task::{
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
@@ -16,36 +17,6 @@ use crate::{
     },
     trap::{get_current_token, trap_handler},
 };
-
-fn normalize_path(cwd: &str, path: &str) -> String {
-    let mut parts = Vec::new();
-    let absolute = path.starts_with('/');
-    if !absolute {
-        for seg in cwd.split('/') {
-            if seg.is_empty() || seg == "." {
-                continue;
-            }
-            if seg == ".." {
-                parts.pop();
-                continue;
-            }
-            parts.push(seg);
-        }
-    }
-    for seg in path.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        if seg == ".." {
-            parts.pop();
-            continue;
-        }
-        parts.push(seg);
-    }
-    let mut out = String::from("/");
-    out.push_str(&parts.join("/"));
-    out
-}
 
 fn read_usize_user(token: usize, ptr: usize) -> usize {
     let mut raw = [0u8; size_of::<usize>()];
@@ -55,26 +26,28 @@ fn read_usize_user(token: usize, ptr: usize) -> usize {
     usize::from_ne_bytes(raw)
 }
 
-fn load_file_from_path(path: &str) -> Option<Vec<u8>> {
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-    let abs = normalize_path(&cwd, path);
-
-    if let Some(inode) = ROOT_INODE.find_path(&abs) {
-        if inode.is_file() {
-            return Some(inode.read_all());
+fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
+    const ENOENT: isize = -2;
+    match resolve_exec_inode(path) {
+        Ok(inode) => {
+            let _ext4_guard = ext4_lock();
+            return Ok(inode.read_all());
         }
+        Err(e) if e != ENOENT => return Err(e),
+        Err(_) => {}
     }
-    if !abs.ends_with(".bin") {
-        let mut with_bin = abs.clone();
+    if !path.ends_with(".bin") {
+        let mut with_bin = String::from(path);
         with_bin.push_str(".bin");
-        if let Some(inode) = ROOT_INODE.find_path(&with_bin) {
-            if inode.is_file() {
-                return Some(inode.read_all());
+        return match resolve_exec_inode(&with_bin) {
+            Ok(inode) => {
+                let _ext4_guard = ext4_lock();
+                Ok(inode.read_all())
             }
-        }
+            Err(e) => Err(e),
+        };
     }
-    None
+    Err(ENOENT)
 }
 
 static MUSL_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -129,13 +102,14 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_THREAD: usize = 0x0001_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
 
     // Thread-like clone: share address space (glibc pthreads).
-    if (flags & CLONE_VM) != 0 {
+    if (flags & CLONE_VM) != 0 && (flags & CLONE_THREAD) != 0 {
         const ENOMEM: isize = -12;
         let task = current_task().unwrap();
         let parent_mask = {
@@ -351,6 +325,19 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
         }
 
         if !has_matching_child {
+            if DEBUG_PTHREAD {
+                let child_pids = process_inner
+                    .children
+                    .iter()
+                    .map(|c| c.getpid())
+                    .collect::<Vec<_>>();
+                log::debug!(
+                    "[wait4] pid={} wait_pid={} no matching child children={:?}",
+                    cur_process.getpid(),
+                    pid,
+                    child_pids
+                );
+            }
             drop(process_inner);
             return ECHILD;
         }
@@ -403,8 +390,9 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     }
 
-    let Some(file_data) = load_file_from_path(&path) else {
-        return ENOENT;
+    let file_data = match load_file_from_path(&path) {
+        Ok(data) => data,
+        Err(e) => return e,
     };
 
     // ELF binary: normal exec.
@@ -412,10 +400,18 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         // Dynamic ELF: map both main program and interpreter, and start at the
         // interpreter entry with a Linux-like auxv (AT_PHDR/AT_ENTRY/AT_BASE).
         if let Some(interp) = elf_interp_path(&file_data) {
-            let mut interp_data = load_file_from_path(&interp);
+            let mut interp_data = match load_file_from_path(&interp) {
+                Ok(data) => Some(data),
+                Err(ENOENT) => None,
+                Err(e) => return e,
+            };
             if interp_data.is_none() && interp.starts_with("/lib/ld-musl") {
                 const MUSL_FALLBACK: &str = "/lib/libc.so";
-                interp_data = load_file_from_path(MUSL_FALLBACK);
+                interp_data = match load_file_from_path(MUSL_FALLBACK) {
+                    Ok(data) => Some(data),
+                    Err(ENOENT) => None,
+                    Err(e) => return e,
+                };
                 if DEBUG_UNIXBENCH && !MUSL_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                     log::info!(
                         "[execve] missing interp={}, fallback={}",
@@ -442,8 +438,9 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     // Script with shebang: emulate Linux `#!` handling in-kernel so that
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(&file_data) {
-        let Some(interp_data) = load_file_from_path(&interp) else {
-            return ENOENT;
+        let interp_data = match load_file_from_path(&interp) {
+            Ok(data) => data,
+            Err(e) => return e,
         };
         if !is_elf(&interp_data) {
             return ENOEXEC;
@@ -469,12 +466,17 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     // scripts working when shells don't retry on ENOEXEC.
     if path.ends_with(".sh") {
         let mut interp: Option<(String, Vec<u8>, bool)> = None;
-        if let Some(data) = load_file_from_path("/bin/busybox") {
-            interp = Some((String::from("/bin/busybox"), data, true));
-        } else if let Some(data) = load_file_from_path("/busybox") {
-            interp = Some((String::from("/busybox"), data, true));
-        } else if let Some(data) = load_file_from_path("/bin/sh") {
-            interp = Some((String::from("/bin/sh"), data, false));
+        for (candidate, needs_sh_arg) in
+            [("/bin/busybox", true), ("/busybox", true), ("/bin/sh", false)]
+        {
+            match load_file_from_path(candidate) {
+                Ok(data) => {
+                    interp = Some((String::from(candidate), data, needs_sh_arg));
+                    break;
+                }
+                Err(ENOENT) => {}
+                Err(e) => return e,
+            }
         }
 
         let Some((interp_path, interp_data, needs_sh_arg)) = interp else {

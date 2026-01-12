@@ -6,7 +6,11 @@
 /// Default kernel log level when `LOG` is not set at build time.
 ///
 /// You can override it by building with `LOG=error|warn|info|debug|trace`.
-pub const DEFAULT_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Warn;
+pub const DEFAULT_LOG_LEVEL: log::LevelFilter = if DEBUG_UNIXBENCH {
+    log::LevelFilter::Info
+} else {
+    log::LevelFilter::Warn
+};
 
 /// Verbose timer debug logs (sleep timers, expiration, wakeups).
 pub const DEBUG_TIMER: bool = false;

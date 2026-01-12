@@ -7,6 +7,7 @@ const EINVAL: isize = -22;
 const EMFILE: isize = -24;
 
 const O_NONBLOCK: u32 = 0x800;
+const O_PATH: u32 = 0x200000;
 const FD_CLOEXEC: u32 = 1;
 
 const CLOEXEC_FLAG: usize = 0x80000;
@@ -148,7 +149,7 @@ pub fn syscall_fspick(_dirfd: isize, _path: usize, _flags: usize) -> isize {
 }
 
 pub fn syscall_open_tree(_dirfd: isize, _path: usize, _flags: usize) -> isize {
-    alloc_dummy_fd(0)
+    alloc_dummy_fd(O_PATH)
 }
 
 pub fn syscall_memfd_create(_name: usize, flags: usize) -> isize {

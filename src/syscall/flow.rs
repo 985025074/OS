@@ -1,6 +1,6 @@
 use crate::{
     println,
-    task::processor::{exit_current_and_run_next, suspend_current_and_run_next},
+    task::processor::{exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next},
     trap::get_current_token,
 };
 
@@ -63,6 +63,11 @@ pub fn syscall_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 pub fn syscall_exit(_code: usize) -> isize {
     exit_current_and_run_next(_code as i32);
     return 0;
+}
+
+pub fn syscall_exit_group(_code: usize) -> isize {
+    exit_group_and_run_next(_code as i32);
+    0
 }
 // the below one is just for testing
 pub fn syscall_fortest(a: usize, b: usize) -> isize {

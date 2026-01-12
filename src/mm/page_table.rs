@@ -394,6 +394,37 @@ pub fn try_copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()
     Ok(())
 }
 
+/// Copy bytes into user space, ignoring user R/W/X permissions.
+///
+/// This is intended for kernel-internal population of freshly-mapped pages
+/// (e.g., file-backed `mmap`) where user permissions may be read-only.
+pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let mut start = dst as usize;
+    let end = start.checked_add(src.len()).ok_or(())?;
+    let mut read = 0usize;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let pte = resolve_user_pte(token, start, MapPermission::U)?;
+        let ppn = pte.ppn();
+        let pa: PhysAddr = ppn.into();
+        let page_off = start_va.page_offset();
+        let n = min(PAGE_SIZE - page_off, end - start);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(read),
+                (pa.0 + page_off) as *mut u8,
+                n,
+            );
+        }
+        start += n;
+        read += n;
+    }
+    Ok(())
+}
+
 pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     let mut value = MaybeUninit::<T>::uninit();
     let dst_bytes = unsafe {

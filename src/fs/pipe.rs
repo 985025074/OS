@@ -11,7 +11,7 @@ use crate::{
     mm::UserBuffer,
     task::{
         manager::{wakeup_task, PID2PCB},
-        processor::{current_task, suspend_current_and_run_next},
+        processor::{block_current_and_run_next, current_task},
     },
 };
 
@@ -307,7 +307,7 @@ impl File for Pipe {
                         }
                     }
                 }
-                suspend_current_and_run_next();
+                block_current_and_run_next();
                 continue;
             }
             // Read at most what's currently available; for pipes, returning a
@@ -402,7 +402,7 @@ impl File for Pipe {
                         }
                     }
                 }
-                suspend_current_and_run_next();
+                block_current_and_run_next();
                 continue;
             }
             // write at most loop_write bytes

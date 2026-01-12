@@ -3,7 +3,7 @@ use core::cmp::min;
 use crate::{
     config::PAGE_SIZE,
     fs::{File, OSInode, PseudoShmFile, ext4_lock},
-    mm::{MapPermission, PTEFlags, frame_alloc, translated_mutref},
+    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user_unchecked},
     task::processor::current_process,
     trap::get_current_token,
 };
@@ -265,8 +265,14 @@ pub fn syscall_mmap(
                 if read == 0 {
                     break;
                 }
-                for i in 0..read {
-                    *translated_mutref(token, (start + pos + i) as *mut u8) = tmp[i];
+                if try_copy_to_user_unchecked(
+                    token,
+                    (start + pos) as *mut u8,
+                    &tmp[..read],
+                )
+                .is_err()
+                {
+                    return ENOMEM;
                 }
                 pos += read;
             }

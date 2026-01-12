@@ -16,7 +16,8 @@ use crate::{
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, write_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, try_read_user_value,
+        try_copy_to_user, write_user_value,
     },
     task::processor::current_process,
     time::get_time,
@@ -45,9 +46,14 @@ const O_CLOEXEC: usize = 0x80000;
 const O_TMPFILE: usize = 0x410000;
 
 const FD_CLOEXEC: u32 = 1;
+const PATH_MAX: usize = 4096;
+const MAX_SYMLINKS: usize = 40;
 
 // Linux errno (negative return in kernel ABI).
 const EBADF: isize = -9;
+const EFAULT: isize = -14;
+const ELOOP: isize = -40;
+const EPERM: isize = -1;
 const ENOENT: isize = -2;
 const EINVAL: isize = -22;
 const EMFILE: isize = -24;
@@ -78,6 +84,7 @@ struct InodeTimes {
 
 lazy_static! {
     static ref INODE_TIMES: Mutex<BTreeMap<u64, InodeTimes>> = Mutex::new(BTreeMap::new());
+    static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
 
 fn get_inode_times(ino: u64) -> InodeTimes {
@@ -88,13 +95,38 @@ fn set_inode_times(ino: u64, times: InodeTimes) {
     INODE_TIMES.lock().insert(ino, times);
 }
 
+pub(crate) fn register_rofs_mount(abs: &str) {
+    let mut mounts = ROFS_MOUNTS.lock();
+    if !mounts.iter().any(|m| m == abs) {
+        mounts.push(String::from(abs));
+    }
+}
+
+pub(crate) fn unregister_rofs_mount(abs: &str) {
+    let mut mounts = ROFS_MOUNTS.lock();
+    mounts.retain(|m| m != abs);
+}
+
+fn path_is_rofs(abs: &str) -> bool {
+    let mounts = ROFS_MOUNTS.lock();
+    mounts.iter().any(|mnt| {
+        if mnt == "/" {
+            return true;
+        }
+        if abs == mnt {
+            return true;
+        }
+        abs.starts_with(mnt) && abs.as_bytes().get(mnt.len()) == Some(&b'/')
+    })
+}
+
 fn current_timespec() -> (i64, i64) {
     let ticks = get_time() as u64;
     let ns = ticks.saturating_mul(1_000_000_000) / CLOCK_FREQ as u64;
     ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
 }
 
-fn normalize_path(cwd: &str, path: &str) -> String {
+pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
     if !absolute {
@@ -218,6 +250,9 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     if path.is_empty() {
         return Err(ENOENT);
     }
+    if path.len() > PATH_MAX {
+        return Err(ENAMETOOLONG);
+    }
 
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
@@ -270,6 +305,179 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     Err(ENOTDIR)
 }
 
+fn read_user_cstring(token: usize, ptr: usize) -> Result<String, isize> {
+    if ptr == 0 {
+        return Err(EFAULT);
+    }
+    let mut out = String::new();
+    for i in 0..=PATH_MAX {
+        let ch = match try_read_user_value(token, (ptr + i) as *const u8) {
+            Some(v) => v,
+            None => return Err(EFAULT),
+        };
+        if ch == 0 {
+            return Ok(out);
+        }
+        out.push(ch as char);
+        if out.len() > PATH_MAX {
+            return Err(ENAMETOOLONG);
+        }
+    }
+    Err(ENAMETOOLONG)
+}
+
+fn resolve_ext4_path(
+    start: alloc::sync::Arc<ext4_fs::Inode>,
+    path: &str,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+    depth: &mut usize,
+) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let mut stack: Vec<alloc::sync::Arc<ext4_fs::Inode>> = alloc::vec![start];
+    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut idx = 0usize;
+    while idx < components.len() {
+        let seg = components[idx];
+        if seg == "." {
+            idx += 1;
+            continue;
+        }
+        if seg == ".." {
+            if stack.len() > 1 {
+                stack.pop();
+            }
+            idx += 1;
+            continue;
+        }
+        let cur = stack.last().unwrap().clone();
+        if !cur.is_dir() {
+            return Err(ENOTDIR);
+        }
+        if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
+            return Err(EACCES);
+        }
+        let Some(next) = cur.find(seg) else {
+            return Err(ENOENT);
+        };
+        let is_last = idx + 1 == components.len();
+        if next.is_symlink() && (follow_final || !is_last) {
+            if *depth >= MAX_SYMLINKS {
+                return Err(ELOOP);
+            }
+            *depth += 1;
+            let target_bytes = next.read_all();
+            let target = String::from_utf8_lossy(&target_bytes).into_owned();
+            if target.is_empty() {
+                return Err(ENOENT);
+            }
+            let remaining = if is_last {
+                String::new()
+            } else {
+                components[idx + 1..].join("/")
+            };
+            let mut new_path = target;
+            if !remaining.is_empty() {
+                if !new_path.ends_with('/') {
+                    new_path.push('/');
+                }
+                new_path.push_str(&remaining);
+            }
+            let new_start = if new_path.starts_with('/') {
+                alloc::sync::Arc::clone(&ROOT_INODE)
+            } else {
+                cur
+            };
+            return resolve_ext4_path(new_start, &new_path, uid, gid, follow_final, depth);
+        }
+        stack.push(next);
+        idx += 1;
+    }
+    Ok(stack.last().unwrap().clone())
+}
+
+fn resolve_at_inode(
+    at: &AtPath,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let mut depth = 0usize;
+    match at {
+        AtPath::Ext4Abs(abs) => resolve_ext4_path(alloc::sync::Arc::clone(&ROOT_INODE), abs, uid, gid, follow_final, &mut depth),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Ok(alloc::sync::Arc::clone(base))
+            } else {
+                resolve_ext4_path(alloc::sync::Arc::clone(base), rel, uid, gid, follow_final, &mut depth)
+            }
+        }
+        AtPath::PseudoAbs(_) => Err(ENOENT),
+    }
+}
+
+pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let at = resolve_at_path(AT_FDCWD, path)?;
+    if let AtPath::PseudoAbs(_) = &at {
+        return Err(ENOENT);
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    if !inode.is_file() {
+        return Err(EACCES);
+    }
+    if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
+        return Err(EACCES);
+    }
+    Ok(inode)
+}
+
+fn resolve_parent_and_name(
+    at: &AtPath,
+    uid: u32,
+    gid: u32,
+) -> Result<(alloc::sync::Arc<ext4_fs::Inode>, alloc::string::String), isize> {
+    let mut depth = 0usize;
+    match at {
+        AtPath::Ext4Abs(abs) => {
+            if abs == "/" {
+                return Err(EINVAL);
+            }
+            let Some((parent_path, name)) = split_parent_and_name(abs) else {
+                return Err(EINVAL);
+            };
+            if name.is_empty() {
+                return Err(EINVAL);
+            }
+            let parent = if parent_path.is_empty() {
+                alloc::sync::Arc::clone(&ROOT_INODE)
+            } else {
+                resolve_ext4_path(alloc::sync::Arc::clone(&ROOT_INODE), parent_path, uid, gid, true, &mut depth)?
+            };
+            Ok((parent, alloc::string::String::from(name)))
+        }
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                return Err(EINVAL);
+            }
+            let Some((parent_path, name)) = split_parent_and_name(rel) else {
+                return Err(EINVAL);
+            };
+            if name.is_empty() {
+                return Err(EINVAL);
+            }
+            let parent = if parent_path.is_empty() {
+                alloc::sync::Arc::clone(base)
+            } else {
+                resolve_ext4_path(alloc::sync::Arc::clone(base), parent_path, uid, gid, true, &mut depth)?
+            };
+            Ok((parent, alloc::string::String::from(name)))
+        }
+        AtPath::PseudoAbs(_) => Err(EROFS),
+    }
+}
+
 fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -298,6 +506,12 @@ fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
     Some(abs)
 }
 
+fn rofs_for_path(dirfd: isize, path: &str) -> bool {
+    resolve_abs_path(dirfd, path)
+        .map(|abs| path_is_rofs(&abs))
+        .unwrap_or(false)
+}
+
 fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
     match e {
         ext4_fs::Ext4Error::NotADirectory => ENOTDIR,
@@ -311,22 +525,61 @@ fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
     }
 }
 
-fn inode_mode_allows(inode_mode: u16, mask: usize) -> bool {
-    // Use "other" permission bits as a permissive default (no uid/gid model).
-    let perm = (inode_mode & 0o777) as usize;
+fn current_real_uid_gid() -> (u32, u32) {
+    crate::syscall::misc::current_real_uid_gid()
+}
+
+fn current_effective_uid_gid() -> (u32, u32) {
+    crate::syscall::misc::current_effective_uid_gid()
+}
+
+fn current_fsuid_gid() -> (u32, u32) {
+    crate::syscall::misc::current_fsuid_gid()
+}
+
+fn inode_mode_allows_uid_gid(inode: &ext4_fs::Inode, mask: usize, uid: u32, gid: u32) -> bool {
     if mask == 0 {
         return true;
     }
-    if (mask & 1) != 0 && (perm & 0o001) == 0 {
+    let mode = inode.mode() as usize;
+
+    if uid == 0 {
+        // Root bypasses read/write checks, but still needs execute bits for files.
+        if (mask & 1) != 0 && !inode.is_dir() && (mode & 0o111) == 0 {
+            return false;
+        }
+        return true;
+    }
+
+    let perm = if uid == inode.uid() {
+        (mode >> 6) & 0o7
+    } else if gid == inode.gid() {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    if (mask & 4) != 0 && (perm & 0o4) == 0 {
         return false;
     }
-    if (mask & 2) != 0 && (perm & 0o002) == 0 {
+    if (mask & 2) != 0 && (perm & 0o2) == 0 {
         return false;
     }
-    if (mask & 4) != 0 && (perm & 0o004) == 0 {
+    if (mask & 1) != 0 && (perm & 0o1) == 0 {
         return false;
     }
     true
+}
+
+fn inode_mode_allows(inode: &ext4_fs::Inode, mask: usize) -> bool {
+    let (uid, gid) = current_fsuid_gid();
+    inode_mode_allows_uid_gid(inode, mask, uid, gid)
+}
+
+fn apply_umask(mode: usize) -> u16 {
+    let umask = crate::syscall::misc::current_umask() as u16;
+    let perm = (mode as u16) & 0o777;
+    let special = (mode as u16) & 0o7000;
+    special | (perm & !umask)
 }
 
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -471,7 +724,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     ret
 }
 
-pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize) -> isize {
+pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
@@ -502,6 +755,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
             _ => (true, false),
         }
     };
+    let write_intent = writable || (flags & (O_CREAT | O_TRUNC | O_TMPFILE)) != 0;
+    let readonly_fs = rofs_for_path(dirfd, &path);
+    if write_intent && readonly_fs {
+        return EROFS;
+    }
     let append = !o_path && (flags & O_APPEND) != 0;
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -509,6 +767,9 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         Err(e) => return e,
     };
     let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
+    let create_mode = apply_umask(mode);
+    let mut created = false;
+    let (fsuid, fsgid) = current_fsuid_gid();
 
     // Pseudo fs: `/proc`, `/sys`, `/dev`.
     if let AtPath::PseudoAbs(abs) = &at {
@@ -564,17 +825,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
 
     let ext4_guard = ext4_lock();
 
-    // ext4 lookup.
-    let mut inode = match &at {
-        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(alloc::sync::Arc::clone(base))
-            } else {
-                base.find_path(rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+    // ext4 lookup with search permission checks and symlink resolution.
+    let mut inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+        Ok(v) => Some(v),
+        Err(ENOENT) => None,
+        Err(e) => return e,
     };
 
     if tmpfile_requested {
@@ -585,8 +840,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         if !dir_inode.is_dir() {
             return ENOTDIR;
         }
+        if !inode_mode_allows_uid_gid(&dir_inode, 3, fsuid, fsgid) {
+            return EACCES;
+        }
         let pid = current_process().getpid();
-        let mut created = None;
+        let mut tmp_created = None;
         for _ in 0..64 {
             let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
             let name = alloc::format!(".tmp.{}.{}", pid, seq);
@@ -595,60 +853,38 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
             }
             match dir_inode.create_file(&name) {
                 Ok(i) => {
-                    created = Some(i);
+                    tmp_created = Some(i);
                     break;
                 }
                 Err(e) => return ext4_err_to_errno(e),
             }
         }
-        let Some(tmp_inode) = created else {
+        let Some(tmp_inode) = tmp_created else {
             return ENOSPC;
         };
         inode = Some(tmp_inode);
+        created = true;
     }
 
     // CREATE: create file if missing (Linux: only affects the final component).
     if inode.is_none() && (flags & O_CREAT != 0) {
         match &at {
-            AtPath::Ext4Abs(abs) => {
-                let Some((parent_path, name)) = split_parent_and_name(abs) else {
-                    return EINVAL;
-                };
-                if name.is_empty() {
-                    return EISDIR;
-                }
-                let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
-                let Some(parent) = ROOT_INODE.find_path(parent_path) else {
-                    return ENOENT;
+            AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
+                let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+                    Ok(v) => v,
+                    Err(e) => return e,
                 };
                 if !parent.is_dir() {
                     return ENOTDIR;
                 }
-                inode = match parent.create_file(name) {
-                    Ok(i) => Some(i),
-                    Err(e) => return ext4_err_to_errno(e),
-                };
-            }
-            AtPath::Ext4Rel { base, rel } => {
-                let Some((parent_path, name)) = split_parent_and_name(rel) else {
-                    return EINVAL;
-                };
-                if name.is_empty() {
-                    return EISDIR;
+                if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+                    return EACCES;
                 }
-                let parent = if parent_path.is_empty() {
-                    alloc::sync::Arc::clone(base)
-                } else {
-                    let Some(p) = base.find_path(parent_path) else {
-                        return ENOENT;
-                    };
-                    p
-                };
-                if !parent.is_dir() {
-                    return ENOTDIR;
-                }
-                inode = match parent.create_file(name) {
-                    Ok(i) => Some(i),
+                inode = match parent.create_file(&name) {
+                    Ok(i) => {
+                        created = true;
+                        Some(i)
+                    }
                     Err(e) => return ext4_err_to_errno(e),
                 };
             }
@@ -661,12 +897,17 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         None => return ENOENT,
     };
 
+    if created {
+        inode.set_mode(create_mode);
+        inode.set_uid_gid(fsuid, fsgid);
+    }
+
     // Linux: opening a directory for write is not allowed.
     if !o_path && inode.is_dir() && (flags & O_ACCMODE) != O_RDONLY {
         return EISDIR;
     }
 
-    // Basic permission check (no uid/gid model; use "other" permission bits).
+    // Basic permission check based on owner/group/other bits.
     let mut mask = 0usize;
     if readable {
         mask |= 4;
@@ -674,7 +915,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
     if writable {
         mask |= 2;
     }
-    if !inode_mode_allows(inode.mode(), mask) {
+    if !inode_mode_allows(&inode, mask) {
         return EACCES;
     }
 
@@ -688,7 +929,13 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, _mode: usize)
         }
     }
 
-    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append(readable, writable, append, inode));
+    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs(
+        readable,
+        writable,
+        append,
+        inode,
+        readonly_fs,
+    ));
     drop(ext4_guard);
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -1070,8 +1317,14 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
 ///
 /// Used by busybox `which` and shells to locate executables.
 pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
+    if mode & !0x7 != 0 {
+        return EINVAL;
+    }
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ENOENT;
     }
@@ -1082,27 +1335,21 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
-        // Treat known pseudo nodes as always accessible (no uid/gid model yet).
+        // Treat known pseudo nodes as always accessible.
         return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
     }
 
+    let (uid, gid) = current_real_uid_gid();
     let _ext4_guard = ext4_lock();
-    let inode = match &at {
-        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(alloc::sync::Arc::clone(base))
-            } else {
-                base.find_path(rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
-    };
-    let Some(inode) = inode else {
-        return ENOENT;
+    let inode = match resolve_at_inode(&at, uid, gid, true) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    if !inode_mode_allows(inode.mode(), mode) {
+    if (mode & 2) != 0 && rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
         return EACCES;
     }
     0
@@ -1110,12 +1357,20 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
 
 /// Linux `fchmod(2)` (syscall 52 on riscv64).
 pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
-    let Some(_file) = get_fd_file(fd) else {
+    let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
-    if let Some(inode) = get_fd_inode(fd) {
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if os_inode.readonly_fs() {
+            return EROFS;
+        }
+        let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
-        inode.set_mode(mode as u16);
+        let (uid, _gid) = current_effective_uid_gid();
+        if uid != 0 && inode.uid() != uid {
+            return EPERM;
+        }
+        inode.set_mode((mode as u16) & 0o7777);
     }
     0
 }
@@ -1144,42 +1399,62 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
         return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let (euid, _egid) = current_effective_uid_gid();
+    let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let _ext4_guard = ext4_lock();
-    let inode = match &at {
-        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(alloc::sync::Arc::clone(base))
-            } else {
-                base.find_path(rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    let Some(inode) = inode else {
-        return ENOENT;
-    };
-    inode.set_mode(mode as u16);
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    if euid != 0 && inode.uid() != euid {
+        return EPERM;
+    }
+    inode.set_mode((mode as u16) & 0o7777);
     0
 }
 
 /// Linux `fchown(2)` (syscall 55 on riscv64).
-pub fn syscall_fchown(fd: usize, _uid: usize, _gid: usize) -> isize {
-    if get_fd_file(fd).is_none() {
+pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
+    let Some(file) = get_fd_file(fd) else {
         return EBADF;
+    };
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if os_inode.readonly_fs() {
+            return EROFS;
+        }
+        let inode = os_inode.ext4_inode();
+        let (cur_uid, _cur_gid) = current_effective_uid_gid();
+        if cur_uid != 0 {
+            return EPERM;
+        }
+        let _ext4_guard = ext4_lock();
+        let new_uid = if uid == usize::MAX {
+            inode.uid()
+        } else {
+            uid as u32
+        };
+        let new_gid = if gid == usize::MAX {
+            inode.gid()
+        } else {
+            gid as u32
+        };
+        inode.set_uid_gid(new_uid, new_gid);
     }
     0
 }
 
 /// Linux `fchownat(2)` (syscall 54 on riscv64).
-pub fn syscall_fchownat(dirfd: isize, pathname: usize, _uid: usize, _gid: usize, flags: usize) -> isize {
-    // Ignore ownership changes (no uid/gid model yet), but validate the path.
+pub fn syscall_fchownat(dirfd: isize, pathname: usize, uid: usize, gid: usize, flags: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
 
     if path.is_empty() {
         if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-            return if get_fd_file(dirfd as usize).is_some() { 0 } else { EBADF };
+            return syscall_fchown(dirfd as usize, uid, gid);
         }
         return ENOENT;
     }
@@ -1196,30 +1471,43 @@ pub fn syscall_fchownat(dirfd: isize, pathname: usize, _uid: usize, _gid: usize,
         return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let (euid, _egid) = current_effective_uid_gid();
+    let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let _ext4_guard = ext4_lock();
-    let inode = match &at {
-        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(alloc::sync::Arc::clone(base))
-            } else {
-                base.find_path(rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    if inode.is_some() { 0 } else { ENOENT }
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    if euid != 0 {
+        return EPERM;
+    }
+    let new_uid = if uid == usize::MAX {
+        inode.uid()
+    } else {
+        uid as u32
+    };
+    let new_gid = if gid == usize::MAX {
+        inode.gid()
+    } else {
+        gid as u32
+    };
+    inode.set_uid_gid(new_uid, new_gid);
+    0
 }
 
 /// Linux `readlinkat(2)` (syscall 78 on riscv64).
 ///
 /// If the path exists but is not a symlink, Linux returns `EINVAL`.
-///
-/// We currently don't expose ext4 symlink targets to the VFS layer; for a real
-/// symlink we return `ENOSYS`.
-pub fn syscall_readlinkat(dirfd: isize, pathname: usize, _buf: usize, _bufsiz: usize) -> isize {
+pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usize) -> isize {
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ENOENT;
     }
@@ -1233,28 +1521,70 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, _buf: usize, _bufsiz: u
         return if open_pseudo(abs).is_some() { EINVAL } else { ENOENT };
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
-    let inode = match &at {
-        AtPath::Ext4Abs(abs) => ROOT_INODE.find_path(abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(alloc::sync::Arc::clone(base))
-            } else {
-                base.find_path(rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, false) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    let Some(inode) = inode else {
-        return ENOENT;
-    };
-
-    const S_IFMT: u16 = 0o170000;
-    const S_IFLNK: u16 = 0o120000;
-    if (inode.mode() & S_IFMT) != S_IFLNK {
+    if !inode.is_symlink() {
         return EINVAL;
     }
-    ENOSYS
+    let target = inode.read_all();
+    let len = min(target.len(), bufsiz);
+    if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
+        return EFAULT;
+    }
+    len as isize
+}
+
+/// Linux `symlinkat(2)` (syscall 36 on riscv64).
+pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isize {
+    let token = get_current_token();
+    let target_path = match read_user_cstring(token, target) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path = match read_user_cstring(token, linkpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(newdirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let AtPath::PseudoAbs(_) = &at {
+        return EROFS;
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if rofs_for_path(newdirfd, &path) {
+        return EROFS;
+    }
+
+    match parent.create_symlink(&name, &target_path) {
+        Ok(inode) => {
+            inode.set_uid_gid(fsuid, fsgid);
+            inode.set_mode(0o777);
+            0
+        }
+        Err(e) => ext4_err_to_errno(e),
+    }
 }
 
 /// Linux `renameat(2)` (syscall 38 on riscv64).
@@ -1281,59 +1611,29 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
 
     let _ext4_guard = ext4_lock();
 
-    fn parent_and_name(at: AtPath) -> Result<(alloc::sync::Arc<ext4_fs::Inode>, alloc::string::String), isize> {
-        match at {
-            AtPath::Ext4Abs(abs) => {
-                if abs == "/" {
-                    return Err(EINVAL);
-                }
-                let Some((parent_path, name)) = split_parent_and_name(&abs) else {
-                    return Err(EINVAL);
-                };
-                if name.is_empty() {
-                    return Err(EINVAL);
-                }
-                let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
-                let Some(parent) = ROOT_INODE.find_path(parent_path) else {
-                    return Err(ENOENT);
-                };
-                Ok((parent, alloc::string::String::from(name)))
-            }
-            AtPath::Ext4Rel { base, rel } => {
-                if rel.is_empty() {
-                    return Err(EINVAL);
-                }
-                let Some((parent_path, name)) = split_parent_and_name(&rel) else {
-                    return Err(EINVAL);
-                };
-                if name.is_empty() {
-                    return Err(EINVAL);
-                }
-                let parent = if parent_path.is_empty() {
-                    base
-                } else {
-                    let Some(p) = base.find_path(parent_path) else {
-                        return Err(ENOENT);
-                    };
-                    p
-                };
-                Ok((parent, alloc::string::String::from(name)))
-            }
-            AtPath::PseudoAbs(_) => unreachable!(),
-        }
-    }
-
-    let (old_parent, old_name) = match parent_and_name(old_at) {
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (new_parent, new_name) = match parent_and_name(new_at) {
+    let (new_parent, new_name) = match resolve_parent_and_name(&new_at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
     if !old_parent.is_dir() || !new_parent.is_dir() {
         return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&old_parent, 3, fsuid, fsgid)
+        || !inode_mode_allows_uid_gid(&new_parent, 3, fsuid, fsgid)
+    {
+        return EACCES;
+    }
+    if old_parent.find(&old_name).is_none() {
+        return ENOENT;
+    }
+    if rofs_for_path(olddirfd, &old_s) || rofs_for_path(newdirfd, &new_s) {
+        return EROFS;
     }
 
     // ext4 implementation only supports rename within the same directory for now.
@@ -1675,12 +1975,23 @@ pub fn syscall_chdir(pathname: usize) -> isize {
     let cwd = { process.borrow_mut().cwd.clone() };
     let new_cwd = normalize_path(&cwd, &path);
 
-    if let Some(is_dir) = {
+    let inode = {
         let _ext4_guard = ext4_lock();
-        ROOT_INODE.find_path(&new_cwd).map(|inode| inode.is_dir())
-    } {
-        if !is_dir {
+        ROOT_INODE.find_path(&new_cwd)
+    };
+    if let Some(inode) = inode {
+        let (fsuid, fsgid) = current_fsuid_gid();
+        let _ext4_guard = ext4_lock();
+        let at = AtPath::Ext4Abs(new_cwd.clone());
+        let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if !inode.is_dir() {
             return ENOTDIR;
+        }
+        if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
+            return EACCES;
         }
     } else if let Some(node) = open_pseudo(&new_cwd) {
         if node.as_any().downcast_ref::<PseudoDir>().is_none() {
@@ -1693,12 +2004,15 @@ pub fn syscall_chdir(pathname: usize) -> isize {
     0
 }
 
-pub fn syscall_mkdirat(dirfd: isize, pathname: usize, _mode: usize) -> isize {
+pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     if path.is_empty() {
         return ENOENT;
     }
+
+    let create_mode = apply_umask(mode);
+    let (fsuid, fsgid) = current_fsuid_gid();
 
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
@@ -1710,56 +2024,35 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, _mode: usize) -> isize {
     }
 
     let _ext4_guard = ext4_lock();
-    match at {
-        AtPath::Ext4Abs(abs) => {
-            if abs == "/" {
-                return EEXIST;
-            }
-            let Some((parent_path, name)) = split_parent_and_name(&abs) else {
-                return EINVAL;
-            };
-            if name.is_empty() {
-                return EEXIST;
-            }
-            let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
-            let Some(parent) = ROOT_INODE.find_path(parent_path) else {
-                return ENOENT;
-            };
-            if !parent.is_dir() {
-                return ENOTDIR;
-            }
-            match parent.create_dir(name) {
-                Ok(_) => 0,
-                Err(e) => ext4_err_to_errno(e),
-            }
+    if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
+        return EEXIST;
+    }
+    if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
+        return EEXIST;
+    }
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if parent.find(&name).is_some() {
+        return EEXIST;
+    }
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    match parent.create_dir(&name) {
+        Ok(dir) => {
+            dir.set_mode(create_mode);
+            dir.set_uid_gid(fsuid, fsgid);
+            0
         }
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                return EEXIST;
-            }
-            let Some((parent_path, name)) = split_parent_and_name(&rel) else {
-                return EINVAL;
-            };
-            if name.is_empty() {
-                return EEXIST;
-            }
-            let parent = if parent_path.is_empty() {
-                base
-            } else {
-                let Some(p) = base.find_path(parent_path) else {
-                    return ENOENT;
-                };
-                p
-            };
-            if !parent.is_dir() {
-                return ENOTDIR;
-            }
-            match parent.create_dir(name) {
-                Ok(_) => 0,
-                Err(e) => ext4_err_to_errno(e),
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+        Err(e) => ext4_err_to_errno(e),
     }
 }
 
@@ -1791,49 +2084,24 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
         return EROFS;
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
-    let (parent, name) = match at {
-        AtPath::Ext4Abs(abs) => {
-            if abs == "/" {
-                return EISDIR;
-            }
-            let Some((parent_path, name)) = split_parent_and_name(&abs) else {
-                return EINVAL;
-            };
-            if name.is_empty() {
-                return EISDIR;
-            }
-            let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
-            let Some(parent) = ROOT_INODE.find_path(parent_path) else {
-                return ENOENT;
-            };
-            (parent, alloc::string::String::from(name))
-        }
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                return EISDIR;
-            }
-            let Some((parent_path, name)) = split_parent_and_name(&rel) else {
-                return EINVAL;
-            };
-            if name.is_empty() {
-                return EISDIR;
-            }
-            let parent = if parent_path.is_empty() {
-                base
-            } else {
-                let Some(p) = base.find_path(parent_path) else {
-                    return ENOENT;
-                };
-                p
-            };
-            (parent, alloc::string::String::from(name))
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+    if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
+        return EISDIR;
+    }
+    if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
+        return EISDIR;
+    }
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     if !parent.is_dir() {
         return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
     }
 
     let remove_dir = (_flags & AT_REMOVEDIR) != 0;
@@ -1854,6 +2122,9 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
             return EISDIR;
         }
     }
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
 
     match parent.unlink(&name) {
         Ok(_) => 0,
@@ -1869,6 +2140,9 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
+    if !file.writable() {
+        return EBADF;
+    }
 
     // `/dev/shm/*` backing file.
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
@@ -1878,6 +2152,9 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
 
     // Best-effort ext4 support.
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if os_inode.readonly_fs() {
+            return EROFS;
+        }
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
         if !inode.is_file() {
@@ -2033,6 +2310,9 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
             return EBADF;
         };
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            if os_inode.readonly_fs() {
+                return EROFS;
+            }
             let inode = os_inode.ext4_inode();
             let ino = inode.inode_num() as u64;
             let now = current_timespec();
@@ -2120,6 +2400,9 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     };
     if inode.is_none() {
         return ENOENT;
+    }
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
     }
     let inode = inode.unwrap();
     let ino = inode.inode_num() as u64;
@@ -2213,6 +2496,7 @@ fn dt_type_from_ext4(ftype: u8) -> u8 {
     match ftype {
         2 => 4, // DT_DIR
         1 => 8, // DT_REG
+        7 => 10, // DT_LNK
         _ => 0, // DT_UNKNOWN
     }
 }
@@ -2328,6 +2612,8 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
 
     let _ext4_guard = ext4_lock();
     let mode = inode.mode() as u32;
+    let uid = inode.uid();
+    let gid = inode.gid();
     let disk_size = inode.size() as usize;
     let size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
     let blocks = (((size as u64) + 511) / 512) as u64;
@@ -2338,8 +2624,8 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         st_ino: inode.inode_num() as u64,
         st_mode: mode,
         st_nlink: 1,
-        st_uid: 0,
-        st_gid: 0,
+        st_uid: uid,
+        st_gid: gid,
         st_rdev: 0,
         __pad: 0,
         st_size: size,
@@ -2482,6 +2768,8 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     };
 
     let mode = inode.mode() as u32;
+    let uid = inode.uid();
+    let gid = inode.gid();
     let size = inode.size() as i64;
     let blocks = ((inode.size() + 511) / 512) as u64;
     let times = get_inode_times(inode.inode_num() as u64);
@@ -2491,8 +2779,8 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         st_ino: inode.inode_num() as u64,
         st_mode: mode,
         st_nlink: 1,
-        st_uid: 0,
-        st_gid: 0,
+        st_uid: uid,
+        st_gid: gid,
         st_rdev: 0,
         __pad: 0,
         st_size: size,

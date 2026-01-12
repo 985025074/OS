@@ -6,12 +6,16 @@ use alloc::vec::Vec;
 
 use super::mutex::Mutex;
 use crate::fs::{File, Stdin, Stdout};
-use crate::config::USER_STACK_SIZE;
+use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value};
 use crate::println;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
-use crate::task::manager::{add_task, insert_into_pid2process, select_hart_for_new_task};
+use crate::task::manager::{
+    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
+    wakeup_task,
+};
+use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{RtSigAction, SignalActions, SignalFlags, RT_SIG_MAX};
 use crate::task::task_block::TaskControlBlock;
@@ -438,6 +442,16 @@ pub struct ProcessControlBlockInner {
     pub argv: Vec<String>,
     /// Process creation time since boot (ms).
     pub start_time_ms: usize,
+    /// Real/effective/saved user IDs and filesystem UID.
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub fsuid: u32,
+    /// Real/effective/saved group IDs and filesystem GID.
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub fsgid: u32,
     //
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     /// Per-fd flags (e.g., FD_CLOEXEC, O_NONBLOCK).
@@ -524,7 +538,10 @@ impl ProcessControlBlockInner {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.tasks.len()
+        self.tasks
+            .iter()
+            .filter(|t| t.as_ref().map(|t| t.borrow_mut().res.is_some()).unwrap_or(false))
+            .count()
     }
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
@@ -533,6 +550,42 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    fn terminate_other_threads(&self) {
+        let current = current_task();
+        let current_ptr = current.as_ref().map(Arc::as_ptr);
+        let mut to_cleanup = Vec::new();
+        {
+            let mut inner = self.borrow_mut();
+            for slot in inner.tasks.iter_mut() {
+                let Some(task) = slot.as_ref() else {
+                    continue;
+                };
+                if current_ptr
+                    .map(|ptr| ptr == Arc::as_ptr(task))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                to_cleanup.push(task.clone());
+                *slot = None;
+            }
+        }
+        for task in to_cleanup {
+            remove_inactive_task(task.clone());
+            let (res, join_waiters) = {
+                let mut inner = task.borrow_mut();
+                inner.exit_code = Some(0);
+                let res = inner.res.take();
+                let join_waiters = inner.join_waiters.drain(..).collect::<Vec<_>>();
+                (res, join_waiters)
+            };
+            drop(res);
+            for waiter in join_waiters {
+                wakeup_task(waiter);
+            }
+        }
+    }
+
     pub fn borrow_mut(&self) -> MutexGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
     }
@@ -568,6 +621,14 @@ impl ProcessControlBlock {
                 exit_code: 0,
                 argv: args.clone(),
                 start_time_ms: crate::time::get_time_ms(),
+                uid: 0,
+                euid: 0,
+                suid: 0,
+                fsuid: 0,
+                gid: 0,
+                egid: 0,
+                sgid: 0,
+                fsgid: 0,
                 fd_table: vec![
                     // 0 -> stdin
                     Some(Arc::new(Stdin)),
@@ -653,7 +714,15 @@ impl ProcessControlBlock {
 
     /// Only support processes with a single thread.
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
-        assert_eq!(self.borrow_mut().thread_count(), 1);
+        let thread_count = { self.borrow_mut().thread_count() };
+        if thread_count != 1 {
+            log::warn!(
+                "[exec] pid={} thread_count={} (terminating other threads)",
+                self.getpid(),
+                thread_count
+            );
+            self.terminate_other_threads();
+        }
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
         let new_token = memory_set.token();
@@ -717,7 +786,15 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
     ) {
-        assert_eq!(self.borrow_mut().thread_count(), 1);
+        let thread_count = { self.borrow_mut().thread_count() };
+        if thread_count != 1 {
+            log::warn!(
+                "[exec_dyn] pid={} thread_count={} (terminating other threads)",
+                self.getpid(),
+                thread_count
+            );
+            self.terminate_other_threads();
+        }
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
             MemorySet::from_elf_with_interp(elf_data, interp_data);
         let new_token = memory_set.token();
@@ -772,7 +849,14 @@ impl ProcessControlBlock {
 
     fn fork_impl(self: &Arc<Self>) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
         let mut parent = self.borrow_mut();
-        assert_eq!(parent.thread_count(), 1);
+        let thread_count = parent.thread_count();
+        if thread_count != 1 {
+            log::warn!(
+                "[fork] pid={} thread_count={} (forking only current thread)",
+                self.getpid(),
+                thread_count
+            );
+        }
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
@@ -780,7 +864,23 @@ impl ProcessControlBlock {
         let inherited_shm = parent.sysv_shm_attaches.clone();
         // Fork address space using copy-on-write for user pages to avoid huge copies
         // when spawning many processes (e.g., rt-tests hackbench).
-        let memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
+        let caller_tid = crate::task::processor::current_task()
+            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
+            .unwrap_or(0);
+        let mut memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
+        if thread_count > 1 {
+            for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
+                let mut task_inner = task.borrow_mut();
+                let Some(res) = task_inner.res.as_ref() else {
+                    continue;
+                };
+                if res.tid == 0 {
+                    continue;
+                }
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - res.tid * PAGE_SIZE;
+                memory_set.remove_area_with_start_vpn(trap_cx_bottom.into());
+            }
+        }
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -797,14 +897,18 @@ impl ProcessControlBlock {
         if new_fd_flags.len() < new_fd_table.len() {
             new_fd_flags.resize(new_fd_table.len(), 0);
         }
-        // Remember parent's user-stack base for the main thread.
-        let parent_ustack_base = parent
-            .get_task(0)
-            .borrow_mut()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base();
+        // Remember parent's user-stack base for the calling thread.
+        let parent_ustack_base = crate::task::processor::current_task()
+            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.ustack_base()))
+            .unwrap_or_else(|| {
+                parent
+                    .get_task(0)
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .unwrap()
+                    .ustack_base()
+            });
 
         // create child process pcb
         let child = Arc::new(Self {
@@ -817,6 +921,14 @@ impl ProcessControlBlock {
                 exit_code: 0,
                 argv,
                 start_time_ms: crate::time::get_time_ms(),
+                uid: parent.uid,
+                euid: parent.euid,
+                suid: parent.suid,
+                fsuid: parent.fsuid,
+                gid: parent.gid,
+                egid: parent.egid,
+                sgid: parent.sgid,
+                fsgid: parent.fsgid,
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,
                 rlimit_nofile_cur: parent.rlimit_nofile_cur,
@@ -864,12 +976,25 @@ impl ProcessControlBlock {
         let mut child_inner = child.borrow_mut();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
+        // Seed trap context from the calling thread when available.
+        let parent_trap_cx = crate::task::processor::current_task()
+            .map(|t| *t.borrow_mut().get_trap_cx());
         // modify kstack_top in trap_cx of this thread
-        let task_inner = task.borrow_mut();
+        let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
+        if let Some(parent_trap_cx) = parent_trap_cx {
+            *trap_cx = parent_trap_cx;
+        }
         trap_cx.kernel_sp = task.kstack.get_top();
         // set return value for child process
         trap_cx.x[10] = 0;
+        if caller_tid != 0 {
+            if let Some(res) = task_inner.res.as_mut() {
+                let caller_stack_bottom =
+                    parent_ustack_base + caller_tid * (PAGE_SIZE + USER_STACK_SIZE);
+                res.ustack_base = caller_stack_bottom;
+            }
+        }
 
         // println!(
         //     "[DEBUG] fork - child trap_cx: sepc={:#x}, sp={:#x}, kernel_sp={:#x}, a0={:#x}",

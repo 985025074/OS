@@ -599,3 +599,137 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
 }
+
+/// Terminate the entire process, even when called from a non-main thread.
+pub fn exit_group_and_run_next(exit_code: i32) {
+    let task = take_current_task().unwrap();
+    task.clear_on_cpu();
+    let Some(process) = task.process.upgrade() else {
+        if DEBUG_SCHED {
+            log::warn!("[exit_group] task lost process; dropping task and scheduling idle");
+        }
+        local_processor().lock().set_pending_drop(task);
+        let mut _unused = TaskContext::new();
+        schedule(&mut _unused as *mut _);
+        return;
+    };
+
+    let (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head) = {
+        let mut task_inner = task.borrow_mut();
+        task_inner.exit_code = Some(exit_code);
+        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        let res_to_drop = task_inner.res.take();
+        let clear_child_tid = task_inner.clear_child_tid.take();
+        let robust_list_head = task_inner.robust_list_head;
+        let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
+        (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head)
+    };
+
+    let clear_child_tid_addr = clear_child_tid;
+
+    let token = {
+        let inner = process.borrow_mut();
+        inner.memory_set.token()
+    };
+
+    if robust_list_head != 0 {
+        let linux_tid = crate::syscall::misc::encode_linux_tid(process.getpid(), tid) as u32;
+        crate::syscall::robust_list::exit_robust_list(
+            process.getpid(),
+            token,
+            robust_list_head,
+            linux_tid,
+        );
+    }
+
+    const CLEAR_CHILD_TID_DELAY_MS: usize = 10;
+    if let Some(ctid) = clear_child_tid_addr {
+        schedule_tid_clear(process.getpid(), ctid, CLEAR_CHILD_TID_DELAY_MS);
+    }
+    drop(res_to_drop);
+    for waiter in join_waiters {
+        wakeup_task(waiter);
+    }
+
+    log::debug!(
+        "[exit_group] pid={} tid={} exit_code={}",
+        process.getpid(),
+        tid,
+        exit_code
+    );
+
+    let pid = process.getpid();
+    if pid == IDLE_PID {
+        println!(
+            "[kernel] Idle process exit with exit_code {} ...",
+            exit_code
+        );
+        if exit_code != 0 {
+            shutdown();
+        } else {
+            shutdown();
+        }
+    }
+
+    let parent = {
+        let mut process_inner = process.borrow_mut();
+        process_inner.is_zombie = true;
+        process_inner.exit_code = exit_code;
+        process_inner.parent.as_ref().and_then(|p| p.upgrade())
+    };
+
+    if let Some(parent) = parent {
+        let waiters = {
+            let mut parent_inner = parent.borrow_mut();
+            parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            wakeup_task(waiter);
+        }
+    }
+
+    let mut process_inner = process.borrow_mut();
+    {
+        let mut initproc_inner = INITPROC.borrow_mut();
+        for child in process_inner.children.iter() {
+            child.borrow_mut().parent = Some(Arc::downgrade(&INITPROC));
+            initproc_inner.children.push(child.clone());
+        }
+    }
+
+    let mut recycle_res = Vec::<TaskUserRes>::new();
+    for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
+        let task = task.as_ref().unwrap();
+        remove_inactive_task(Arc::clone(&task));
+        let mut task_inner = task.borrow_mut();
+        if let Some(res) = task_inner.res.take() {
+            recycle_res.push(res);
+        }
+    }
+    drop(process_inner);
+    recycle_res.clear();
+
+    let mut process_inner = process.borrow_mut();
+    process_inner.children.clear();
+    let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
+    crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+    process_inner.memory_set.recycle_data_pages();
+    process_inner.fd_table.clear();
+    process_inner.fd_flags.clear();
+
+    if tid != usize::MAX {
+        for (idx, slot) in process_inner.tasks.iter_mut().enumerate() {
+            if idx == tid {
+                continue;
+            }
+            *slot = None;
+        }
+    } else {
+        process_inner.tasks.clear();
+    }
+
+    drop(process_inner);
+    drop(process);
+    let mut _unused = TaskContext::new();
+    schedule(&mut _unused as *mut _);
+}

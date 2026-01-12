@@ -23,6 +23,7 @@ pub struct OSInode {
     readable: bool,
     writable: bool,
     append: bool,
+    readonly_fs: bool,
     inner: Mutex<OSInodeInner>,
 }
 
@@ -45,10 +46,21 @@ impl OSInode {
     }
 
     pub fn new_with_append(readable: bool, writable: bool, append: bool, inode: Arc<Inode>) -> Self {
+        Self::new_with_append_rofs(readable, writable, append, inode, false)
+    }
+
+    pub fn new_with_append_rofs(
+        readable: bool,
+        writable: bool,
+        append: bool,
+        inode: Arc<Inode>,
+        readonly_fs: bool,
+    ) -> Self {
         Self {
             readable,
             writable,
             append,
+            readonly_fs,
             inner: Mutex::new(OSInodeInner {
                 offset: 0,
                 dir_offset: 0,
@@ -64,6 +76,10 @@ impl OSInode {
 
     pub fn append(&self) -> bool {
         self.append
+    }
+
+    pub fn readonly_fs(&self) -> bool {
+        self.readonly_fs
     }
 
     /// Read all data inside an inode into vector
