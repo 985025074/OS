@@ -12,6 +12,8 @@ pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 
 lazy_static! {
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());
+    pub static ref USER_BLOCK_DEVICE: Option<Arc<dyn BlockDevice>> =
+        BlockDeviceImpl::try_new_second().map(|dev| Arc::new(dev) as Arc<dyn BlockDevice>);
 }
 
 #[allow(unused)]

@@ -12,6 +12,11 @@ MEM ?= 512M
 QEMU_TIMEOUT ?= 0
 DISK_IMG ?=
 EXT4_REBUILD ?= 0
+SUBMIT ?= 0
+USER_FEATURES :=
+ifeq ($(SUBMIT),1)
+USER_FEATURES := --features submit
+endif
 # Optional OpenSBI fw_dynamic for HSM-enabled boot
 FW_DYNAMIC ?=../firmware/fw_dynamic.bin
 # Only append the extra virtio disk if the file exists
@@ -42,7 +47,7 @@ KERNEL:USER_APPS
 
 # find all excutable in the user's target dir strip it and copy to the os_str
 USER_APPS:
-	@cd ../user  && cargo build --$(MODE)
+	@cd ../user  && cargo build --$(MODE) $(USER_FEATURES)
 	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
 			base=$$(basename $$f); \

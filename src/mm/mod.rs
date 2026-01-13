@@ -19,7 +19,7 @@ use crate::println;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use address::{StepByOne, VPNRange};
 use alloc::vec::Vec;
-pub use frame_allocator::{FrameTracker, frame_alloc, frame_dealloc};
+pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_contiguous, frame_dealloc};
 pub use dtb::init_phys_mem_from_dtb;
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.

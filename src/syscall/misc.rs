@@ -1,6 +1,6 @@
 use crate::{
     debug_config::DEBUG_PTHREAD,
-    fs::{ROOT_INODE, ext4_lock},
+    fs::ext4_lock,
     mm::{
         MapPermission, read_user_value, translated_byte_buffer, translated_str,
         try_write_user_value, write_user_value,
@@ -136,7 +136,7 @@ pub fn syscall_mount(
     let cwd = { process.borrow_mut().cwd.clone() };
     let abs = normalize_path(&cwd, &dir);
     let _ext4_guard = ext4_lock();
-    let inode = match ROOT_INODE.find_path(&abs) {
+    let inode = match crate::fs::root_inode_for_path(&abs).find_path(&abs) {
         Some(v) => v,
         None => return ENOENT,
     };

@@ -24,6 +24,7 @@ pub trait File: Send + Sync {
 
 pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::ext4_lock;
+pub(crate) use inode::root_inode_for_path;
 pub use pipe::{Pipe, make_pipe};
 pub use socketpair::{SocketPairEnd, make_socketpair};
 pub use net_socket::{NetSocketFile, NetSocketKind};

@@ -12,29 +12,38 @@ fn main() {
     let target_file = "./src/link_app.asm";
     let user_app_dir = "./results";
     let mut file = std::fs::File::create(target_file).unwrap();
+    let _ = std::fs::create_dir_all(user_app_dir);
 
-    let entries = read_dir(user_app_dir).unwrap();
+    let entries = match read_dir(user_app_dir) {
+        Ok(entries) => Some(entries),
+        Err(err) => {
+            println!("cargo:warning=missing results dir '{}': {}", user_app_dir, err);
+            None
+        }
+    };
     let mut num_app = 0;
-    for (num, entry) in entries.enumerate() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_file() {
-            let file_name = path.file_name().unwrap().to_str().unwrap();
-            if file_name.ends_with(".bin") {
-                let app_name = &file_name[0..file_name.len() - 4]; // 去掉 "app_" 前缀和 ".bin" 后缀
-                writeln!(file, ".section .rodata").unwrap();
-                writeln!(file, ".align 3");
+    if let Some(entries) = entries {
+        for (num, entry) in entries.enumerate() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_file() {
+                let file_name = path.file_name().unwrap().to_str().unwrap();
+                if file_name.ends_with(".bin") {
+                    let app_name = &file_name[0..file_name.len() - 4]; // 去掉 "app_" 前缀和 ".bin" 后缀
+                    writeln!(file, ".section .rodata").unwrap();
+                    writeln!(file, ".align 3");
 
-                writeln!(file, "app_{}_name:", num).unwrap();
-                writeln!(file, "    .asciz \"{}\"", app_name).unwrap();
-                // writeln!(file, ".align 3");
+                    writeln!(file, "app_{}_name:", num).unwrap();
+                    writeln!(file, "    .asciz \"{}\"", app_name).unwrap();
+                    // writeln!(file, ".align 3");
 
-                // writeln!(file, ".section .data").unwrap();
-                // writeln!(file, "app_{}_start:", num).unwrap();
-                // writeln!(file, "    .incbin \"{}/{}\"", user_app_dir, file_name).unwrap();
-                // writeln!(file, ".align 3");
-                // writeln!(file, "app_{}_end:", num).unwrap();
-                num_app += 1;
+                    // writeln!(file, ".section .data").unwrap();
+                    // writeln!(file, "app_{}_start:", num).unwrap();
+                    // writeln!(file, "    .incbin \"{}/{}\"", user_app_dir, file_name).unwrap();
+                    // writeln!(file, ".align 3");
+                    // writeln!(file, "app_{}_end:", num).unwrap();
+                    num_app += 1;
+                }
             }
         }
     }

@@ -84,6 +84,18 @@ impl StackFrameAllocator {
         self.current = l.0;
         self.end = r.0;
     }
+
+    pub fn alloc_contiguous(&mut self, pages: usize) -> Option<PhysPageNum> {
+        if pages == 0 {
+            return None;
+        }
+        if self.current.saturating_add(pages) > self.end {
+            return None;
+        }
+        let start = self.current;
+        self.current += pages;
+        Some(start.into())
+    }
 }
 impl FrameAllocator for StackFrameAllocator {
     fn new() -> Self {
@@ -135,6 +147,15 @@ pub fn init_frame_allocator() {
 /// allocate a frame
 pub fn frame_alloc() -> Option<FrameTracker> {
     FRAME_ALLOCATOR.lock().alloc().map(FrameTracker::new)
+}
+
+pub fn frame_alloc_contiguous(pages: usize) -> Option<Vec<FrameTracker>> {
+    let start = FRAME_ALLOCATOR.lock().alloc_contiguous(pages)?;
+    let mut frames = Vec::with_capacity(pages);
+    for i in 0..pages {
+        frames.push(FrameTracker::new(PhysPageNum(start.0 + i)));
+    }
+    Some(frames)
 }
 
 /// deallocate a frame

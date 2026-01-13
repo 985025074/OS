@@ -1,7 +1,7 @@
 use crate::{
     mm::{
-        FrameTracker, PageTable, PhysAddr, PhysPageNum, VirtAddr, frame_alloc, frame_dealloc,
-        kernel_token,
+        FrameTracker, PageTable, PhysAddr, PhysPageNum, VirtAddr, frame_alloc,
+        frame_alloc_contiguous, frame_dealloc, kernel_token,
     },
     println,
 };
@@ -13,6 +13,10 @@ use virtio_drivers::{Hal, VirtIOBlk, VirtIOHeader};
 
 #[allow(unused)]
 const VIRTIO0: usize = 0x10001000;
+#[allow(unused)]
+const VIRTIO1: usize = 0x10002000;
+const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
+const VIRTIO_DEVICE_BLOCK: u32 = 2;
 
 struct VirtIOBlockInner {
     blk: VirtIOBlk<'static, VirtioHal>,
@@ -100,7 +104,14 @@ pub struct TestHeader {
 impl VirtIOBlock {
     #[allow(unused)]
     pub fn new() -> Self {
-        let test_header = unsafe { &*(VIRTIO0 as *const TestHeader) };
+        Self::try_new_with_base(VIRTIO0).expect("VirtIO block device not found")
+    }
+
+    pub fn try_new_with_base(base: usize) -> Option<Self> {
+        let test_header = unsafe { &*(base as *const TestHeader) };
+        if test_header.magic != VIRTIO_MMIO_MAGIC || test_header.device_id != VIRTIO_DEVICE_BLOCK {
+            return None;
+        }
         // println!(
         //     "[VirtIO DEBUG] Header info:\n  magic={:#x}\n  version={}\n  device_id={:#x}\n  vendor_id={:#x}\n  device_features={:#x}\n  driver_features={:#x}\n  queue_num_max={}\n  queue_ready={}\n  status={:#x}",
         //     test_header.magic,
@@ -118,18 +129,25 @@ impl VirtIOBlock {
             // Try to initialize the underlying virtio block driver and
             // print a helpful error if it fails instead of panicking silently
             // via unwrap(). This gives clearer diagnostics when init fails.
-            let blk = match VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)) {
+            let blk = match VirtIOBlk::<VirtioHal>::new(&mut *(base as *mut VirtIOHeader)) {
                 Ok(dev) => dev,
                 Err(e) => {
                     println!("[VirtIO ERROR] VirtIOBlk::new failed: {:?}", e);
-                    panic!("VirtIOBlk initialization failed");
+                    return None;
                 }
             };
-            let bounce = frame_alloc().expect("VirtIOBlock: OOM for bounce page");
-            Self(Mutex::new(VirtIOBlockInner { blk, bounce }))
+            let bounce = frame_alloc()?;
+            Some(Self(Mutex::new(VirtIOBlockInner { blk, bounce })))
         };
-        println!("VirtIOBlock initialized.");
+        if result.is_some() {
+            println!("VirtIOBlock initialized at {:#x}.", base);
+        }
         result
+    }
+
+    #[allow(unused)]
+    pub fn try_new_second() -> Option<Self> {
+        Self::try_new_with_base(VIRTIO1)
     }
 }
 
@@ -137,16 +155,12 @@ pub struct VirtioHal;
 
 impl Hal for VirtioHal {
     fn dma_alloc(pages: usize) -> usize {
-        let mut ppn_base = PhysPageNum(0);
-        for i in 0..pages {
-            let frame = frame_alloc().unwrap();
+        let frames = frame_alloc_contiguous(pages).expect("VirtIOBlock: OOM for queue pages");
+        let ppn_base = frames[0].ppn;
+        for frame in frames {
             // The virtio queue layout requires the ring/descriptor memory to be zeroed.
             // virtio-drivers does not clear the DMA region on its own.
             frame.ppn.get_bytes_array().fill(0);
-            if i == 0 {
-                ppn_base = frame.ppn;
-            }
-            assert_eq!(frame.ppn.0, ppn_base.0 + i);
             QUEUE_FRAMES.lock().push(frame);
         }
         let pa: PhysAddr = ppn_base.into();

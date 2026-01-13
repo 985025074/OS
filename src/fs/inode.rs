@@ -1,7 +1,7 @@
 //! Inode abstraction for ext4 filesystem
 
 use super::File;
-use crate::drivers::BLOCK_DEVICE;
+use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
 use alloc::sync::Arc;
@@ -191,10 +191,38 @@ lazy_static! {
         Arc::new(Ext4FileSystem::root_inode(&EXT4_FS))
     };
 
+    /// Optional secondary filesystem (e.g., disk.img).
+    pub static ref USER_EXT4_FS: Option<Arc<spin::Mutex<Ext4FileSystem>>> = {
+        USER_BLOCK_DEVICE
+            .as_ref()
+            .map(|dev| Ext4FileSystem::open(dev.clone()))
+    };
+
+    /// Root inode of the secondary filesystem.
+    pub static ref USER_ROOT_INODE: Option<Arc<Inode>> = {
+        USER_EXT4_FS
+            .as_ref()
+            .map(|fs| Arc::new(Ext4FileSystem::root_inode(fs)))
+    };
+
     /// User directory inode (for ext4, apps are in /user)
     pub static ref USER_INODE: Arc<Inode> = {
-        ROOT_INODE.find("user").expect("[ext4] /user directory not found!")
+        if let Some(root) = USER_ROOT_INODE.as_ref() {
+            root.find("user")
+                .expect("[ext4] /user directory not found on user disk!")
+        } else {
+            ROOT_INODE.find("user").expect("[ext4] /user directory not found!")
+        }
     };
+}
+
+pub(crate) fn root_inode_for_path(path: &str) -> Arc<Inode> {
+    let use_user = (path == "/user" || path.starts_with("/user/")) && USER_ROOT_INODE.is_some();
+    if use_user {
+        USER_ROOT_INODE.as_ref().unwrap().clone()
+    } else {
+        ROOT_INODE.clone()
+    }
 }
 
 /// List all files in the filesystem
@@ -249,10 +277,10 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 
     // Default: resolve relative paths from /user to keep exec() behavior.
-    let base_dir: &Arc<Inode> = if raw.starts_with('/') {
-        &ROOT_INODE
+    let base_dir: Arc<Inode> = if raw.starts_with('/') {
+        root_inode_for_path(raw)
     } else {
-        &USER_INODE
+        Arc::clone(&USER_INODE)
     };
 
     let mut inode = base_dir.find_path(raw);
@@ -267,7 +295,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     if inode.is_none() && flags.contains(OpenFlags::CREATE) {
         let (parent_path, file_name) = split_parent_and_name(raw)?;
         let parent = if parent_path.is_empty() {
-            Arc::clone(base_dir)
+            Arc::clone(&base_dir)
         } else {
             base_dir.find_path(parent_path)?
         };
