@@ -518,6 +518,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.
         if let Some(parent) = parent {
+            crate::task::signal::queue_process_signal(
+                parent.getpid(),
+                crate::task::signal::SIGCHLD_NUM,
+            );
             let waiters = {
                 let mut parent_inner = parent.borrow_mut();
                 parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
@@ -679,6 +683,10 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     };
 
     if let Some(parent) = parent {
+        crate::task::signal::queue_process_signal(
+            parent.getpid(),
+            crate::task::signal::SIGCHLD_NUM,
+        );
         let waiters = {
             let mut parent_inner = parent.borrow_mut();
             parent_inner.wait_queue.drain(..).collect::<Vec<_>>()

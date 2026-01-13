@@ -7,6 +7,7 @@ use spin::Mutex;
 
 use crate::mm::UserBuffer;
 use crate::task::processor::current_task;
+use crate::task::signal::has_unmasked_pending;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -26,14 +27,7 @@ fn pending_unmasked_signal() -> bool {
         return false;
     };
     let inner = task.borrow_mut();
-    if let Some(sig) = inner.pending_signal {
-        if sig == 0 || sig > 64 {
-            return false;
-        }
-        let bit = 1u64 << (sig - 1);
-        return (inner.signal_mask & bit) == 0;
-    }
-    false
+    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

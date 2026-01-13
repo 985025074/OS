@@ -5,7 +5,7 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{MapPermission, PageTable, VirtAddr};
 use crate::task::block_sleep::check_timer;
 use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
-use crate::task::signal::check_if_current_signals_error;
+use crate::task::signal::{check_if_current_signals_error, signal_bit};
 use crate::time::set_next_trigger;
 use crate::{println, trap::context::TrapContext};
 pub mod context;
@@ -450,7 +450,9 @@ fn handle_user_exception(code: usize, stval: usize) {
         _ => None,
     } {
         if let Some(task) = crate::task::processor::current_task() {
-            task.borrow_mut().pending_signal = Some(sig);
+            if let Some(bit) = signal_bit(sig) {
+                task.borrow_mut().pending_signals |= bit;
+            }
         }
         return;
     }

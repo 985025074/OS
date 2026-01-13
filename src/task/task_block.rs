@@ -424,8 +424,8 @@ pub struct TaskControlBlockInner {
     /// Linux robust futex list head (user VA) and length.
     pub robust_list_head: usize,
     pub robust_list_len: usize,
-    /// Pending POSIX signal for this thread (best-effort, single-slot).
-    pub pending_signal: Option<usize>,
+    /// Pending POSIX signals for this thread (bitmask).
+    pub pending_signals: u64,
     /// Signal mask for this thread (bitmask of blocked signals).
     pub signal_mask: u64,
     /// Saved user context when running a signal handler.
@@ -479,7 +479,7 @@ impl TaskControlBlock {
                 clear_child_tid: None,
                 robust_list_head: 0,
                 robust_list_len: 0,
-                pending_signal: None,
+                pending_signals: 0,
                 signal_mask: 0,
                 sig_saved_ctx: None,
             }),
@@ -523,7 +523,7 @@ impl TaskControlBlock {
                 clear_child_tid: None,
                 robust_list_head: 0,
                 robust_list_len: 0,
-                pending_signal: None,
+                pending_signals: 0,
                 signal_mask: 0,
                 sig_saved_ctx: None,
             }),

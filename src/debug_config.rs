@@ -40,7 +40,7 @@ pub const DEBUG_NET: bool = false;
 pub const DEBUG_UNIXBENCH: bool = true;
 
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
-pub const DEBUG_WATCHDOG: bool = false;
+pub const DEBUG_WATCHDOG: bool = true;
 
 /// Run `log::test()` at boot (very noisy).
 pub const DEBUG_LOG_TEST: bool = false;

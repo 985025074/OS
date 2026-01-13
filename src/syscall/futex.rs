@@ -12,6 +12,7 @@ use crate::{
     task::{
         manager::wakeup_task,
         processor::{block_current_and_run_next, current_process, current_task},
+        signal::has_unmasked_pending,
         task_block::TaskControlBlock,
     },
     task::block_sleep::add_timer,
@@ -62,14 +63,7 @@ fn timespec_to_ms(ts: TimeSpec) -> Option<usize> {
 fn pending_unmasked_signal() -> bool {
     let task = current_task().unwrap();
     let inner = task.borrow_mut();
-    let Some(sig) = inner.pending_signal else {
-        return false;
-    };
-    if sig == 0 || sig > 64 {
-        return true;
-    }
-    let bit = 1u64 << (sig - 1);
-    (inner.signal_mask & bit) == 0
+    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
 }
 
 fn remove_waiter(pid: usize, uaddr: usize, task: &Arc<TaskControlBlock>) {
@@ -167,12 +161,12 @@ pub fn syscall_futex(
                     let inner = task.borrow_mut();
                     (
                         inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
-                        inner.pending_signal,
+                        inner.pending_signals,
                         inner.signal_mask,
                     )
                 };
                 log::debug!(
-                    "[futex_wait] pid={} tid={} uaddr={:#x} val={} pending_sig={:?} mask={:#x}",
+                    "[futex_wait] pid={} tid={} uaddr={:#x} val={} pending_sig={:#x} mask={:#x}",
                     pid,
                     tid,
                     uaddr,
@@ -239,12 +233,12 @@ pub fn syscall_futex(
                     let inner = task.borrow_mut();
                     (
                         inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
-                        inner.pending_signal,
+                        inner.pending_signals,
                         inner.signal_mask,
                     )
                 };
                 log::debug!(
-                    "[futex_wait] pid={} tid={} woke pending_sig={:?} mask={:#x}",
+                    "[futex_wait] pid={} tid={} woke pending_sig={:#x} mask={:#x}",
                     pid,
                     tid,
                     pending_sig,

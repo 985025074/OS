@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::{
@@ -14,8 +14,8 @@ use crate::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SignalAction, SignalFlags, kill,
-            kill_current, set_signal, set_signal_mask,
+            signal_bit, take_first_unmasked, RT_SIG_MAX, RtSigAction, SIGALRM_NUM, SIG_DFL,
+            SIG_IGN, SignalAction, SignalFlags, kill, kill_current, set_signal, set_signal_mask,
         },
         task_block::{SigSavedContext, TaskControlBlock},
     },
@@ -57,6 +57,9 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
             ESRCH
         };
     }
+    if sig < 0 || sig as usize > RT_SIG_MAX {
+        return EINVAL;
+    }
     if DEBUG_PTHREAD {
         crate::println!("[tgkill] tgid={} tid={} sig={}", tgid, tid, sig);
     }
@@ -75,7 +78,9 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     };
     {
         let mut inner = task.borrow_mut();
-        inner.pending_signal = Some(sig as usize);
+        if let Some(bit) = signal_bit(sig as usize) {
+            inner.pending_signals |= bit;
+        }
     }
     if DEBUG_PTHREAD && sig == 33 {
         let (tid_idx, status, on_cpu) = {
@@ -114,6 +119,21 @@ pub fn syscall_sigaction(
     action: *const SignalAction,
     old_action: *mut SignalAction,
 ) -> isize {
+    if DEBUG_UNIXBENCH && signum == SIGALRM_NUM as i32 {
+        let token = get_current_token();
+        let act = if action == core::ptr::null() {
+            SignalAction::default()
+        } else {
+            read_user_value(token, action)
+        };
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[signal] sigaction(legacy) sig=14 handler={:#x} mask={:#x}",
+            act.handler,
+            act.mask.bits()
+        );
+    }
     set_signal(signum, action, old_action)
 }
 pub fn syscall_sigprocmask(how: u32) -> isize {
@@ -174,11 +194,14 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
     let task = current_task().unwrap();
     let mut inner = task.borrow_mut();
     let _ = sigsetsize;
-    if oldset != 0 {
-        write_user_value(token, oldset as *mut u64, &inner.signal_mask);
-    }
+    let old_mask = inner.signal_mask;
+    let new_mask = if set != 0 {
+        // Read new mask before writing oldset to support aliasing set/oldset.
+        read_user_value(token, set as *const u64)
+    } else {
+        old_mask
+    };
     if set != 0 {
-        let new_mask = read_user_value(token, set as *const u64);
         if DEBUG_PTHREAD {
             crate::println!(
                 "[rt_sigprocmask] how={} new_mask={:#x} old_mask={:#x}",
@@ -187,12 +210,38 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
                 inner.signal_mask
             );
         }
-        match how {
-            0 => inner.signal_mask |= new_mask,  // SIG_BLOCK
-            1 => inner.signal_mask &= !new_mask, // SIG_UNBLOCK
-            2 => inner.signal_mask = new_mask,   // SIG_SETMASK
+        let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
+        let sigkill_bit = signal_bit(crate::task::signal::SIGKILL_NUM).unwrap_or(0);
+        let sigstop_bit = signal_bit(crate::task::signal::SIGSTOP_NUM).unwrap_or(0);
+        let mut updated = match how {
+            0 => old_mask | new_mask,  // SIG_BLOCK
+            1 => old_mask & !new_mask, // SIG_UNBLOCK
+            2 => new_mask,             // SIG_SETMASK
             _ => return EINVAL,
+        };
+        updated &= !(sigkill_bit | sigstop_bit);
+        inner.signal_mask = updated;
+        if DEBUG_UNIXBENCH
+            && sigalrm_bit != 0
+            && ((old_mask ^ updated) & sigalrm_bit) != 0
+        {
+            let pid = current_process().getpid();
+            let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+            crate::log_if!(
+                DEBUG_UNIXBENCH,
+                info,
+                "[signal] sigmask pid={} tid={} how={} setsize={} old={:#x} new={:#x}",
+                pid,
+                tid,
+                how,
+                sigsetsize,
+                old_mask,
+                updated
+            );
         }
+    }
+    if oldset != 0 {
+        write_user_value(token, oldset as *mut u64, &old_mask);
     }
     0
 }
@@ -492,13 +541,21 @@ pub fn syscall_rt_sigtimedwait(
     let task = current_task().unwrap();
 
     // Immediate pending signal.
-    if let Some(sig) = task.borrow_mut().pending_signal {
-        if let Some(bit) = sig_bit(sig) {
-            if (mask & bit) != 0 {
-                task.borrow_mut().pending_signal = None;
-                return sig as isize;
+    let pending_sig = {
+        let mut inner = task.borrow_mut();
+        let pending = inner.pending_signals & mask;
+        if pending != 0 {
+            let sig = pending.trailing_zeros() as usize + 1;
+            if let Some(bit) = sig_bit(sig) {
+                inner.pending_signals &= !bit;
             }
+            Some(sig)
+        } else {
+            None
         }
+    };
+    if let Some(sig) = pending_sig {
+        return sig as isize;
     }
 
     // SIGCHLD via zombie child detection.
@@ -542,13 +599,21 @@ pub fn syscall_rt_sigtimedwait(
         remove_waiter(&task);
 
         // Re-check pending signal.
-        if let Some(sig) = task.borrow_mut().pending_signal {
-            if let Some(bit) = sig_bit(sig) {
-                if (mask & bit) != 0 {
-                    task.borrow_mut().pending_signal = None;
-                    return sig as isize;
+        let pending_sig = {
+            let mut inner = task.borrow_mut();
+            let pending = inner.pending_signals & mask;
+            if pending != 0 {
+                let sig = pending.trailing_zeros() as usize + 1;
+                if let Some(bit) = sig_bit(sig) {
+                    inner.pending_signals &= !bit;
                 }
+                Some(sig)
+            } else {
+                None
             }
+        };
+        if let Some(sig) = pending_sig {
+            return sig as isize;
         }
 
         if (mask & sigchld_bit) != 0 && has_zombie_child() {
@@ -564,22 +629,52 @@ pub fn maybe_deliver_signal() {
     let Some(task) = current_task() else {
         return;
     };
+    static SIGALRM_LOG_LEFT: AtomicUsize = AtomicUsize::new(16);
+    let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
     let signum = {
         let mut inner = task.borrow_mut();
         if inner.sig_saved_ctx.is_some() {
+            if DEBUG_UNIXBENCH
+                && sigalrm_bit != 0
+                && (inner.pending_signals & sigalrm_bit) != 0
+                && SIGALRM_LOG_LEFT.fetch_sub(1, Ordering::Relaxed) > 0
+            {
+                let pid = current_process().getpid();
+                let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                crate::log_if!(
+                    DEBUG_UNIXBENCH,
+                    debug,
+                    "[signal] defer sig=14 pid={} tid={} pending={:#x} mask={:#x}",
+                    pid,
+                    tid,
+                    inner.pending_signals,
+                    inner.signal_mask
+                );
+            }
             return;
         }
-        let Some(sig) = inner.pending_signal else {
+        let mask = inner.signal_mask;
+        let pending = inner.pending_signals;
+        let Some(sig) = take_first_unmasked(&mut inner.pending_signals, mask) else {
+            if DEBUG_UNIXBENCH
+                && sigalrm_bit != 0
+                && (pending & sigalrm_bit) != 0
+                && SIGALRM_LOG_LEFT.fetch_sub(1, Ordering::Relaxed) > 0
+            {
+                let pid = current_process().getpid();
+                let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                crate::log_if!(
+                    DEBUG_UNIXBENCH,
+                    debug,
+                    "[signal] masked sig=14 pid={} tid={} pending={:#x} mask={:#x}",
+                    pid,
+                    tid,
+                    pending,
+                    mask
+                );
+            }
             return;
         };
-        if let Some(bit) = sig_bit(sig) {
-            if (inner.signal_mask & bit) != 0 {
-                return;
-            }
-        } else {
-            return;
-        }
-        inner.pending_signal = None;
         sig
     };
     if DEBUG_UNIXBENCH && signum == 14 {
@@ -592,7 +687,7 @@ pub fn maybe_deliver_signal() {
             .unwrap_or(usize::MAX);
         crate::log_if!(
             DEBUG_UNIXBENCH,
-            info,
+            debug,
             "[signal] deliver pid={} tid={} sig={}",
             pid,
             tid,

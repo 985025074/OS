@@ -12,6 +12,7 @@ use crate::{
     task::{
         manager::{wakeup_task, PID2PCB},
         processor::{block_current_and_run_next, current_task},
+        signal::{has_unmasked_pending, signal_bit, SIGPIPE_NUM},
     },
 };
 
@@ -181,6 +182,18 @@ impl PipeRingBuffer {
         self.write_waiters.pop_front()
     }
 
+    fn remove_reader(&mut self, task: &Arc<crate::task::task_block::TaskControlBlock>) -> bool {
+        let before = self.read_waiters.len();
+        self.read_waiters.retain(|t| !Arc::ptr_eq(t, task));
+        before != self.read_waiters.len()
+    }
+
+    fn remove_writer(&mut self, task: &Arc<crate::task::task_block::TaskControlBlock>) -> bool {
+        let before = self.write_waiters.len();
+        self.write_waiters.retain(|t| !Arc::ptr_eq(t, task));
+        before != self.write_waiters.len()
+    }
+
     fn drain_readers(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
         self.read_waiters.drain(..).collect()
     }
@@ -256,26 +269,27 @@ impl File for Pipe {
         if want_to_read == 0 {
             return 0;
         }
+        let task = current_task().unwrap();
         let has_pending_signal = || {
-            current_task()
-                .map(|t| t.borrow_mut().pending_signal.is_some())
-                .unwrap_or(false)
+            let inner = task.borrow_mut();
+            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
         };
         loop {
             let mut ring_buffer = self.buffer.lock();
             let avail = ring_buffer.available_read();
             if avail == 0 {
                 if has_pending_signal() {
+                    ring_buffer.remove_reader(&task);
                     crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] read abort (pending signal)");
                     return 0;
                 }
                 if ring_buffer.all_write_ends_closed() {
+                    ring_buffer.remove_reader(&task);
                     crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] read EOF");
                     return 0;
                 }
-                let task = current_task().unwrap();
                 let task_for_log = task.clone();
-                let inserted = ring_buffer.push_reader(task);
+                let inserted = ring_buffer.push_reader(task.clone());
                 let waiters = ring_buffer.read_waiters.len();
                 let writers = ring_buffer.write_end_count();
                 let write_end = ring_buffer.write_end.as_ref().and_then(|w| w.upgrade());
@@ -342,10 +356,10 @@ impl File for Pipe {
         if want_to_write == 0 {
             return 0;
         }
+        let task = current_task().unwrap();
         let has_pending_signal = || {
-            current_task()
-                .map(|t| t.borrow_mut().pending_signal.is_some())
-                .unwrap_or(false)
+            let inner = task.borrow_mut();
+            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
         };
         // Copy user data up front to avoid holding user pointers across blocking writes.
         let mut data = Vec::with_capacity(want_to_write);
@@ -358,19 +372,23 @@ impl File for Pipe {
         let mut already_write = 0usize;
         loop {
             let mut ring_buffer = self.buffer.lock();
+            if ring_buffer.all_read_ends_closed() {
+                crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write to closed read end");
+                if let Some(bit) = signal_bit(SIGPIPE_NUM) {
+                    task.borrow_mut().pending_signals |= bit;
+                }
+                ring_buffer.remove_writer(&task);
+                return already_write;
+            }
             let loop_write = ring_buffer.available_write();
             if loop_write == 0 {
                 if has_pending_signal() {
+                    ring_buffer.remove_writer(&task);
                     crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write abort (pending signal)");
                     return already_write;
                 }
-                if ring_buffer.all_read_ends_closed() {
-                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write to closed read end");
-                    return already_write;
-                }
-                let task = current_task().unwrap();
                 let task_for_log = task.clone();
-                let inserted = ring_buffer.push_writer(task);
+                let inserted = ring_buffer.push_writer(task.clone());
                 let waiters = ring_buffer.write_waiters.len();
                 let readers = ring_buffer.read_end_count();
                 let read_end = ring_buffer.read_end.as_ref().and_then(|w| w.upgrade());

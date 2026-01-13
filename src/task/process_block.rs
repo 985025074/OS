@@ -17,13 +17,32 @@ use crate::task::manager::{
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
-use crate::task::signal::{RtSigAction, SignalActions, SignalFlags, RT_SIG_MAX};
+use crate::task::signal::{RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN};
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
 use crate::debug_config::DEBUG_SYSCALL;
 use spin::{Mutex as SpinMutex, MutexGuard};
+
+fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
+    for (signum, action) in inner.rt_sig_handlers.iter_mut().enumerate() {
+        if signum == 0 {
+            continue;
+        }
+        if action.handler != SIG_IGN {
+            *action = RtSigAction::default();
+        }
+    }
+    for (signum, action) in inner.signals_actions.table.iter_mut().enumerate() {
+        if signum == 0 {
+            continue;
+        }
+        if action.handler != SIG_IGN {
+            *action = SignalAction::default();
+        }
+    }
+}
 
 fn patch_glibc_ld_linux_symtab_dyn(
     token: usize,
@@ -733,6 +752,7 @@ impl ProcessControlBlock {
             inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+            reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
             inner.brk = heap_start;
@@ -804,6 +824,7 @@ impl ProcessControlBlock {
             inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+            reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
             inner.brk = heap_start;

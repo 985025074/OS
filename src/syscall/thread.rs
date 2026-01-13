@@ -9,6 +9,7 @@ use crate::{
         block_sleep::add_timer,
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_task},
+        signal::has_unmasked_pending,
         task_block::TaskControlBlock,
     },
     trap::{context::TrapContext, trap_handler},
@@ -169,16 +170,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     const EINTR: isize = -4;
     let interrupted = {
         let inner = task.borrow_mut();
-        if let Some(sig) = inner.pending_signal {
-            if sig == 0 || sig > 64 {
-                false
-            } else {
-                let bit = 1u64 << (sig - 1);
-                (inner.signal_mask & bit) == 0
-            }
-        } else {
-            false
-        }
+        has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
     };
     if interrupted {
         return EINTR;

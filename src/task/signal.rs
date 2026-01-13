@@ -2,18 +2,95 @@ pub const MAX_SIG: usize = 31;
 pub const RT_SIG_MAX: usize = 64;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
+pub const SIGPIPE_NUM: usize = 13;
+pub const SIGALRM_NUM: usize = 14;
+pub const SIGCHLD_NUM: usize = 17;
+pub const SIGKILL_NUM: usize = 9;
+pub const SIGSTOP_NUM: usize = 19;
 use bitflags::bitflags;
 
+use alloc::sync::Arc;
+
 use crate::{
+    debug_config::DEBUG_UNIXBENCH,
     mm::{read_user_value, translated_single_address, write_user_value},
     println,
+    sbi::send_ipi,
     task::processor::current_process,
     task::{
         manager::{pid2process, wakeup_task},
         processor::suspend_current_and_run_next,
+        task_block::TaskControlBlock,
     },
     trap::{context::TrapContext, get_current_token},
 };
+
+pub fn signal_bit(signum: usize) -> Option<u64> {
+    if signum == 0 || signum > RT_SIG_MAX {
+        return None;
+    }
+    Some(1u64 << (signum - 1))
+}
+
+pub fn pending_unmasked_bits(pending: u64, mask: u64, ignore_sigchld: bool) -> u64 {
+    let mut ready = pending & !mask;
+    let sigkill_bit = 1u64 << (SIGKILL_NUM - 1);
+    let sigstop_bit = 1u64 << (SIGSTOP_NUM - 1);
+    ready |= pending & (sigkill_bit | sigstop_bit);
+    if ignore_sigchld {
+        if let Some(bit) = signal_bit(SIGCHLD_NUM) {
+            ready &= !bit;
+        }
+    }
+    ready
+}
+
+pub fn pick_task_for_signal(
+    tasks: &[Arc<TaskControlBlock>],
+    bit: u64,
+) -> Option<Arc<TaskControlBlock>> {
+    if bit == 0 {
+        return None;
+    }
+    let mut unmasked: Option<Arc<TaskControlBlock>> = None;
+    let mut fallback: Option<Arc<TaskControlBlock>> = None;
+    for task in tasks.iter() {
+        let inner = task.borrow_mut();
+        if inner.res.is_none() {
+            continue;
+        }
+        let pending = (inner.pending_signals & bit) != 0;
+        let blocked = (inner.signal_mask & bit) != 0;
+        let handling = inner.sig_saved_ctx.is_some();
+        drop(inner);
+        if !blocked && !pending && !handling {
+            return Some(task.clone());
+        }
+        if !blocked && unmasked.is_none() {
+            unmasked = Some(task.clone());
+        }
+        if fallback.is_none() {
+            fallback = Some(task.clone());
+        }
+    }
+    unmasked.or(fallback)
+}
+
+pub fn has_unmasked_pending(pending: u64, mask: u64, ignore_sigchld: bool) -> bool {
+    pending_unmasked_bits(pending, mask, ignore_sigchld) != 0
+}
+
+pub fn take_first_unmasked(pending: &mut u64, mask: u64) -> Option<usize> {
+    let ready = pending_unmasked_bits(*pending, mask, false);
+    if ready == 0 {
+        return None;
+    }
+    let signum = ready.trailing_zeros() as usize + 1;
+    if let Some(bit) = signal_bit(signum) {
+        *pending &= !bit;
+    }
+    Some(signum)
+}
 
 bitflags! {
     pub struct SignalFlags: u32 {
@@ -65,6 +142,8 @@ impl SignalFlags {
             Some((-9, "Killed, SIGKILL=9"))
         } else if self.contains(Self::SIGSEGV) {
             Some((-11, "Segmentation Fault, SIGSEGV=11"))
+        } else if self.contains(Self::SIGPIPE) {
+            Some((-13, "Broken pipe, SIGPIPE=13"))
         } else {
             //println!("[K] signalflags check_error  {:?}", self);
             None
@@ -233,6 +312,74 @@ pub fn kill_current(signum: i32) -> isize {
         wakeup_task(t);
     }
     0
+}
+
+/// Queue a non-fatal signal to one thread in the target process.
+///
+/// This mirrors the "one thread" delivery behavior used for alarms and keeps
+/// SIGCHLD visible to user-space job control (e.g., busybox/ash).
+pub fn queue_process_signal(pid: usize, signum: usize) {
+    if signum == 0 || signum > RT_SIG_MAX {
+        return;
+    }
+    let Some(bit) = signal_bit(signum) else {
+        return;
+    };
+    let Some(process) = pid2process(pid) else {
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[signal] drop sig={} pid={} (no process)",
+            signum,
+            pid
+        );
+        return;
+    };
+    let tasks = {
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let Some(task) = pick_task_for_signal(&tasks, bit) else {
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[signal] drop sig={} pid={} (no task)",
+            signum,
+            pid
+        );
+        return;
+    };
+    let (tid, on_cpu, queued) = {
+        let mut inner = task.borrow_mut();
+        let already = (inner.pending_signals & bit) != 0;
+        inner.pending_signals |= bit;
+        let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        (
+            tid,
+            task.on_cpu.load(core::sync::atomic::Ordering::Acquire),
+            !already,
+        )
+    };
+    crate::log_if!(
+        DEBUG_UNIXBENCH,
+        info,
+        "[signal] queue pid={} tid={} sig={} queued={} on_cpu={}",
+        pid,
+        tid,
+        signum,
+        queued,
+        on_cpu
+    );
+    if queued {
+        wakeup_task(task.clone());
+        if on_cpu != TaskControlBlock::OFF_CPU {
+            send_ipi(on_cpu);
+        }
+    }
 }
 
 // fn check_pending_signals() {

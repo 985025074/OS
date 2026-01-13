@@ -13,6 +13,7 @@ use crate::{
     task::{
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
+        signal::has_unmasked_pending,
         task_block::TaskControlBlock,
     },
     trap::{get_current_token, trap_handler},
@@ -245,16 +246,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
         let task = current_task().unwrap();
         let pending_unmasked = {
             let inner = task.borrow_mut();
-            if let Some(sig) = inner.pending_signal {
-                if sig == 0 || sig > 64 {
-                    true
-                } else {
-                    let bit = 1u64 << (sig - 1);
-                    (inner.signal_mask & bit) == 0
-                }
-            } else {
-                false
-            }
+            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
         };
         let mut process_inner = cur_process.borrow_mut();
         if pending_unmasked {

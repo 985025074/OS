@@ -6,6 +6,7 @@ use crate::{
     task::{manager::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
 };
+use crate::task::signal::{pick_task_for_signal, signal_bit, SIGALRM_NUM};
 use lazy_static::*;
 use spin::Mutex;
 
@@ -167,37 +168,48 @@ fn deliver_alarm(pid: usize) {
         crate::log_if!(DEBUG_UNIXBENCH, info, "[alarm] drop pid={} (no process)", pid);
         return;
     };
+    let Some(bit) = signal_bit(SIGALRM_NUM) else {
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[alarm] drop pid={} (invalid signal)",
+            pid
+        );
+        return;
+    };
     let task = {
         let inner = proc.borrow_mut();
-        let mut picked: Option<Arc<TaskControlBlock>> = None;
-        for t in inner.tasks.iter().filter_map(|t| t.as_ref()) {
-            if t.borrow_mut().pending_signal.is_none() {
-                picked = Some(t.clone());
-                break;
-            }
-            if picked.is_none() {
-                picked = Some(t.clone());
-            }
-        }
-        picked
+        let tasks = inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<Vec<_>>();
+        pick_task_for_signal(&tasks, bit)
     };
     let Some(task) = task else {
         crate::log_if!(DEBUG_UNIXBENCH, info, "[alarm] drop pid={} (no task)", pid);
         return;
     };
-    let (tid, on_cpu) = {
+    let (tid, on_cpu, mask, pending) = {
         let mut inner = task.borrow_mut();
-        inner.pending_signal = Some(14);
+        inner.pending_signals |= bit;
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-        (tid, task.on_cpu.load(AtomicOrdering::Acquire))
+        (
+            tid,
+            task.on_cpu.load(AtomicOrdering::Acquire),
+            inner.signal_mask,
+            inner.pending_signals,
+        )
     };
     crate::log_if!(
         DEBUG_UNIXBENCH,
         info,
-        "[alarm] fire pid={} tid={} on_cpu={}",
+        "[alarm] fire pid={} tid={} on_cpu={} mask={:#x} pending={:#x}",
         pid,
         tid,
-        on_cpu
+        on_cpu,
+        mask,
+        pending
     );
     wakeup_task(task.clone());
     if on_cpu != TaskControlBlock::OFF_CPU {
