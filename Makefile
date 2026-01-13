@@ -110,8 +110,16 @@ debug:KERNEL
 # ===========================
 EXT4_IMG := ../ext4-fs-packer/target/fs.ext4
 EXT4_SIZE?= 4G 
+EXT4_BASE_IMG ?= ../img/disk.img
+EXT4_BASE_TAR ?= ../img/disk.tar
+EXT4_BASE_TAR_XZ ?= ../img/disk.tar.xz
+EXT4_BASE_ARG :=
+ifneq ($(strip $(EXT4_BASE_IMG)),)
+EXT4_BASE_ARG := -b $(abspath $(EXT4_BASE_IMG))
+EXT4_BASE_DEP := ext4_base_img
+endif
 # Build ext4 image from user apps
-ext4_img: USER_APPS
+ext4_img: USER_APPS $(EXT4_BASE_DEP)
 	@needs=0; \
 	if [ ! -f "$(EXT4_IMG)" ]; then needs=1; fi; \
 	if [ $$needs -eq 0 ]; then \
@@ -119,6 +127,9 @@ ext4_img: USER_APPS
 	fi; \
 	if [ $$needs -eq 0 ]; then \
 		if find ../ext4-fs-packer/extra -type f -newer "$(EXT4_IMG)" 2>/dev/null | head -n 1 | grep -q .; then needs=1; fi; \
+	fi; \
+	if [ $$needs -eq 0 ] && [ -n "$(EXT4_BASE_IMG)" ] && [ -f "$(EXT4_BASE_IMG)" ]; then \
+		if [ "$(EXT4_BASE_IMG)" -nt "$(EXT4_IMG)" ]; then needs=1; fi; \
 	fi; \
 	if [ "$(EXT4_REBUILD)" = "1" ]; then needs=1; fi; \
 	if [ $$needs -eq 0 ]; then \
@@ -128,9 +139,24 @@ ext4_img: USER_APPS
 		cd ../ext4-fs-packer && cargo run --release -- \
 			-u ../os/$(APP_DIR) \
 			-e extra \
+			$(EXT4_BASE_ARG) \
 			-t target \
 			-S $(EXT4_SIZE); \
 		echo "✅ Ext4 image created: $(EXT4_IMG)"; \
+	fi
+
+ext4_base_img:
+	@if [ ! -f "$(EXT4_BASE_IMG)" ]; then \
+		if [ -f "$(EXT4_BASE_TAR)" ]; then \
+			echo "📦 Extracting base image from $(EXT4_BASE_TAR)..."; \
+			tar -xf "$(EXT4_BASE_TAR)" -C "$(dir $(EXT4_BASE_IMG))"; \
+		elif [ -f "$(EXT4_BASE_TAR_XZ)" ]; then \
+			echo "📦 Extracting base image from $(EXT4_BASE_TAR_XZ)..."; \
+			tar -xf "$(EXT4_BASE_TAR_XZ)" -C "$(dir $(EXT4_BASE_IMG))"; \
+		else \
+			echo "❌ Base image not found: $(EXT4_BASE_IMG)"; \
+			exit 1; \
+		fi; \
 	fi
 
 # Run with ext4 filesystem

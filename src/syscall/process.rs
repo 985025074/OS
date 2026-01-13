@@ -1,7 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     mem::size_of,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::Ordering,
 };
 
 use crate::{
@@ -19,6 +19,8 @@ use crate::{
     trap::{get_current_token, trap_handler},
 };
 
+const ENOENT: isize = -2;
+
 fn read_usize_user(token: usize, ptr: usize) -> usize {
     let mut raw = [0u8; size_of::<usize>()];
     for (i, byte) in raw.iter_mut().enumerate() {
@@ -28,7 +30,6 @@ fn read_usize_user(token: usize, ptr: usize) -> usize {
 }
 
 fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
-    const ENOENT: isize = -2;
     match resolve_exec_inode(path) {
         Ok(inode) => {
             let _ext4_guard = ext4_lock();
@@ -51,7 +52,70 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
     Err(ENOENT)
 }
 
-static MUSL_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
+    let candidates = [
+        ("./busybox", true),
+        ("busybox", true),
+        ("/musl/busybox", true),
+        ("/glibc/busybox", true),
+        ("/riscv/musl/busybox", true),
+        ("/riscv/glibc/busybox", true),
+        ("/bin/busybox", true),
+        ("/busybox", true),
+        ("/bin/sh", false),
+        ("/sh", false),
+    ];
+    for (candidate, needs_sh_arg) in candidates {
+        match load_file_from_path(candidate) {
+            Ok(data) => {
+                return Ok(Some((String::from(candidate), data, needs_sh_arg)));
+            }
+            Err(ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
+    match load_file_from_path(interp) {
+        Ok(data) => return Ok(data),
+        Err(ENOENT) => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut candidates: Vec<&str> = Vec::new();
+    if interp.starts_with("/lib/ld-musl") {
+        candidates.extend([
+            "/lib/libc.so",
+            "/musl/lib/libc.so",
+            "/riscv/musl/lib/libc.so",
+        ]);
+    } else if interp.starts_with("/lib/ld-linux") {
+        candidates.extend([
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+            "/glibc/lib/ld-linux-riscv64-lp64.so.1",
+            "/glibc/lib/libc.so.6",
+            "/glibc/lib/libc.so",
+        ]);
+    } else {
+        candidates.extend([
+            "/musl/lib/libc.so",
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+            "/glibc/lib/libc.so.6",
+        ]);
+    }
+
+    for cand in candidates {
+        match load_file_from_path(cand) {
+            Ok(data) => return Ok(data),
+            Err(ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(ENOENT)
+}
 
 fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == [0x7f, b'E', b'L', b'F']
@@ -349,7 +413,6 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
 
 pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     const ENOEXEC: isize = -8;
-    const ENOENT: isize = -2;
     let token = get_current_token();
     let path = translated_str(token, path_ptr as *const u8);
 
@@ -392,28 +455,9 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         // Dynamic ELF: map both main program and interpreter, and start at the
         // interpreter entry with a Linux-like auxv (AT_PHDR/AT_ENTRY/AT_BASE).
         if let Some(interp) = elf_interp_path(&file_data) {
-            let mut interp_data = match load_file_from_path(&interp) {
-                Ok(data) => Some(data),
-                Err(ENOENT) => None,
+            let interp_data = match load_interp_data(&interp) {
+                Ok(data) => data,
                 Err(e) => return e,
-            };
-            if interp_data.is_none() && interp.starts_with("/lib/ld-musl") {
-                const MUSL_FALLBACK: &str = "/lib/libc.so";
-                interp_data = match load_file_from_path(MUSL_FALLBACK) {
-                    Ok(data) => Some(data),
-                    Err(ENOENT) => None,
-                    Err(e) => return e,
-                };
-                if DEBUG_UNIXBENCH && !MUSL_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
-                    log::info!(
-                        "[execve] missing interp={}, fallback={}",
-                        interp,
-                        MUSL_FALLBACK
-                    );
-                }
-            }
-            let Some(interp_data) = interp_data else {
-                return ENOENT;
             };
             if !is_elf(&interp_data) {
                 return ENOEXEC;
@@ -430,47 +474,66 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     // Script with shebang: emulate Linux `#!` handling in-kernel so that
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(&file_data) {
-        let interp_data = match load_file_from_path(&interp) {
-            Ok(data) => data,
+        let wants_shell = interp.ends_with("/sh") || interp.ends_with("/busybox");
+        match load_file_from_path(&interp) {
+            Ok(interp_data) => {
+                if !is_elf(&interp_data) {
+                    return ENOEXEC;
+                }
+                let mut new_args: Vec<String> = Vec::new();
+                new_args.push(interp.clone());
+                if let Some(a) = opt_arg {
+                    new_args.push(a);
+                }
+                // Pass script path as argv[1] (or argv[2] with opt arg), like Linux.
+                new_args.push(path.clone());
+                // Append original args after argv[0].
+                for a in args_vec.iter().skip(1) {
+                    new_args.push(a.clone());
+                }
+                let process = current_process();
+                process.exec(&interp_data, new_args, envs_vec);
+                return 0;
+            }
+            Err(ENOENT) if wants_shell => {
+                let interp = match find_shell_interpreter() {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
+                    return ENOENT;
+                };
+                if !is_elf(&interp_data) {
+                    return ENOEXEC;
+                }
+                let mut new_args: Vec<String> = Vec::new();
+                new_args.push(interp_path.clone());
+                if needs_sh_arg && opt_arg.as_deref() != Some("sh") {
+                    new_args.push(String::from("sh"));
+                }
+                if let Some(a) = opt_arg {
+                    new_args.push(a);
+                }
+                new_args.push(path.clone());
+                for a in args_vec.iter().skip(1) {
+                    new_args.push(a.clone());
+                }
+                let process = current_process();
+                process.exec(&interp_data, new_args, envs_vec);
+                return 0;
+            }
             Err(e) => return e,
-        };
-        if !is_elf(&interp_data) {
-            return ENOEXEC;
         }
-        let mut new_args: Vec<String> = Vec::new();
-        new_args.push(interp.clone());
-        if let Some(a) = opt_arg {
-            new_args.push(a);
-        }
-        // Pass script path as argv[1] (or argv[2] with opt arg), like Linux.
-        new_args.push(path.clone());
-        // Append original args after argv[0].
-        for a in args_vec.iter().skip(1) {
-            new_args.push(a.clone());
-        }
-        let process = current_process();
-        process.exec(&interp_data, new_args, envs_vec);
-        return 0;
     }
 
     // ExampleOs-style fallback for .sh files without shebangs.
     // Note: this diverges from Linux (which returns ENOEXEC) but keeps OSComp
     // scripts working when shells don't retry on ENOEXEC.
     if path.ends_with(".sh") {
-        let mut interp: Option<(String, Vec<u8>, bool)> = None;
-        for (candidate, needs_sh_arg) in
-            [("/bin/busybox", true), ("/busybox", true), ("/bin/sh", false)]
-        {
-            match load_file_from_path(candidate) {
-                Ok(data) => {
-                    interp = Some((String::from(candidate), data, needs_sh_arg));
-                    break;
-                }
-                Err(ENOENT) => {}
-                Err(e) => return e,
-            }
-        }
-
+        let interp = match find_shell_interpreter() {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
             return ENOENT;
         };

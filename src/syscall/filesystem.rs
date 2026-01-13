@@ -429,7 +429,8 @@ pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
     if !inode.is_file() {
         return Err(EACCES);
     }
-    if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
+    let exec_mask = if path.ends_with(".sh") { 4 } else { 1 };
+    if !inode_mode_allows_uid_gid(&inode, exec_mask, fsuid, fsgid) {
         return Err(EACCES);
     }
     Ok(inode)

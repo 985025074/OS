@@ -105,6 +105,7 @@ const SYSCALL_SETRESGID: usize = 149;
 const SYSCALL_GETRESGID: usize = 150;
 const SYSCALL_SETFSUID: usize = 151;
 const SYSCALL_SETFSGID: usize = 152;
+const SYSCALL_REBOOT: usize = 142;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
@@ -346,6 +347,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSPICK => dummy::syscall_fspick(args[0] as isize, args[1], args[2]),
         SYSCALL_PIDFD_OPEN => dummy::syscall_pidfd_open(args[0], args[1]),
         SYSCALL_MEMFD_SECRET => dummy::syscall_memfd_secret(args[0]),
+        SYSCALL_REBOOT => misc::syscall_reboot(args[0], args[1], args[2], args[3]),
 
         SYSCALL_KILL => signal::syscall_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => signal::syscall_tkill(args[0], args[1] as i32),

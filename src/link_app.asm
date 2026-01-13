@@ -136,9 +136,13 @@ app_33_name:
     .asciz "submit_script"
 .section .rodata
 .align 3
+app_34_name:
+    .asciz "poweroff"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 34
+    .quad 35
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -173,3 +177,4 @@ num_user_apps:
     .quad app_31_name
     .quad app_32_name
     .quad app_33_name
+    .quad app_34_name
