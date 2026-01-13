@@ -159,6 +159,7 @@ const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
+const SYSCALL_SIGSUSPEND: usize = 133; // rt_sigsuspend
 const SYSCALL_SIGTIMEDWAIT: usize = 137; // rt_sigtimedwait
 const SYSCALL_SIGRETURN: usize = 139; // rt_sigreturn
 const SYSCALL_KILL: usize = 129;
@@ -350,6 +351,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TKILL => signal::syscall_tkill(args[0], args[1] as i32),
         SYSCALL_TGKILL => signal::syscall_tgkill(args[0], args[1], args[2] as i32),
 
+        SYSCALL_SIGSUSPEND => signal::syscall_rt_sigsuspend(args[0], args[1]),
         SYSCALL_SIGACTION => signal::syscall_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::syscall_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGTIMEDWAIT => {

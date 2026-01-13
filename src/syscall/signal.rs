@@ -14,8 +14,9 @@ use crate::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            signal_bit, take_first_unmasked, RT_SIG_MAX, RtSigAction, SIGALRM_NUM, SIG_DFL,
-            SIG_IGN, SignalAction, SignalFlags, kill, kill_current, set_signal, set_signal_mask,
+            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
+            set_signal_mask, signal_bit, take_first_unmasked, RT_SIG_MAX, RtSigAction, SIGALRM_NUM,
+            SIG_DFL, SIG_IGN, SignalAction, SignalFlags,
         },
         task_block::{SigSavedContext, TaskControlBlock},
     },
@@ -246,6 +247,76 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
     0
 }
 
+fn has_deliverable_pending(pending: u64, mask: u64) -> bool {
+    let mut bits = pending_unmasked_bits(pending, mask, false);
+    if bits == 0 {
+        return false;
+    }
+    let process = current_process();
+    let inner = process.borrow_mut();
+    while bits != 0 {
+        let signum = bits.trailing_zeros() as usize + 1;
+        bits &= bits - 1;
+        let action = inner
+            .rt_sig_handlers
+            .get(signum)
+            .copied()
+            .unwrap_or_default();
+        if action.handler == SIG_IGN {
+            continue;
+        }
+        if action.handler == SIG_DFL {
+            if signum <= crate::task::signal::MAX_SIG {
+                if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
+                    if flag.check_error().is_some() {
+                        return true;
+                    }
+                }
+            } else {
+                return true;
+            }
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Linux `rt_sigsuspend` (syscall 133).
+pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
+    const EINVAL: isize = -22;
+    const EINTR: isize = -4;
+    if sigsetsize < core::mem::size_of::<u64>() {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let new_mask = if mask_ptr != 0 {
+        read_user_value(token, mask_ptr as *const u64)
+    } else {
+        0
+    };
+    let task = current_task().unwrap();
+    let old_mask = {
+        let inner = task.borrow_mut();
+        inner.signal_mask
+    };
+
+    loop {
+        let (pending, mask) = {
+            let mut inner = task.borrow_mut();
+            if inner.sigsuspend_old_mask.is_none() {
+                inner.sigsuspend_old_mask = Some(old_mask);
+            }
+            inner.signal_mask = new_mask;
+            (inner.pending_signals, inner.signal_mask)
+        };
+        if has_deliverable_pending(pending, mask) {
+            return EINTR;
+        }
+        block_current_and_run_next();
+    }
+}
+
 /// Linux `rt_sigreturn` (syscall 139).
 pub fn syscall_rt_sigreturn() -> isize {
     let task = current_task().unwrap();
@@ -256,7 +327,7 @@ pub fn syscall_rt_sigreturn() -> isize {
             inner.res.as_ref().map(|r| r.tid).unwrap_or(0)
         );
     }
-    let Some(saved) = inner.sig_saved_ctx.take() else {
+    let Some(saved) = inner.sig_saved_ctx.pop() else {
         drop(inner);
         exit_current_and_run_next(-1);
         unreachable!("exit_current_and_run_next should not return");
@@ -629,11 +700,12 @@ pub fn maybe_deliver_signal() {
     let Some(task) = current_task() else {
         return;
     };
+    const MAX_SIGNAL_DEPTH: usize = 8;
     static SIGALRM_LOG_LEFT: AtomicUsize = AtomicUsize::new(16);
     let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
     let signum = {
         let mut inner = task.borrow_mut();
-        if inner.sig_saved_ctx.is_some() {
+        if inner.sig_saved_ctx.len() >= MAX_SIGNAL_DEPTH {
             if DEBUG_UNIXBENCH
                 && sigalrm_bit != 0
                 && (inner.pending_signals & sigalrm_bit) != 0
@@ -644,11 +716,10 @@ pub fn maybe_deliver_signal() {
                 crate::log_if!(
                     DEBUG_UNIXBENCH,
                     debug,
-                    "[signal] defer sig=14 pid={} tid={} pending={:#x} mask={:#x}",
+                    "[signal] drop sig=14 (nesting) pid={} tid={} depth={}",
                     pid,
                     tid,
-                    inner.pending_signals,
-                    inner.signal_mask
+                    inner.sig_saved_ctx.len()
                 );
             }
             return;
@@ -733,6 +804,10 @@ pub fn maybe_deliver_signal() {
         );
     }
     if action.handler == SIG_IGN {
+        let mut inner = task.borrow_mut();
+        if let Some(saved) = inner.sigsuspend_old_mask.take() {
+            inner.signal_mask = saved;
+        }
         return;
     }
     if action.handler == SIG_DFL {
@@ -745,16 +820,18 @@ pub fn maybe_deliver_signal() {
                 }
             }
         }
+        let mut inner = task.borrow_mut();
+        if let Some(saved) = inner.sigsuspend_old_mask.take() {
+            inner.signal_mask = saved;
+        }
         return;
     }
 
     let mut inner = task.borrow_mut();
-    if inner.sig_saved_ctx.is_some() {
-        return;
-    }
     let cx = inner.get_trap_cx();
-    let saved_mask = inner.signal_mask;
-    inner.sig_saved_ctx = Some(SigSavedContext {
+    let cur_mask = inner.signal_mask;
+    let saved_mask = inner.sigsuspend_old_mask.take().unwrap_or(cur_mask);
+    inner.sig_saved_ctx.push(SigSavedContext {
         trap_cx: *cx,
         mask: saved_mask,
         ucontext_ptr: 0,
@@ -762,7 +839,7 @@ pub fn maybe_deliver_signal() {
         signum,
     });
 
-    let mut new_mask = saved_mask | action.mask;
+    let mut new_mask = cur_mask | action.mask;
     if (action.flags & SA_NODEFER) == 0 {
         if let Some(bit) = sig_bit(signum) {
             new_mask |= bit;
@@ -804,7 +881,7 @@ pub fn maybe_deliver_signal() {
         let token = get_current_token();
         write_user_value(token, siginfo_ptr as *mut LinuxSigInfo, &siginfo);
         write_user_value(token, ucontext_ptr as *mut UContext, &ucontext);
-        if let Some(saved) = inner.sig_saved_ctx.as_mut() {
+        if let Some(saved) = inner.sig_saved_ctx.last_mut() {
             saved.ucontext_ptr = ucontext_ptr;
             saved.uses_ucontext = true;
         }
@@ -835,7 +912,7 @@ pub fn maybe_deliver_signal() {
 pub fn try_sigreturn_from_fault() -> bool {
     let task = current_task().unwrap();
     let mut inner = task.borrow_mut();
-    let Some(saved) = inner.sig_saved_ctx.take() else {
+    let Some(saved) = inner.sig_saved_ctx.pop() else {
         return false;
     };
     *inner.get_trap_cx() = saved.trap_cx;

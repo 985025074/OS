@@ -61,7 +61,7 @@ pub fn pick_task_for_signal(
         }
         let pending = (inner.pending_signals & bit) != 0;
         let blocked = (inner.signal_mask & bit) != 0;
-        let handling = inner.sig_saved_ctx.is_some();
+        let handling = !inner.sig_saved_ctx.is_empty();
         drop(inner);
         if !blocked && !pending && !handling {
             return Some(task.clone());

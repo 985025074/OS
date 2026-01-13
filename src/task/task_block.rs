@@ -428,8 +428,10 @@ pub struct TaskControlBlockInner {
     pub pending_signals: u64,
     /// Signal mask for this thread (bitmask of blocked signals).
     pub signal_mask: u64,
-    /// Saved user context when running a signal handler.
-    pub sig_saved_ctx: Option<SigSavedContext>,
+    /// Saved mask to restore after a `sigsuspend`-delivered signal.
+    pub sigsuspend_old_mask: Option<u64>,
+    /// Saved user contexts when running nested signal handlers (stack).
+    pub sig_saved_ctx: alloc::vec::Vec<SigSavedContext>,
 }
 
 #[derive(Clone, Copy)]
@@ -481,7 +483,8 @@ impl TaskControlBlock {
                 robust_list_len: 0,
                 pending_signals: 0,
                 signal_mask: 0,
-                sig_saved_ctx: None,
+                sigsuspend_old_mask: None,
+                sig_saved_ctx: alloc::vec::Vec::new(),
             }),
         })
     }
@@ -525,7 +528,8 @@ impl TaskControlBlock {
                 robust_list_len: 0,
                 pending_signals: 0,
                 signal_mask: 0,
-                sig_saved_ctx: None,
+                sigsuspend_old_mask: None,
+                sig_saved_ctx: alloc::vec::Vec::new(),
             }),
         })
     }
