@@ -11,8 +11,8 @@ use crate::{
     config::CLOCK_FREQ,
     fs::{
         shm_create, shm_get, shm_list, shm_remove, File, OSInode, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile, OpenFlags, ext4_lock, make_pipe,
-        open_file,
+        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile, OpenFlags, ext4_lock,
+        find_path_in_roots, make_pipe, open_file, secondary_root_inode,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
@@ -305,6 +305,66 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     Err(ENOTDIR)
 }
 
+fn resolve_ext4_abs_path(
+    path: &str,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+    depth: &mut usize,
+) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let primary = crate::fs::root_inode_for_path(path);
+    match resolve_ext4_path(primary, path, uid, gid, follow_final, depth) {
+        Ok(v) => Ok(v),
+        Err(ENOENT) => {
+            let Some(secondary) = secondary_root_inode() else {
+                return Err(ENOENT);
+            };
+            resolve_ext4_path(secondary, path, uid, gid, follow_final, depth)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn add_root_dir_entries(
+    root: &alloc::sync::Arc<ext4_fs::Inode>,
+    entries: &mut BTreeMap<String, (u64, u8)>,
+) {
+    for (name, ino, ftype) in root.dir_entries() {
+        if name == "." || name == ".." {
+            continue;
+        }
+        entries.entry(name).or_insert((ino as u64, dt_type_from_ext4(ftype)));
+    }
+}
+
+/// Build a merged root directory listing from the primary and secondary disks.
+///
+/// Caller should hold `ext4_lock`.
+fn union_root_dir_entries() -> Vec<PseudoDirent> {
+    let mut merged: BTreeMap<String, (u64, u8)> = BTreeMap::new();
+    let primary = crate::fs::root_inode_for_path("/");
+    add_root_dir_entries(&primary, &mut merged);
+    if let Some(secondary) = secondary_root_inode() {
+        add_root_dir_entries(&secondary, &mut merged);
+    }
+
+    let mut entries = Vec::with_capacity(merged.len() + 2);
+    entries.push(PseudoDirent {
+        name: alloc::string::String::from("."),
+        ino: 1,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: alloc::string::String::from(".."),
+        ino: 1,
+        dtype: 4,
+    });
+    for (name, (ino, dtype)) in merged {
+        entries.push(PseudoDirent { name, ino, dtype });
+    }
+    entries
+}
+
 fn read_user_cstring(token: usize, ptr: usize) -> Result<String, isize> {
     if ptr == 0 {
         return Err(EFAULT);
@@ -383,12 +443,10 @@ fn resolve_ext4_path(
                 }
                 new_path.push_str(&remaining);
             }
-            let new_start = if new_path.starts_with('/') {
-                crate::fs::root_inode_for_path(&new_path)
-            } else {
-                cur
-            };
-            return resolve_ext4_path(new_start, &new_path, uid, gid, follow_final, depth);
+            if new_path.starts_with('/') {
+                return resolve_ext4_abs_path(&new_path, uid, gid, follow_final, depth);
+            }
+            return resolve_ext4_path(cur, &new_path, uid, gid, follow_final, depth);
         }
         stack.push(next);
         idx += 1;
@@ -404,9 +462,7 @@ fn resolve_at_inode(
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let mut depth = 0usize;
     match at {
-        AtPath::Ext4Abs(abs) => {
-            resolve_ext4_path(crate::fs::root_inode_for_path(abs), abs, uid, gid, follow_final, &mut depth)
-        }
+        AtPath::Ext4Abs(abs) => resolve_ext4_abs_path(abs, uid, gid, follow_final, &mut depth),
         AtPath::Ext4Rel { base, rel } => {
             if rel.is_empty() {
                 Ok(alloc::sync::Arc::clone(base))
@@ -453,11 +509,14 @@ fn resolve_parent_and_name(
             if name.is_empty() {
                 return Err(EINVAL);
             }
-            let parent = if parent_path.is_empty() {
-                crate::fs::root_inode_for_path(abs)
+            let parent_abs = if parent_path.is_empty() {
+                alloc::string::String::from("/")
             } else {
-                resolve_ext4_path(crate::fs::root_inode_for_path(parent_path), parent_path, uid, gid, true, &mut depth)?
+                let mut p = alloc::string::String::from("/");
+                p.push_str(parent_path);
+                p
             };
+            let parent = resolve_ext4_abs_path(&parent_abs, uid, gid, true, &mut depth)?;
             Ok((parent, alloc::string::String::from(name)))
         }
         AtPath::Ext4Rel { base, rel } => {
@@ -824,6 +883,38 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             }
         }
         return fd as isize;
+    }
+
+    // If we have a secondary disk, expose a merged view of `/` for directory listing.
+    if let AtPath::Ext4Abs(abs) = &at {
+        if abs == "/" && secondary_root_inode().is_some() {
+            if write_intent && !o_path {
+                return EISDIR;
+            }
+            let _ext4_guard = ext4_lock();
+            let entries = union_root_dir_entries();
+            drop(_ext4_guard);
+            let file: alloc::sync::Arc<dyn File + Send + Sync> =
+                alloc::sync::Arc::new(PseudoDir::new("/", entries));
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            let Some(fd) = inner.alloc_fd() else {
+                return EMFILE;
+            };
+            inner.fd_table[fd] = Some(file);
+            let mut fd_flags = 0u32;
+            if (flags & O_CLOEXEC) != 0 {
+                fd_flags |= FD_CLOEXEC;
+            }
+            if (flags & O_NONBLOCK) != 0 {
+                fd_flags |= O_NONBLOCK as u32;
+            }
+            if o_path {
+                fd_flags |= O_PATH as u32;
+            }
+            inner.fd_flags[fd] = fd_flags;
+            return fd as isize;
+        }
     }
 
     let ext4_guard = ext4_lock();
@@ -1980,7 +2071,7 @@ pub fn syscall_chdir(pathname: usize) -> isize {
 
     let inode = {
         let _ext4_guard = ext4_lock();
-        crate::fs::root_inode_for_path(&new_cwd).find_path(&new_cwd)
+        find_path_in_roots(&new_cwd)
     };
     if let Some(inode) = inode {
         let (fsuid, fsgid) = current_fsuid_gid();
@@ -2266,7 +2357,7 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
         }
         AtPath::Ext4Abs(abs) => {
             let _ext4_guard = ext4_lock();
-            if crate::fs::root_inode_for_path(&abs).find_path(&abs).is_none() {
+            if find_path_in_roots(&abs).is_none() {
                 return ENOENT;
             }
             fill_statfs(st_ptr)
@@ -2391,7 +2482,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
 
     let _ext4_guard = ext4_lock();
     let inode = match at {
-        AtPath::Ext4Abs(abs) => crate::fs::root_inode_for_path(&abs).find_path(&abs),
+        AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
         AtPath::Ext4Rel { base, rel } => {
             if rel.is_empty() {
                 Some(base)
@@ -2755,7 +2846,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     let _ext4_guard = ext4_lock();
     let inode = match at {
-        AtPath::Ext4Abs(abs) => crate::fs::root_inode_for_path(&abs).find_path(&abs),
+        AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
         AtPath::Ext4Rel { base, rel } => {
             if rel.is_empty() {
                 Some(base)

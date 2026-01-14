@@ -1,4 +1,7 @@
-use core::{arch::asm, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use crate::config::TRAMPOLINE;
 use crate::debug_config::DEBUG_TRAP;
@@ -11,7 +14,10 @@ use crate::{println, trap::context::TrapContext};
 pub mod context;
 pub mod trap;
 use crate::syscall::syscall;
-use riscv::{interrupt::Trap, register::{scause, sstatus, stval}};
+use riscv::{
+    interrupt::Trap,
+    register::{scause, sstatus, stval},
+};
 
 #[allow(unused)]
 fn log_for_trap_context(context: &TrapContext) {
@@ -156,16 +162,13 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             }
             panic!(
                 "Kernel page fault: cause = {:?}, sepc = {:#x}, stval = {:#x}",
-                c,
-                trap_cx.sepc,
-                stval
+                c, trap_cx.sepc, stval
             );
         }
         c => {
             panic!(
                 "Unsupported trap from kernel: {:?}, stval = {:#x}!",
-                c,
-                stval
+                c, stval
             );
         }
     }
@@ -181,7 +184,8 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
     let Some(mut inner) = process.try_borrow_mut() else {
         return false;
     };
-    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT)) && inner.memory_set.resolve_cow_fault(stval)
+    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT))
+        && inner.memory_set.resolve_cow_fault(stval)
     {
         return true;
     }
@@ -256,7 +260,7 @@ pub fn trap_handler() {
             // The tradeoff is that long-running syscalls (like exec) won't be preemptible,
             // but this is acceptable for correctness.
             //
-            // If you need preemptible syscalls, consider:
+            //  todo:
             // 1. Using interrupt-safe allocators
             // 2. Avoiding memory allocation in interrupt handlers
             // 3. Selectively enabling interrupts only for syscalls that don't use spin::Mutex
@@ -434,7 +438,8 @@ fn handle_user_exception(code: usize, stval: usize) {
             );
             if slot_val != 0 {
                 let tag = try_read_user_u64(token, slot_val as usize).unwrap_or(0);
-                let val = try_read_user_u64(token, (slot_val as usize).wrapping_add(8)).unwrap_or(0);
+                let val =
+                    try_read_user_u64(token, (slot_val as usize).wrapping_add(8)).unwrap_or(0);
                 crate::println!(
                     "[ld-linux_diag] dyn@{:#x}: tag={} val={:#x}",
                     slot_val,
@@ -478,16 +483,11 @@ pub fn trap_return() -> ! {
             unsafe { asm!("mv {}, tp", out(reg) h) };
             h
         };
-        log::debug!(
-            "[trap_return entry#{}] hart={} sp={:#x}",
-            entered,
-            hart,
-            {
-                let s: usize;
-                unsafe { asm!("mv {}, sp", out(reg) s) };
-                s
-            }
-        );
+        log::debug!("[trap_return entry#{}] hart={} sp={:#x}", entered, hart, {
+            let s: usize;
+            unsafe { asm!("mv {}, sp", out(reg) s) };
+            s
+        });
     }
     // this shouln't be interrupted
     disable_supervisor_interrupt();

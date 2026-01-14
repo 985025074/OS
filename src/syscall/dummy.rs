@@ -13,6 +13,7 @@ const FD_CLOEXEC: u32 = 1;
 const CLOEXEC_FLAG: usize = 0x80000;
 const NONBLOCK_FLAG: usize = 0x800;
 
+// this function allocates a dummy file descriptor with given flags
 fn alloc_dummy_fd(fd_flags: u32) -> isize {
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -128,7 +129,13 @@ pub fn syscall_userfaultfd(_flags: usize) -> isize {
     alloc_dummy_fd(0)
 }
 
-pub fn syscall_perf_event_open(_attr: usize, _pid: isize, _cpu: isize, _group_fd: isize, _flags: usize) -> isize {
+pub fn syscall_perf_event_open(
+    _attr: usize,
+    _pid: isize,
+    _cpu: isize,
+    _group_fd: isize,
+    _flags: usize,
+) -> isize {
     alloc_dummy_fd(0)
 }
 

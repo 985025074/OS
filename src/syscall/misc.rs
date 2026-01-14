@@ -137,7 +137,7 @@ pub fn syscall_mount(
     let cwd = { process.borrow_mut().cwd.clone() };
     let abs = normalize_path(&cwd, &dir);
     let _ext4_guard = ext4_lock();
-    let inode = match crate::fs::root_inode_for_path(&abs).find_path(&abs) {
+    let inode = match crate::fs::find_path_in_roots(&abs) {
         Some(v) => v,
         None => return ENOENT,
     };

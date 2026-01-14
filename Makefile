@@ -10,7 +10,7 @@ KERNEL_ENTRY_PA = 0x80200000
 SMP ?= 4
 MEM ?= 512M
 QEMU_TIMEOUT ?= 0
-DISK_IMG ?=
+DISK_IMG ?= ../sdcard-rv.img
 EXT4_REBUILD ?= 0
 SUBMIT ?= 0
 USER_FEATURES :=
@@ -119,6 +119,13 @@ EXT4_BASE_ARG := -b $(abspath $(EXT4_BASE_IMG))
 EXT4_BASE_DEP := ext4_base_img
 endif
 # Build ext4 image from user apps
+# check if need to rebuild
+# 1. ext4 image not exist
+# 2. any user app is newer than ext4 image
+# 3. any file in extra/ is newer than ext4 image
+# 4. base image is newer than ext4 image
+# 5. EXT4_REBUILD is set to 1
+
 ext4_img: USER_APPS $(EXT4_BASE_DEP)
 	@needs=0; \
 	if [ ! -f "$(EXT4_IMG)" ]; then needs=1; fi; \

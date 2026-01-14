@@ -98,10 +98,7 @@ impl MemorySet {
     }
 
     fn push(&mut self, map_area: MapArea, data: Option<&[u8]>) {
-        assert!(
-            self.try_push(map_area, data),
-            "OOM: mapping area failed"
-        );
+        assert!(self.try_push(map_area, data), "OOM: mapping area failed");
     }
 
     fn try_push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) -> bool {
@@ -361,7 +358,8 @@ impl MemorySet {
                 continue;
             }
             let start_va: VirtAddr = (load_bias + ph.virtual_addr() as usize).into();
-            let end_va: VirtAddr = (load_bias + (ph.virtual_addr() + ph.mem_size()) as usize).into();
+            let end_va: VirtAddr =
+                (load_bias + (ph.virtual_addr() + ph.mem_size()) as usize).into();
             let mut map_perm = MapPermission::U;
             let ph_flags = ph.flags();
             if ph_flags.is_read() {
@@ -473,7 +471,14 @@ impl MemorySet {
             None,
         );
 
-        (memory_set, user_stack_bottom, interp_entry, main_entry, main_aux, interp_bias)
+        (
+            memory_set,
+            user_stack_bottom,
+            interp_entry,
+            main_entry,
+            main_aux,
+            interp_bias,
+        )
     }
     /// Fork a user address space using copy-on-write for user pages.
     ///
@@ -505,6 +510,8 @@ impl MemorySet {
                     }
                     MapType::Framed | MapType::Lazy => {
                         let Some(src_pte) = user_space.translate(vpn) else {
+                            // this is for clarifing that we dont map lazy area here
+
                             if area.map_type == MapType::Lazy {
                                 continue;
                             }
@@ -643,10 +650,7 @@ impl MemorySet {
                 }
             }
             let Some(frame) = frame_alloc() else {
-                crate::println!(
-                    "[mm] OOM: lazy fault alloc failed for vpn={:?}",
-                    vpn
-                );
+                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
                 return false;
             };
             let pte_flags = PTEFlags::from_bits(area.map_perm.bits as u16).unwrap();
@@ -844,8 +848,7 @@ impl MemorySet {
                             self.page_table.unmap(vpn);
                             continue;
                         }
-                        let mut pte_flags =
-                            PTEFlags::from_bits(new_perm.bits as u16).unwrap();
+                        let mut pte_flags = PTEFlags::from_bits(new_perm.bits as u16).unwrap();
                         let old_flags = pte.flags();
                         if old_flags.contains(PTEFlags::COW) {
                             pte_flags.insert(PTEFlags::COW);
@@ -860,8 +863,7 @@ impl MemorySet {
                 }
                 if new_perm != MapPermission::U {
                     if let Some(frame) = mid_frames.get(&vpn) {
-                        let pte_flags =
-                            PTEFlags::from_bits(new_perm.bits as u16).unwrap();
+                        let pte_flags = PTEFlags::from_bits(new_perm.bits as u16).unwrap();
                         self.page_table.map(vpn, frame.ppn, pte_flags);
                     }
                 }

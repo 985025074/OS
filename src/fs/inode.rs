@@ -45,7 +45,12 @@ impl OSInode {
         Self::new_with_append(readable, writable, false, inode)
     }
 
-    pub fn new_with_append(readable: bool, writable: bool, append: bool, inode: Arc<Inode>) -> Self {
+    pub fn new_with_append(
+        readable: bool,
+        writable: bool,
+        append: bool,
+        inode: Arc<Inode>,
+    ) -> Self {
         Self::new_with_append_rofs(readable, writable, append, inode, false)
     }
 
@@ -181,47 +186,112 @@ impl OSInode {
 }
 
 lazy_static! {
-    /// ext4 filesystem handle (shared by all inodes).
-    pub static ref EXT4_FS: Arc<spin::Mutex<Ext4FileSystem>> = {
+    static ref DISK0_FS: Arc<spin::Mutex<Ext4FileSystem>> = {
         Ext4FileSystem::open(BLOCK_DEVICE.clone())
     };
 
-    /// Root inode of the filesystem
-    pub static ref ROOT_INODE: Arc<Inode> = {
-        Arc::new(Ext4FileSystem::root_inode(&EXT4_FS))
-    };
-
-    /// Optional secondary filesystem (e.g., disk.img).
-    pub static ref USER_EXT4_FS: Option<Arc<spin::Mutex<Ext4FileSystem>>> = {
+    static ref DISK1_FS: Option<Arc<spin::Mutex<Ext4FileSystem>>> = {
         USER_BLOCK_DEVICE
             .as_ref()
             .map(|dev| Ext4FileSystem::open(dev.clone()))
     };
 
-    /// Root inode of the secondary filesystem.
-    pub static ref USER_ROOT_INODE: Option<Arc<Inode>> = {
-        USER_EXT4_FS
+    static ref DISK0_ROOT: Arc<Inode> = {
+        Arc::new(Ext4FileSystem::root_inode(&DISK0_FS))
+    };
+
+    static ref DISK1_ROOT: Option<Arc<Inode>> = {
+        DISK1_FS
             .as_ref()
             .map(|fs| Arc::new(Ext4FileSystem::root_inode(fs)))
     };
 
-    /// User directory inode (for ext4, apps are in /user)
+    static ref ROOT_SELECTION: RootSelection = RootSelection::new(
+        &DISK0_ROOT,
+        &DISK1_ROOT,
+        &DISK0_FS,
+        &DISK1_FS,
+    );
+
+    /// ext4 filesystem handle (primary root device).
+    pub static ref EXT4_FS: Arc<spin::Mutex<Ext4FileSystem>> = ROOT_SELECTION.primary_fs.clone();
+
+    /// Root inode of the primary filesystem.
+    pub static ref ROOT_INODE: Arc<Inode> = ROOT_SELECTION.primary_root.clone();
+
+    /// Optional secondary filesystem (if present).
+    pub static ref SECONDARY_EXT4_FS: Option<Arc<spin::Mutex<Ext4FileSystem>>> =
+        ROOT_SELECTION.secondary_fs.clone();
+
+    /// Root inode of the secondary filesystem (if present).
+    pub static ref SECONDARY_ROOT_INODE: Option<Arc<Inode>> =
+        ROOT_SELECTION.secondary_root.clone();
+
+    /// User directory inode (for ext4, apps are in /user).
     pub static ref USER_INODE: Arc<Inode> = {
-        if let Some(root) = USER_ROOT_INODE.as_ref() {
-            root.find("user")
-                .expect("[ext4] /user directory not found on user disk!")
-        } else {
-            ROOT_INODE.find("user").expect("[ext4] /user directory not found!")
-        }
+        ROOT_INODE
+            .find("user")
+            .expect("[ext4] /user directory not found!")
     };
 }
 
 pub(crate) fn root_inode_for_path(path: &str) -> Arc<Inode> {
-    let use_user = (path == "/user" || path.starts_with("/user/")) && USER_ROOT_INODE.is_some();
-    if use_user {
-        USER_ROOT_INODE.as_ref().unwrap().clone()
-    } else {
-        ROOT_INODE.clone()
+    let _ = path;
+    ROOT_INODE.clone()
+}
+
+pub(crate) fn secondary_root_inode() -> Option<Arc<Inode>> {
+    SECONDARY_ROOT_INODE.as_ref().map(Arc::clone)
+}
+
+/// Find a path in the primary root, falling back to the secondary root when missing.
+///
+/// Caller should hold `EXT4_LOCK` if concurrent ext4 access is possible.
+pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
+    if let Some(inode) = ROOT_INODE.find_path(path) {
+        return Some(inode);
+    }
+    SECONDARY_ROOT_INODE.as_ref()?.find_path(path)
+}
+//if a disk has a /user directory while the other does not, prefer the one with /user
+//todo: better solution.
+struct RootSelection {
+    primary_root: Arc<Inode>,
+    secondary_root: Option<Arc<Inode>>,
+    primary_fs: Arc<spin::Mutex<Ext4FileSystem>>,
+    secondary_fs: Option<Arc<spin::Mutex<Ext4FileSystem>>>,
+}
+
+impl RootSelection {
+    fn new(
+        root0: &Arc<Inode>,
+        root1: &Option<Arc<Inode>>,
+        fs0: &Arc<spin::Mutex<Ext4FileSystem>>,
+        fs1: &Option<Arc<spin::Mutex<Ext4FileSystem>>>,
+    ) -> Self {
+        // Avoid taking EXT4_LOCK here; this may run during lazy_static initialization
+        // while a caller already holds the lock.
+        let has_user0 = root0.find("user").is_some();
+        let has_user1 = root1
+            .as_ref()
+            .map(|root| root.find("user").is_some())
+            .unwrap_or(false);
+
+        if root1.is_some() && !has_user0 && has_user1 {
+            RootSelection {
+                primary_root: root1.as_ref().unwrap().clone(),
+                secondary_root: Some(root0.clone()),
+                primary_fs: fs1.as_ref().unwrap().clone(),
+                secondary_fs: Some(fs0.clone()),
+            }
+        } else {
+            RootSelection {
+                primary_root: root0.clone(),
+                secondary_root: root1.clone(),
+                primary_fs: fs0.clone(),
+                secondary_fs: fs1.clone(),
+            }
+        }
     }
 }
 
@@ -277,13 +347,18 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 
     // Default: resolve relative paths from /user to keep exec() behavior.
-    let base_dir: Arc<Inode> = if raw.starts_with('/') {
+    let is_abs = raw.starts_with('/');
+    let base_dir: Arc<Inode> = if is_abs {
         root_inode_for_path(raw)
     } else {
         Arc::clone(&USER_INODE)
     };
 
-    let mut inode = base_dir.find_path(raw);
+    let mut inode = if is_abs {
+        find_path_in_roots(raw)
+    } else {
+        base_dir.find_path(raw)
+    };
 
     // Keep compatibility: exec("foo") can omit ".bin".
     if inode.is_none() && !raw.contains('/') && !raw.ends_with(".bin") {
@@ -296,6 +371,9 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         let (parent_path, file_name) = split_parent_and_name(raw)?;
         let parent = if parent_path.is_empty() {
             Arc::clone(&base_dir)
+        } else if is_abs {
+            let parent_abs = alloc::format!("/{}", parent_path);
+            find_path_in_roots(&parent_abs)?
         } else {
             base_dir.find_path(parent_path)?
         };

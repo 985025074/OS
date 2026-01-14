@@ -10,6 +10,7 @@ use crate::println;
 
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 
+// sdcard.img on the block device and disk.img on the second part
 lazy_static! {
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());
     pub static ref USER_BLOCK_DEVICE: Option<Arc<dyn BlockDevice>> =
