@@ -1,28 +1,31 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::sync::atomic::{AtomicUsize, Ordering};
-
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
     config::CLOCK_FREQ,
     fs::{
-        shm_create, shm_get, shm_list, shm_remove, File, OSInode, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile, OpenFlags, ext4_lock,
-        find_path_in_roots, make_pipe, open_file, secondary_root_inode,
+        File, OSInode, OpenFlags, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile,
+        RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode,
+        shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_read_user_value,
-        try_copy_to_user, write_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, try_copy_to_user,
+        try_read_user_value, write_user_value,
     },
     task::processor::current_process,
+    task::ProcessControlBlock,
     time::get_time,
     trap::get_current_token,
 };
+use crate::task::manager::PID2PCB;
+use ext4_fs::sync_all;
 
 const AT_FDCWD: isize = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -333,7 +336,9 @@ fn add_root_dir_entries(
         if name == "." || name == ".." {
             continue;
         }
-        entries.entry(name).or_insert((ino as u64, dt_type_from_ext4(ftype)));
+        entries
+            .entry(name)
+            .or_insert((ino as u64, dt_type_from_ext4(ftype)));
     }
 }
 
@@ -467,7 +472,14 @@ fn resolve_at_inode(
             if rel.is_empty() {
                 Ok(alloc::sync::Arc::clone(base))
             } else {
-                resolve_ext4_path(alloc::sync::Arc::clone(base), rel, uid, gid, follow_final, &mut depth)
+                resolve_ext4_path(
+                    alloc::sync::Arc::clone(base),
+                    rel,
+                    uid,
+                    gid,
+                    follow_final,
+                    &mut depth,
+                )
             }
         }
         AtPath::PseudoAbs(_) => Err(ENOENT),
@@ -532,7 +544,14 @@ fn resolve_parent_and_name(
             let parent = if parent_path.is_empty() {
                 alloc::sync::Arc::clone(base)
             } else {
-                resolve_ext4_path(alloc::sync::Arc::clone(base), parent_path, uid, gid, true, &mut depth)?
+                resolve_ext4_path(
+                    alloc::sync::Arc::clone(base),
+                    parent_path,
+                    uid,
+                    gid,
+                    true,
+                    &mut depth,
+                )?
             };
             Ok((parent, alloc::string::String::from(name)))
         }
@@ -780,7 +799,14 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if pid >= 2 && fd <= 8 {
-            crate::println!("[fs] fcntl(pid={}) fd={} cmd={} arg={:#x} -> {}", pid, fd, cmd, arg, ret);
+            crate::println!(
+                "[fs] fcntl(pid={}) fd={} cmd={} arg={:#x} -> {}",
+                pid,
+                fd,
+                cmd,
+                arg,
+                ret
+            );
         }
     }
     ret
@@ -840,25 +866,25 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         }
         // Minimal `/dev/shm` support for POSIX `shm_open` users (e.g., cyclictest).
         // Must handle `O_CREAT|O_EXCL` even when the object already exists.
-        let file: alloc::sync::Arc<dyn File + Send + Sync> = if let Some(name) = shm_object_name(abs)
-        {
-            if (flags & O_CREAT) != 0 {
-                if (flags & O_EXCL) != 0 && shm_get(name).is_some() {
-                    return EEXIST;
+        let file: alloc::sync::Arc<dyn File + Send + Sync> =
+            if let Some(name) = shm_object_name(abs) {
+                if (flags & O_CREAT) != 0 {
+                    if (flags & O_EXCL) != 0 && shm_get(name).is_some() {
+                        return EEXIST;
+                    }
+                    let data = shm_create(name);
+                    alloc::sync::Arc::new(PseudoShmFile::new(data))
+                } else {
+                    let Some(data) = shm_get(name) else {
+                        return ENOENT;
+                    };
+                    alloc::sync::Arc::new(PseudoShmFile::new(data))
                 }
-                let data = shm_create(name);
-                alloc::sync::Arc::new(PseudoShmFile::new(data))
+            } else if let Some(f) = open_pseudo(abs) {
+                f
             } else {
-                let Some(data) = shm_get(name) else {
-                    return ENOENT;
-                };
-                alloc::sync::Arc::new(PseudoShmFile::new(data))
-            }
-        } else if let Some(f) = open_pseudo(abs) {
-            f
-        } else {
-            return ENOENT;
-        };
+                return ENOENT;
+            };
         let process = current_process();
         let mut inner = process.borrow_mut();
         let Some(fd) = inner.alloc_fd() else {
@@ -1064,15 +1090,47 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     // /proc with just enough content for busybox `ps`, `df`, `free`, etc.
     if path == "/proc" || path == "/proc/" {
         let mut entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("mounts"), ino: 2, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("meminfo"), ino: 3, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("loadavg"), ino: 4, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("uptime"), ino: 5, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("stat"), ino: 6, dtype: 8 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("mounts"),
+                ino: 2,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("meminfo"),
+                ino: 3,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("loadavg"),
+                ino: 4,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("uptime"),
+                ino: 5,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("stat"),
+                ino: 6,
+                dtype: 8
+            },
             // Linux has /proc/self as a symlink; we expose it as a directory.
-            PseudoDirent { name: alloc::string::String::from("self"), ino: 7, dtype: 4 },
+            PseudoDirent {
+                name: alloc::string::String::from("self"),
+                ino: 7,
+                dtype: 4
+            },
         ];
         let mut pids: alloc::vec::Vec<usize> = {
             let map = crate::task::manager::PID2PCB.lock();
@@ -1080,7 +1138,11 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         };
         pids.sort_unstable();
         for pid in pids {
-            entries.push(PseudoDirent { name: alloc::format!("{}", pid), ino: pid as u64, dtype: 4 });
+            entries.push(PseudoDirent {
+                name: alloc::format!("{}", pid),
+                ino: pid as u64,
+                dtype: 4,
+            });
         }
         return Some(alloc::sync::Arc::new(PseudoDir::new("/proc", entries)));
     }
@@ -1089,13 +1151,41 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     if path == "/proc/self" || path == "/proc/self/" {
         let pid = current_process().getpid();
         let entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: pid as u64, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("mounts"), ino: (pid as u64) << 32 | 4, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("maps"), ino: (pid as u64) << 32 | 5, dtype: 8 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: pid as u64,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("stat"),
+                ino: (pid as u64) << 32 | 1,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("cmdline"),
+                ino: (pid as u64) << 32 | 2,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("status"),
+                ino: (pid as u64) << 32 | 3,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("mounts"),
+                ino: (pid as u64) << 32 | 4,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("maps"),
+                ino: (pid as u64) << 32 | 5,
+                dtype: 8
+            },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/self", entries)));
     }
@@ -1141,8 +1231,17 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                     .map(|(s, e)| e.saturating_sub(*s))
                     .sum();
                 let vsize: u64 = (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
-                let vsize_kb: usize = (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
-                (ppid, argv, start_time_ms, num_threads, main_state, vsize, vsize_kb)
+                let vsize_kb: usize =
+                    (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
+                (
+                    ppid,
+                    argv,
+                    start_time_ms,
+                    num_threads,
+                    main_state,
+                    vsize,
+                    vsize_kb,
+                )
             };
 
             let comm = argv
@@ -1160,13 +1259,41 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             match it.next() {
                 None => {
                     let entries = alloc::vec![
-                        PseudoDirent { name: alloc::string::String::from("."), ino: pid as u64, dtype: 4 },
-                        PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-                        PseudoDirent { name: alloc::string::String::from("stat"), ino: (pid as u64) << 32 | 1, dtype: 8 },
-                        PseudoDirent { name: alloc::string::String::from("cmdline"), ino: (pid as u64) << 32 | 2, dtype: 8 },
-                        PseudoDirent { name: alloc::string::String::from("status"), ino: (pid as u64) << 32 | 3, dtype: 8 },
-                        PseudoDirent { name: alloc::string::String::from("mounts"), ino: (pid as u64) << 32 | 4, dtype: 8 },
-                        PseudoDirent { name: alloc::string::String::from("maps"), ino: (pid as u64) << 32 | 5, dtype: 8 },
+                        PseudoDirent {
+                            name: alloc::string::String::from("."),
+                            ino: pid as u64,
+                            dtype: 4
+                        },
+                        PseudoDirent {
+                            name: alloc::string::String::from(".."),
+                            ino: 1,
+                            dtype: 4
+                        },
+                        PseudoDirent {
+                            name: alloc::string::String::from("stat"),
+                            ino: (pid as u64) << 32 | 1,
+                            dtype: 8
+                        },
+                        PseudoDirent {
+                            name: alloc::string::String::from("cmdline"),
+                            ino: (pid as u64) << 32 | 2,
+                            dtype: 8
+                        },
+                        PseudoDirent {
+                            name: alloc::string::String::from("status"),
+                            ino: (pid as u64) << 32 | 3,
+                            dtype: 8
+                        },
+                        PseudoDirent {
+                            name: alloc::string::String::from("mounts"),
+                            ino: (pid as u64) << 32 | 4,
+                            dtype: 8
+                        },
+                        PseudoDirent {
+                            name: alloc::string::String::from("maps"),
+                            ino: (pid as u64) << 32 | 5,
+                            dtype: 8
+                        },
                     ];
                     let p = alloc::format!("/proc/{}", pid);
                     return Some(alloc::sync::Arc::new(PseudoDir::new(&p, entries)));
@@ -1182,7 +1309,8 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                     let rss_pages: u64 = if vsize == 0 {
                         0
                     } else {
-                        (vsize + crate::config::PAGE_SIZE as u64 - 1) / crate::config::PAGE_SIZE as u64
+                        (vsize + crate::config::PAGE_SIZE as u64 - 1)
+                            / crate::config::PAGE_SIZE as u64
                     };
                     // Field order follows Linux `/proc/<pid>/stat` (man proc).
                     let pgrp = pid;
@@ -1265,50 +1393,138 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/sys" || path == "/sys/" {
         let entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("devices"), ino: 2, dtype: 4 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("devices"),
+                ino: 2,
+                dtype: 4
+            },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/sys", entries)));
     }
     if path == "/dev" || path == "/dev/" {
         let entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("root"), ino: 6, dtype: 6 },
-            PseudoDirent { name: alloc::string::String::from("shm"), ino: 8, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("null"), ino: 2, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("zero"), ino: 3, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("urandom"), ino: 4, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("random"), ino: 5, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("misc"), ino: 7, dtype: 4 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("root"),
+                ino: 6,
+                dtype: 6
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("shm"),
+                ino: 8,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("null"),
+                ino: 2,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("zero"),
+                ino: 3,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("urandom"),
+                ino: 4,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("random"),
+                ino: 5,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("misc"),
+                ino: 7,
+                dtype: 4
+            },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
     }
     if path == "/dev/shm" || path == "/dev/shm/" {
         let mut entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
         ];
         for (idx, name) in shm_list().into_iter().enumerate() {
-            entries.push(PseudoDirent { name, ino: (1000 + idx) as u64, dtype: 8 });
+            entries.push(PseudoDirent {
+                name,
+                ino: (1000 + idx) as u64,
+                dtype: 8,
+            });
         }
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/shm", entries)));
     }
     if path == "/dev/misc" || path == "/dev/misc/" {
         let entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("rtc"), ino: 2, dtype: 8 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("rtc"),
+                ino: 2,
+                dtype: 8
+            },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/misc", entries)));
     }
     if path == "/etc" || path == "/etc/" {
         let entries = alloc::vec![
-            PseudoDirent { name: alloc::string::String::from("."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from(".."), ino: 1, dtype: 4 },
-            PseudoDirent { name: alloc::string::String::from("passwd"), ino: 2, dtype: 8 },
-            PseudoDirent { name: alloc::string::String::from("group"), ino: 3, dtype: 8 },
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("passwd"),
+                ino: 2,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("group"),
+                ino: 3,
+                dtype: 8
+            },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/etc", entries)));
     }
@@ -1353,7 +1569,9 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     // /proc/loadavg
     if path == "/proc/loadavg" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0.00 0.00 0.00 1/1 1\n")));
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+            "0.00 0.00 0.00 1/1 1\n",
+        )));
     }
     if path == "/proc/uptime" {
         let ms = crate::time::get_time_ms();
@@ -1369,7 +1587,9 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/proc/mounts" {
         // Minimal mount table so `df` works.
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("/dev/root / ext4 rw 0 0\n")));
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+            "/dev/root / ext4 rw 0 0\n",
+        )));
     }
     if path == "/proc/self/mounts" {
         return open_pseudo("/proc/mounts");
@@ -1400,7 +1620,8 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         return Some(alloc::sync::Arc::new(PseudoFile::new_zero()));
     }
     if path == "/dev/urandom" || path == "/dev/random" {
-        let seed = (crate::time::get_time() as u64) ^ ((crate::task::processor::hart_id() as u64) << 32);
+        let seed =
+            (crate::time::get_time() as u64) ^ ((crate::task::processor::hart_id() as u64) << 32);
         return Some(alloc::sync::Arc::new(PseudoFile::new_urandom(seed)));
     }
     if path == "/dev/misc/rtc" {
@@ -1432,7 +1653,11 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
 
     if let AtPath::PseudoAbs(abs) = &at {
         // Treat known pseudo nodes as always accessible.
-        return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
+        return if open_pseudo(abs).is_some() {
+            0
+        } else {
+            ENOENT
+        };
     }
 
     let (uid, gid) = current_real_uid_gid();
@@ -1492,7 +1717,11 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
         if let Some(name) = shm_object_name(abs) {
             return if shm_get(name).is_some() { 0 } else { ENOENT };
         }
-        return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
+        return if open_pseudo(abs).is_some() {
+            0
+        } else {
+            ENOENT
+        };
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -1544,7 +1773,13 @@ pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
 }
 
 /// Linux `fchownat(2)` (syscall 54 on riscv64).
-pub fn syscall_fchownat(dirfd: isize, pathname: usize, uid: usize, gid: usize, flags: usize) -> isize {
+pub fn syscall_fchownat(
+    dirfd: isize,
+    pathname: usize,
+    uid: usize,
+    gid: usize,
+    flags: usize,
+) -> isize {
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
 
@@ -1564,7 +1799,11 @@ pub fn syscall_fchownat(dirfd: isize, pathname: usize, uid: usize, gid: usize, f
         if let Some(name) = shm_object_name(abs) {
             return if shm_get(name).is_some() { 0 } else { ENOENT };
         }
-        return if open_pseudo(abs).is_some() { 0 } else { ENOENT };
+        return if open_pseudo(abs).is_some() {
+            0
+        } else {
+            ENOENT
+        };
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -1614,7 +1853,11 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
-        return if open_pseudo(abs).is_some() { EINVAL } else { ENOENT };
+        return if open_pseudo(abs).is_some() {
+            EINVAL
+        } else {
+            ENOENT
+        };
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -1744,7 +1987,13 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
 }
 
 /// Linux `renameat2(2)` (syscall 276 on riscv64).
-pub fn syscall_renameat2(olddirfd: isize, oldpath: usize, newdirfd: isize, newpath: usize, flags: usize) -> isize {
+pub fn syscall_renameat2(
+    olddirfd: isize,
+    oldpath: usize,
+    newdirfd: isize,
+    newpath: usize,
+    flags: usize,
+) -> isize {
     if flags != 0 {
         return EINVAL;
     }
@@ -1844,11 +2093,11 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         let mut off = pos as usize;
         let mut user_ptr = buffer;
         const CHUNK_MAX: usize = 16 * 1024;
+        let buf_cap = core::cmp::min(len, CHUNK_MAX);
+        let mut kbuf = vec![0u8; buf_cap];
         while total < len {
-            let want = core::cmp::min(len - total, CHUNK_MAX);
-            let mut kbuf = Vec::new();
-            kbuf.resize(want, 0);
-            let n = os_inode.pread_at(off, &mut kbuf);
+            let want = core::cmp::min(len - total, buf_cap);
+            let n = os_inode.pread_at(off, &mut kbuf[..want]);
             if n == 0 {
                 break;
             }
@@ -1920,12 +2169,12 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         let mut off = pos as usize;
         let mut user_ptr = buffer;
         const CHUNK_MAX: usize = 16 * 1024;
+        let buf_cap = core::cmp::min(len, CHUNK_MAX);
+        let mut kbuf = vec![0u8; buf_cap];
         while total < len {
-            let want = core::cmp::min(len - total, CHUNK_MAX);
-            let mut kbuf = Vec::new();
-            kbuf.resize(want, 0);
-            copy_from_user(token, user_ptr as *const u8, &mut kbuf);
-            match os_inode.pwrite_at(off, &kbuf) {
+            let want = core::cmp::min(len - total, buf_cap);
+            copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]);
+            match os_inode.pwrite_at(off, &kbuf[..want]) {
                 Ok(n) => {
                     total += n;
                     off += n;
@@ -2590,10 +2839,10 @@ const EXT4_ST_DEV: u64 = 1;
 
 fn dt_type_from_ext4(ftype: u8) -> u8 {
     match ftype {
-        2 => 4, // DT_DIR
-        1 => 8, // DT_REG
+        2 => 4,  // DT_DIR
+        1 => 8,  // DT_REG
         7 => 10, // DT_LNK
-        _ => 0, // DT_UNKNOWN
+        _ => 0,  // DT_UNKNOWN
     }
 }
 
@@ -2764,6 +3013,48 @@ pub fn syscall_fsync(fd: usize) -> isize {
         }
         let _ = os_inode.flush();
     }
+    0
+}
+
+/// Linux `sync(2)` (syscall 81 on riscv64).
+///
+/// Flush per-fd write buffers and the ext4 block cache to disk.
+pub fn syscall_sync() -> isize {
+    let current = current_process();
+    let mut files: Vec<alloc::sync::Arc<dyn File + Send + Sync>> = Vec::new();
+    {
+        let inner = current.borrow_mut();
+        for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
+            files.push(file.clone());
+        }
+    }
+
+    let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+    for process in processes {
+        if core::ptr::eq(
+            alloc::sync::Arc::as_ptr(&process),
+            alloc::sync::Arc::as_ptr(&current),
+        ) {
+            continue;
+        }
+        if let Some(inner) = process.try_borrow_mut() {
+            for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
+                files.push(file.clone());
+            }
+        }
+    }
+
+    for file in files {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            if !os_inode.readonly_fs() {
+                let _ = os_inode.flush();
+            }
+        }
+    }
+    sync_all();
     0
 }
 

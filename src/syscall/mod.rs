@@ -60,6 +60,7 @@ const SYSCALL_SIGNALFD4: usize = 74;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
+const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
@@ -248,6 +249,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READLINKAT => filesystem::syscall_readlinkat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_NEWFSTATAT => filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_FSTAT => filesystem::syscall_fstat(args[0], args[1]),
+        SYSCALL_SYNC => filesystem::syscall_sync(),
         SYSCALL_FSYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FDATASYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FSTATFS => filesystem::syscall_fstatfs(args[0], args[1]),

@@ -4,9 +4,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 // Linux userland (busybox/glibc) expects a large initial stack.
 pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
-pub const KERNEL_STACK_SIZE: usize = 4096 * 16;  // Increased from 4 to 16 pages (64KB)
-// Kernel heap must be large enough to buffer big user ELFs (e.g. glibc tests).
-pub const KERNEL_HEAP_SIZE: usize = 0x200_0000; // 32 MiB
+pub const KERNEL_STACK_SIZE: usize = 4096 * 8;  // 32KB
+// Kernel heap must be large enough to buffer big user ELFs and pthread-heavy glibc benches.
+pub const KERNEL_HEAP_SIZE: usize = 0x400_0000; // 64 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 

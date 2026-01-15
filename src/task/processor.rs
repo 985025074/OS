@@ -1,9 +1,10 @@
 use crate::{
     config::MAX_HARTS,
+    mm::try_write_user_value,
     println,
     sbi::shutdown,
+    syscall::futex::futex_wake,
     task::{
-        block_sleep::schedule_tid_clear,
         INITPROC,
         id::TaskUserRes,
         manager::{
@@ -23,6 +24,14 @@ use log;
 use spin::Mutex;
 
 use crate::debug_config::{DEBUG_PTHREAD, DEBUG_SCHED};
+
+fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
+    if ctid == 0 {
+        return;
+    }
+    let _ = try_write_user_value(token, ctid as *mut i32, &0);
+    let _ = futex_wake(pid, ctid, 1);
+}
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
     idle_task_context: TaskContext,
@@ -438,9 +447,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     // Linux pthreads expect CLONE_CHILD_CLEARTID/set_tid_address semantics:
     // clear *ctid to 0 and wake any futex waiters.
-    const CLEAR_CHILD_TID_DELAY_MS: usize = 10;
     if let Some(ctid) = clear_child_tid_addr {
-        schedule_tid_clear(process.getpid(), ctid, CLEAR_CHILD_TID_DELAY_MS);
+        clear_child_tid_now(process.getpid(), token, ctid);
     }
     drop(res_to_drop);
     for waiter in join_waiters {
@@ -646,9 +654,8 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         );
     }
 
-    const CLEAR_CHILD_TID_DELAY_MS: usize = 10;
     if let Some(ctid) = clear_child_tid_addr {
-        schedule_tid_clear(process.getpid(), ctid, CLEAR_CHILD_TID_DELAY_MS);
+        clear_child_tid_now(process.getpid(), token, ctid);
     }
     drop(res_to_drop);
     for waiter in join_waiters {
