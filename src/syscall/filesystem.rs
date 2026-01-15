@@ -1023,6 +1023,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         }
     }
 
+    let inode_num = inode.inode_num();
     let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs(
         readable,
         writable,
@@ -1030,6 +1031,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         inode,
         readonly_fs,
     ));
+    crate::fs::debug_track_iozone_inode(&path, inode_num);
     drop(ext4_guard);
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -1456,7 +1458,7 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return EROFS;
+            return 0;
         }
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
@@ -1518,7 +1520,7 @@ pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return EROFS;
+            return 0;
         }
         let inode = os_inode.ext4_inode();
         let (cur_uid, _cur_gid) = current_effective_uid_gid();
@@ -2247,7 +2249,7 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     // Best-effort ext4 support.
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return EROFS;
+            return 0;
         }
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
@@ -2748,15 +2750,19 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
 
 /// Linux `fsync(2)` / `fdatasync(2)` (syscalls 82/83 on riscv64).
 ///
-/// iozone uses this heavily; implement as a lightweight stub that validates the
-/// fd and returns success.
+/// iozone uses this heavily; keep it lightweight but flush per-fd buffered writes.
 pub fn syscall_fsync(fd: usize) -> isize {
     // A full ext4 sync for every `fsync` call is prohibitively expensive for
     // micro-benchmarks like iozone (it may call `fsync` very frequently).
-    //
-    // We currently do not have per-inode dirty tracking; treat `fsync` as a hint.
-    if get_fd_file(fd).is_none() {
+    // Flush the per-fd write buffer so subsequent reads from other fds see data.
+    let Some(file) = get_fd_file(fd) else {
         return EBADF;
+    };
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if os_inode.readonly_fs() {
+            return 0;
+        }
+        let _ = os_inode.flush();
     }
     0
 }

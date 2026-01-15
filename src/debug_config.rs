@@ -33,6 +33,9 @@ pub const DEBUG_FUTEX: bool = false;
 /// Verbose filesystem debug logs (open/getdents/lseek).
 pub const DEBUG_FS: bool = false;
 
+/// Track iozone file I/O (inode, offsets, flushes).
+pub const DEBUG_IOZONE_FS: bool = false;
+
 /// Verbose network debug logs (socket send/recv).
 pub const DEBUG_NET: bool = false;
 

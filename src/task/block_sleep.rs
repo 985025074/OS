@@ -115,7 +115,7 @@ fn process_delayed_tid_clears(current_ms: usize) {
             continue;
         };
         let token = proc.borrow_mut().get_user_token();
-        write_user_value(token, entry.ctid as *mut i32, &0);
+        let _ = crate::mm::try_write_user_value(token, entry.ctid as *mut i32, &0);
         let _ = futex_wake(entry.pid, entry.ctid, 1);
     }
 }

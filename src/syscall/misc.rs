@@ -47,6 +47,8 @@ pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
 }
 
 pub(crate) fn decode_linux_tid(tgid: usize, tid: usize) -> Option<usize> {
+    // Strip futex owner/waiter bits that user space may OR into the TID word.
+    let tid = tid & 0x3fff_ffff;
     if tid == tgid {
         return Some(0);
     }

@@ -48,10 +48,11 @@ KERNEL:USER_APPS
 # find all excutable in the user's target dir strip it and copy to the os_str
 USER_APPS:
 	@cd ../user  && cargo build --$(MODE) $(USER_FEATURES)
+	@mkdir -p $(APP_DIR)
 	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
 			base=$$(basename $$f); \
-			dst=../os/$(APP_DIR)/$$base.bin; \
+			dst=$(APP_DIR)/$$base.bin; \
 			if [ ! -f "$$dst" ] || ! cmp -s "$$f" "$$dst"; then \
 				cp "$$f" "$$dst"; \
 				echo "find user app (updated): $$base"; \
@@ -109,7 +110,7 @@ debug:KERNEL
 # Ext4 Support
 # ===========================
 EXT4_IMG := ../ext4-fs-packer/target/fs.ext4
-EXT4_SIZE?= 4G 
+EXT4_SIZE?= 1G 
 EXT4_BASE_IMG ?= ../img/disk.img
 EXT4_BASE_TAR ?= ../img/disk.tar
 EXT4_BASE_TAR_XZ ?= ../img/disk.tar.xz

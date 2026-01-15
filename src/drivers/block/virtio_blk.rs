@@ -77,8 +77,17 @@ impl BlockDevice for VirtIOBlock {
             let chunk_bytes = chunk * SECTOR_BYTES;
             let src_off = done * SECTOR_BYTES;
             bounce_bytes[..chunk_bytes].copy_from_slice(&buf[src_off..src_off + chunk_bytes]);
-            blk.write_block(base_sector + done, &bounce_bytes[..chunk_bytes])
-                .expect("Error when writing VirtIOBlk");
+            if let Err(err) = blk.write_block(base_sector + done, &bounce_bytes[..chunk_bytes]) {
+                println!(
+                    "[VirtIO ERROR] write_block failed: block_id={} sector={} sectors={} bytes={} err={:?}",
+                    block_id,
+                    base_sector + done,
+                    chunk,
+                    chunk_bytes,
+                    err
+                );
+                panic!("Error when writing VirtIOBlk");
+            }
             done += chunk;
         }
     }
