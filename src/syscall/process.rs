@@ -474,56 +474,68 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     // Script with shebang: emulate Linux `#!` handling in-kernel so that
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(&file_data) {
-        let wants_shell = interp.ends_with("/sh") || interp.ends_with("/busybox");
+        let interp_name = interp.rsplit('/').next().unwrap_or(interp.as_str());
+        let env_shell = interp_name == "env"
+            && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
+        let wants_shell =
+            matches!(interp_name, "sh" | "bash" | "busybox") || env_shell;
+        let opt_arg_ref = opt_arg.as_deref();
         match load_file_from_path(&interp) {
             Ok(interp_data) => {
-                if !is_elf(&interp_data) {
+                if is_elf(&interp_data) {
+                    let mut new_args: Vec<String> = Vec::new();
+                    new_args.push(interp.clone());
+                    if let Some(a) = opt_arg_ref {
+                        new_args.push(String::from(a));
+                    }
+                    // Pass script path as argv[1] (or argv[2] with opt arg), like Linux.
+                    new_args.push(path.clone());
+                    // Append original args after argv[0].
+                    for a in args_vec.iter().skip(1) {
+                        new_args.push(a.clone());
+                    }
+                    let process = current_process();
+                    process.exec(&interp_data, new_args, envs_vec);
+                    return 0;
+                }
+                if !wants_shell {
                     return ENOEXEC;
                 }
-                let mut new_args: Vec<String> = Vec::new();
-                new_args.push(interp.clone());
-                if let Some(a) = opt_arg {
-                    new_args.push(a);
-                }
-                // Pass script path as argv[1] (or argv[2] with opt arg), like Linux.
-                new_args.push(path.clone());
-                // Append original args after argv[0].
-                for a in args_vec.iter().skip(1) {
-                    new_args.push(a.clone());
-                }
-                let process = current_process();
-                process.exec(&interp_data, new_args, envs_vec);
-                return 0;
             }
             Err(ENOENT) if wants_shell => {
-                let interp = match find_shell_interpreter() {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
-                let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
-                    return ENOENT;
-                };
-                if !is_elf(&interp_data) {
-                    return ENOEXEC;
-                }
-                let mut new_args: Vec<String> = Vec::new();
-                new_args.push(interp_path.clone());
-                if needs_sh_arg && opt_arg.as_deref() != Some("sh") {
-                    new_args.push(String::from("sh"));
-                }
-                if let Some(a) = opt_arg {
-                    new_args.push(a);
-                }
-                new_args.push(path.clone());
-                for a in args_vec.iter().skip(1) {
-                    new_args.push(a.clone());
-                }
-                let process = current_process();
-                process.exec(&interp_data, new_args, envs_vec);
-                return 0;
+                // handled below
             }
             Err(e) => return e,
         }
+        if wants_shell {
+            let fallback_opt_arg = if env_shell { None } else { opt_arg_ref };
+            let interp = match find_shell_interpreter() {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
+                return ENOENT;
+            };
+            if !is_elf(&interp_data) {
+                return ENOEXEC;
+            }
+            let mut new_args: Vec<String> = Vec::new();
+            new_args.push(interp_path.clone());
+            if needs_sh_arg && fallback_opt_arg != Some("sh") {
+                new_args.push(String::from("sh"));
+            }
+            if let Some(a) = fallback_opt_arg {
+                new_args.push(String::from(a));
+            }
+            new_args.push(path.clone());
+            for a in args_vec.iter().skip(1) {
+                new_args.push(a.clone());
+            }
+            let process = current_process();
+            process.exec(&interp_data, new_args, envs_vec);
+            return 0;
+        }
+        return ENOEXEC;
     }
 
     // ExampleOs-style fallback for .sh files without shebangs.

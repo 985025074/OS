@@ -229,12 +229,21 @@ fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
 fn is_pseudo_path(abs: &str) -> bool {
     abs == "/sys"
         || abs.starts_with("/sys/")
-        || abs == "/proc"
-        || abs.starts_with("/proc/")
         || abs == "/dev"
         || abs.starts_with("/dev/")
         || abs == "/etc"
         || abs.starts_with("/etc/")
+}
+
+fn rewrite_proc_self(abs: &str) -> String {
+    if abs == "/proc/self" || abs.starts_with("/proc/self/") {
+        let pid = current_process().getpid();
+        let suffix = &abs["/proc/self".len()..];
+        let mut out = alloc::format!("/proc/{pid}");
+        out.push_str(suffix);
+        return out;
+    }
+    String::from(abs)
 }
 
 enum AtPath {
@@ -259,7 +268,8 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
 
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
-        let abs = normalize_path("/", path);
+        let abs = rewrite_proc_self(&normalize_path("/", path));
+        crate::fs::sync_proc_path(&abs);
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -271,7 +281,8 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     if dirfd == AT_FDCWD {
         let process = current_process();
         let cwd = { process.borrow_mut().cwd.clone() };
-        let abs = normalize_path(&cwd, path);
+        let abs = rewrite_proc_self(&normalize_path(&cwd, path));
+        crate::fs::sync_proc_path(&abs);
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -288,7 +299,8 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     };
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        let abs = normalize_path(pdir.path(), path);
+        let abs = rewrite_proc_self(&normalize_path(pdir.path(), path));
+        crate::fs::sync_proc_path(&abs);
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -302,6 +314,10 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
             return Err(ENOTDIR);
         }
         let rel = normalize_relative_path(path);
+        if !rel.is_empty() && crate::fs::is_proc_root(base.inode_num()) {
+            let abs = alloc::format!("/proc/{}", rel);
+            crate::fs::sync_proc_path(&abs);
+        }
         return Ok(AtPath::Ext4Rel { base, rel });
     }
 
@@ -314,15 +330,16 @@ fn resolve_ext4_abs_path(
     gid: u32,
     follow_final: bool,
     depth: &mut usize,
+    seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let primary = crate::fs::root_inode_for_path(path);
-    match resolve_ext4_path(primary, path, uid, gid, follow_final, depth) {
+    match resolve_ext4_path(primary, path, uid, gid, follow_final, depth, seen_symlinks) {
         Ok(v) => Ok(v),
         Err(ENOENT) => {
             let Some(secondary) = secondary_root_inode() else {
                 return Err(ENOENT);
             };
-            resolve_ext4_path(secondary, path, uid, gid, follow_final, depth)
+            resolve_ext4_path(secondary, path, uid, gid, follow_final, depth, seen_symlinks)
         }
         Err(e) => Err(e),
     }
@@ -398,6 +415,7 @@ fn resolve_ext4_path(
     gid: u32,
     follow_final: bool,
     depth: &mut usize,
+    seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let mut stack: Vec<alloc::sync::Arc<ext4_fs::Inode>> = alloc::vec![start];
     let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -430,6 +448,11 @@ fn resolve_ext4_path(
             if *depth >= MAX_SYMLINKS {
                 return Err(ELOOP);
             }
+            let inode_num = next.inode_num();
+            if seen_symlinks.iter().any(|&n| n == inode_num) {
+                return Err(ELOOP);
+            }
+            seen_symlinks.push(inode_num);
             *depth += 1;
             let target_bytes = next.read_all();
             let target = String::from_utf8_lossy(&target_bytes).into_owned();
@@ -449,9 +472,24 @@ fn resolve_ext4_path(
                 new_path.push_str(&remaining);
             }
             if new_path.starts_with('/') {
-                return resolve_ext4_abs_path(&new_path, uid, gid, follow_final, depth);
+                return resolve_ext4_abs_path(
+                    &new_path,
+                    uid,
+                    gid,
+                    follow_final,
+                    depth,
+                    seen_symlinks,
+                );
             }
-            return resolve_ext4_path(cur, &new_path, uid, gid, follow_final, depth);
+            return resolve_ext4_path(
+                cur,
+                &new_path,
+                uid,
+                gid,
+                follow_final,
+                depth,
+                seen_symlinks,
+            );
         }
         stack.push(next);
         idx += 1;
@@ -466,8 +504,16 @@ fn resolve_at_inode(
     follow_final: bool,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let mut depth = 0usize;
+    let mut seen_symlinks = Vec::new();
     match at {
-        AtPath::Ext4Abs(abs) => resolve_ext4_abs_path(abs, uid, gid, follow_final, &mut depth),
+        AtPath::Ext4Abs(abs) => resolve_ext4_abs_path(
+            abs,
+            uid,
+            gid,
+            follow_final,
+            &mut depth,
+            &mut seen_symlinks,
+        ),
         AtPath::Ext4Rel { base, rel } => {
             if rel.is_empty() {
                 Ok(alloc::sync::Arc::clone(base))
@@ -479,6 +525,7 @@ fn resolve_at_inode(
                     gid,
                     follow_final,
                     &mut depth,
+                    &mut seen_symlinks,
                 )
             }
         }
@@ -510,6 +557,7 @@ fn resolve_parent_and_name(
     gid: u32,
 ) -> Result<(alloc::sync::Arc<ext4_fs::Inode>, alloc::string::String), isize> {
     let mut depth = 0usize;
+    let mut seen_symlinks = Vec::new();
     match at {
         AtPath::Ext4Abs(abs) => {
             if abs == "/" {
@@ -528,7 +576,14 @@ fn resolve_parent_and_name(
                 p.push_str(parent_path);
                 p
             };
-            let parent = resolve_ext4_abs_path(&parent_abs, uid, gid, true, &mut depth)?;
+            let parent = resolve_ext4_abs_path(
+                &parent_abs,
+                uid,
+                gid,
+                true,
+                &mut depth,
+                &mut seen_symlinks,
+            )?;
             Ok((parent, alloc::string::String::from(name)))
         }
         AtPath::Ext4Rel { base, rel } => {
@@ -551,6 +606,7 @@ fn resolve_parent_and_name(
                     gid,
                     true,
                     &mut depth,
+                    &mut seen_symlinks,
                 )?
             };
             Ok((parent, alloc::string::String::from(name)))
@@ -859,7 +915,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     let mut created = false;
     let (fsuid, fsgid) = current_fsuid_gid();
 
-    // Pseudo fs: `/proc`, `/sys`, `/dev`.
+    // Pseudo fs: `/sys`, `/dev`.
     if let AtPath::PseudoAbs(abs) = &at {
         if tmpfile_requested {
             return EOPNOTSUPP;
@@ -1086,311 +1142,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 }
 
 fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
-    // Provide minimal pseudo directories for tools that expect them to exist.
-    // /proc with just enough content for busybox `ps`, `df`, `free`, etc.
-    if path == "/proc" || path == "/proc/" {
-        let mut entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("mounts"),
-                ino: 2,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("meminfo"),
-                ino: 3,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("loadavg"),
-                ino: 4,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("uptime"),
-                ino: 5,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("stat"),
-                ino: 6,
-                dtype: 8
-            },
-            // Linux has /proc/self as a symlink; we expose it as a directory.
-            PseudoDirent {
-                name: alloc::string::String::from("self"),
-                ino: 7,
-                dtype: 4
-            },
-        ];
-        let mut pids: alloc::vec::Vec<usize> = {
-            let map = crate::task::manager::PID2PCB.lock();
-            map.keys().copied().collect()
-        };
-        pids.sort_unstable();
-        for pid in pids {
-            entries.push(PseudoDirent {
-                name: alloc::format!("{}", pid),
-                ino: pid as u64,
-                dtype: 4,
-            });
-        }
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc", entries)));
-    }
-
-    // /proc/self -> current process directory (best-effort; no symlink support).
-    if path == "/proc/self" || path == "/proc/self/" {
-        let pid = current_process().getpid();
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: pid as u64,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("stat"),
-                ino: (pid as u64) << 32 | 1,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("cmdline"),
-                ino: (pid as u64) << 32 | 2,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("status"),
-                ino: (pid as u64) << 32 | 3,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("mounts"),
-                ino: (pid as u64) << 32 | 4,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("maps"),
-                ino: (pid as u64) << 32 | 5,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/self", entries)));
-    }
-
-    // /proc/<pid> and /proc/<pid>/...
-    if let Some(rest) = path.strip_prefix("/proc/") {
-        let rest = rest.trim_end_matches('/');
-        let mut it = rest.split('/');
-        let first = it.next().unwrap_or("");
-        if first == "self" {
-            let pid = current_process().getpid();
-            if let Some(after) = rest.strip_prefix("self/") {
-                let p = alloc::format!("/proc/{}/{}", pid, after);
-                return open_pseudo(&p);
-            }
-            return open_pseudo("/proc/self");
-        }
-        if let Ok(pid) = first.parse::<usize>() {
-            // Validate pid exists.
-            let proc = crate::task::manager::pid2process(pid)?;
-            let (ppid, argv, start_time_ms, num_threads, main_state, vsize, vsize_kb) = {
-                let inner = proc.borrow_mut();
-                let ppid = inner
-                    .parent
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                    .map(|p| p.getpid())
-                    .unwrap_or(0);
-                let argv = inner.argv.clone();
-                let start_time_ms = inner.start_time_ms;
-                let num_threads = inner.thread_count();
-                let main_state = inner
-                    .tasks
-                    .iter()
-                    .flatten()
-                    .next()
-                    .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
-                    .unwrap_or(crate::task::task_block::TaskStatus::Ready);
-                let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-                let mmap_bytes: usize = inner
-                    .mmap_areas
-                    .iter()
-                    .map(|(s, e)| e.saturating_sub(*s))
-                    .sum();
-                let vsize: u64 = (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
-                let vsize_kb: usize =
-                    (crate::config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
-                (
-                    ppid,
-                    argv,
-                    start_time_ms,
-                    num_threads,
-                    main_state,
-                    vsize,
-                    vsize_kb,
-                )
-            };
-
-            let comm = argv
-                .first()
-                .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-                .unwrap_or("CongCore")
-                .replace(')', "_");
-
-            let state_char = match main_state {
-                crate::task::task_block::TaskStatus::Running => 'R',
-                crate::task::task_block::TaskStatus::Ready => 'R',
-                crate::task::task_block::TaskStatus::Blocked => 'S',
-            };
-
-            match it.next() {
-                None => {
-                    let entries = alloc::vec![
-                        PseudoDirent {
-                            name: alloc::string::String::from("."),
-                            ino: pid as u64,
-                            dtype: 4
-                        },
-                        PseudoDirent {
-                            name: alloc::string::String::from(".."),
-                            ino: 1,
-                            dtype: 4
-                        },
-                        PseudoDirent {
-                            name: alloc::string::String::from("stat"),
-                            ino: (pid as u64) << 32 | 1,
-                            dtype: 8
-                        },
-                        PseudoDirent {
-                            name: alloc::string::String::from("cmdline"),
-                            ino: (pid as u64) << 32 | 2,
-                            dtype: 8
-                        },
-                        PseudoDirent {
-                            name: alloc::string::String::from("status"),
-                            ino: (pid as u64) << 32 | 3,
-                            dtype: 8
-                        },
-                        PseudoDirent {
-                            name: alloc::string::String::from("mounts"),
-                            ino: (pid as u64) << 32 | 4,
-                            dtype: 8
-                        },
-                        PseudoDirent {
-                            name: alloc::string::String::from("maps"),
-                            ino: (pid as u64) << 32 | 5,
-                            dtype: 8
-                        },
-                    ];
-                    let p = alloc::format!("/proc/{}", pid);
-                    return Some(alloc::sync::Arc::new(PseudoDir::new(&p, entries)));
-                }
-                Some("mounts") if it.next().is_none() => {
-                    return open_pseudo("/proc/mounts");
-                }
-                Some("stat") if it.next().is_none() => {
-                    // Linux-like `/proc/<pid>/stat` (man proc). Keep it well-formed so
-                    // proc parsers (busybox ps) can read it.
-                    const HZ: u64 = 100;
-                    let starttime = (start_time_ms as u64).saturating_mul(HZ) / 1000;
-                    let rss_pages: u64 = if vsize == 0 {
-                        0
-                    } else {
-                        (vsize + crate::config::PAGE_SIZE as u64 - 1)
-                            / crate::config::PAGE_SIZE as u64
-                    };
-                    // Field order follows Linux `/proc/<pid>/stat` (man proc).
-                    let pgrp = pid;
-                    let session = pid;
-                    let tty_nr = 0;
-                    let tpgid = 0;
-                    let flags = 0;
-                    let minflt = 0;
-                    let cminflt = 0;
-                    let majflt = 0;
-                    let cmajflt = 0;
-                    let utime = 0;
-                    let stime = 0;
-                    let cutime = 0;
-                    let cstime = 0;
-                    let priority = 0;
-                    let nice = 0;
-                    let itrealvalue = 0;
-                    let rsslim = 0;
-                    let startcode = 0;
-                    let endcode = 0;
-                    let startstack = 0;
-                    let kstkesp = 0;
-                    let kstkeip = 0;
-                    let signal = 0;
-                    let blocked = 0;
-                    let sigignore = 0;
-                    let sigcatch = 0;
-                    let wchan = 0;
-                    let nswap = 0;
-                    let cnswap = 0;
-                    let exit_signal = 0;
-                    let processor = 0;
-                    let rt_priority = 0;
-                    let policy = 0;
-                    let delayacct_blkio_ticks = 0;
-                    let guest_time = 0;
-                    let cguest_time = 0;
-                    let start_data = 0;
-                    let end_data = 0;
-                    let start_brk = 0;
-                    let arg_start = 0;
-                    let arg_end = 0;
-                    let env_start = 0;
-                    let env_end = 0;
-                    let exit_code = 0;
-
-                    let s = alloc::format!(
-                        "{pid} ({comm}) {state_char} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} {num_threads} {itrealvalue} {starttime} {vsize} {rss_pages} {rsslim} {startcode} {endcode} {startstack} {kstkesp} {kstkeip} {signal} {blocked} {sigignore} {sigcatch} {wchan} {nswap} {cnswap} {exit_signal} {processor} {rt_priority} {policy} {delayacct_blkio_ticks} {guest_time} {cguest_time} {start_data} {end_data} {start_brk} {arg_start} {arg_end} {env_start} {env_end} {exit_code}\n"
-                    );
-                    return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
-                }
-                Some("cmdline") if it.next().is_none() => {
-                    let mut s = String::new();
-                    for arg in argv.iter() {
-                        s.push_str(arg);
-                        s.push('\0');
-                    }
-                    return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
-                }
-                Some("status") if it.next().is_none() => {
-                    let state_desc = match state_char {
-                        'R' => "R (running)",
-                        'S' => "S (sleeping)",
-                        _ => "R (running)",
-                    };
-                    let s = alloc::format!(
-                        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{num_threads}\nVmSize:\t{vsize_kb} kB\n"
-                    );
-                    return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
-                }
-                Some("maps") if it.next().is_none() => {
-                    return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-                        "00000000-00000000 r--p 00000000 00:00 0 \n",
-                    )));
-                }
-                _ => {}
-            }
-        }
-    }
     if path == "/sys" || path == "/sys/" {
         let entries = alloc::vec![
             PseudoDirent {
@@ -1566,44 +1317,6 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     // /sys/devices/system/node/*
     if path == "/sys/devices/system/node/online" || path == "/sys/devices/system/node/possible" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
-    }
-    // /proc/loadavg
-    if path == "/proc/loadavg" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "0.00 0.00 0.00 1/1 1\n",
-        )));
-    }
-    if path == "/proc/uptime" {
-        let ms = crate::time::get_time_ms();
-        let secs = ms / 1000;
-        let frac = (ms % 1000) / 10;
-        let s = alloc::format!("{secs}.{frac:02} 0.00\n");
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
-    }
-    if path == "/proc/stat" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "cpu  0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n",
-        )));
-    }
-    if path == "/proc/mounts" {
-        // Minimal mount table so `df` works.
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "/dev/root / ext4 rw 0 0\n",
-        )));
-    }
-    if path == "/proc/self/mounts" {
-        return open_pseudo("/proc/mounts");
-    }
-    if path == "/proc/meminfo" {
-        // Minimal meminfo so busybox `free` works.
-        let mem_total_kb =
-            ((crate::config::phys_mem_end() - crate::config::phys_mem_start()) / 1024) as u64;
-        let s = alloc::format!(
-            "MemTotal:       {} kB\nMemFree:        {} kB\nBuffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n",
-            mem_total_kb,
-            mem_total_kb / 2
-        );
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
     }
     // /dev/*
     if path == "/dev/root" {
@@ -2960,7 +2673,10 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     let uid = inode.uid();
     let gid = inode.gid();
     let disk_size = inode.size() as usize;
-    let size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
+    let mut size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
+    if let Some(kind) = crate::fs::proc_file_kind(inode.inode_num()) {
+        size = crate::fs::proc_file_len(&kind) as i64;
+    }
     let blocks = (((size as u64) + 511) / 512) as u64;
     let times = get_inode_times(inode.inode_num() as u64);
 
@@ -3161,8 +2877,11 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     let mode = inode.mode() as u32;
     let uid = inode.uid();
     let gid = inode.gid();
-    let size = inode.size() as i64;
-    let blocks = ((inode.size() + 511) / 512) as u64;
+    let mut size = inode.size() as i64;
+    if let Some(kind) = crate::fs::proc_file_kind(inode.inode_num()) {
+        size = crate::fs::proc_file_len(&kind) as i64;
+    }
+    let blocks = (((size as u64) + 511) / 512) as u64;
     let times = get_inode_times(inode.inode_num() as u64);
 
     let st = KStat {
@@ -3197,7 +2916,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     };
     let token = get_current_token();
 
-    // Pseudo directories (e.g. /proc, /sys, /dev).
+    // Pseudo directories (e.g. /sys, /dev).
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
@@ -3248,6 +2967,53 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return ENOTDIR;
     };
     let inode = os_inode.ext4_inode();
+    if crate::fs::is_proc_root(inode.inode_num()) {
+        let pids = crate::fs::collect_pids();
+        let ext4_guard = ext4_lock();
+        let static_entries = inode.dir_entries();
+        drop(ext4_guard);
+
+        let entries = crate::fs::build_proc_root_entries(static_entries, pids);
+        let mut index = os_inode.dir_offset();
+        if index >= entries.len() || len == 0 {
+            return 0;
+        }
+
+        let mut kbuf = alloc::vec![0u8; len];
+        let mut written = 0usize;
+        while index < entries.len() {
+            let ent = &entries[index];
+            let name_bytes = ent.name.as_bytes();
+            let reclen = align_up(19 + name_bytes.len() + 1, 8);
+            if written + reclen > len {
+                break;
+            }
+            let base = written;
+            kbuf[base..base + 8].copy_from_slice(&ent.ino.to_le_bytes());
+            kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
+            kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            kbuf[base + 18] = ent.dtype;
+            kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+            kbuf[base + 19 + name_bytes.len()] = 0;
+            for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
+                *b = 0;
+            }
+
+            written += reclen;
+            index += 1;
+        }
+
+        let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
+        let mut src_off = 0usize;
+        for ub in user_bufs {
+            let end = src_off + ub.len();
+            ub.copy_from_slice(&kbuf[src_off..end]);
+            src_off = end;
+        }
+        os_inode.set_dir_offset(index);
+        return written as isize;
+    }
+
     let ext4_guard = ext4_lock();
     if !inode.is_dir() {
         return ENOTDIR;
@@ -3396,12 +3162,18 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        let (is_dir, end) = {
+        let inode_num = inode.inode_num();
+        let (is_dir, mut end) = {
             let _ext4_guard = ext4_lock();
             let disk = inode.size() as usize;
             let end = core::cmp::max(disk, os_inode.pending_write_end()) as isize;
             (inode.is_dir(), end)
         };
+        if !is_dir {
+            if let Some(kind) = crate::fs::proc_file_kind(inode_num) {
+                end = crate::fs::proc_file_len(&kind) as isize;
+            }
+        }
 
         if is_dir {
             let cur = os_inode.dir_offset() as isize;
@@ -3433,7 +3205,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         return new;
     }
 
-    // Pseudo regular files: allow seeking for static content (e.g., `/proc/mounts`),
+    // Pseudo regular files: allow seeking for static content (e.g., `/dev` nodes),
     // which libc helpers (busybox `df`) may `rewind()` via lseek.
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         let Some(end) = pf.len().map(|n| n as isize) else {

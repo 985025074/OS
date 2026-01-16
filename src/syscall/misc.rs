@@ -36,6 +36,7 @@ static UMASK: AtomicUsize = AtomicUsize::new(0);
 const EPERM: isize = -1;
 const EFAULT: isize = -14;
 const ENOENT: isize = -2;
+const ENODEV: isize = -19;
 const ENOTDIR: isize = -20;
 
 pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
@@ -131,6 +132,14 @@ pub fn syscall_mount(
         return EPERM;
     }
     let token = get_current_token();
+    let fstype = if _fstype == 0 {
+        alloc::string::String::new()
+    } else {
+        translated_str(token, _fstype as *const u8)
+    };
+    if fstype == "cgroup" || fstype == "cgroup2" {
+        return ENODEV;
+    }
     let dir = translated_str(token, _dir as *const u8);
     if dir.is_empty() {
         return ENOENT;

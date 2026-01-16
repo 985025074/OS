@@ -13,7 +13,7 @@ pub const DEFAULT_LOG_LEVEL: log::LevelFilter = if DEBUG_UNIXBENCH {
 };
 
 /// Verbose timer debug logs (sleep timers, expiration, wakeups).
-pub const DEBUG_TIMER: bool = true;
+pub const DEBUG_TIMER: bool = false;
 
 /// Verbose scheduler debug logs (ready queue push/pop, idle switches).
 pub const DEBUG_SCHED: bool = false;
@@ -43,7 +43,7 @@ pub const DEBUG_NET: bool = false;
 pub const DEBUG_UNIXBENCH: bool = false;
 
 /// Targeted logs for cyclictest hangs (clock_nanosleep/affinity/sleep).
-pub const DEBUG_CYCLICTEST: bool = true;
+pub const DEBUG_CYCLICTEST: bool = false;
 
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
 pub const DEBUG_WATCHDOG: bool = false;

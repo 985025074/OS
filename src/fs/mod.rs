@@ -6,6 +6,7 @@ mod net_socket;
 mod stdio;
 mod pseudo;
 mod dummy;
+mod procfs;
 use crate::mm::UserBuffer;
 use core::any::Any;
 
@@ -34,4 +35,8 @@ pub use stdio::{Stdin, Stdout};
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub use pseudo::PseudoBlock;
 pub use dummy::DummyFile;
+pub use procfs::{
+    build_proc_root_entries, collect_pids, init_procfs, is_proc_root, proc_file_kind,
+    proc_file_len, proc_file_content, sync_proc_path,
+};
 pub(crate) use pseudo::{shm_create, shm_get, shm_list, shm_remove};
