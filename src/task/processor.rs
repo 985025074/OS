@@ -260,6 +260,12 @@ pub fn idle_task() {
                     crate::task::manager::dump_system_state();
                 }
             }
+            if crate::task::block_sleep::has_pending_timers() {
+                // Poll timers while idle to avoid missing wakeups if interrupts are masked.
+                crate::task::block_sleep::check_timer();
+                core::hint::spin_loop();
+                continue;
+            }
             // crate::println!("[idle] No tasks, entering wfi...");
             // No ready tasks - enable interrupts and wait
             // Use wfi to save power while waiting for timer interrupt

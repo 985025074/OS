@@ -14,7 +14,7 @@ use crate::{
     },
     trap::{context::TrapContext, trap_handler},
 };
-use crate::debug_config::DEBUG_TIMER;
+use crate::debug_config::{DEBUG_CYCLICTEST, DEBUG_TIMER};
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     const ENOMEM: isize = -12;
@@ -138,19 +138,25 @@ pub fn sys_sleep(time_ms: usize) -> isize {
         return 0;
     }
     let task = current_task().unwrap();
-    if DEBUG_TIMER {
-        let tid = task
-            .borrow_mut()
+    let tid = if DEBUG_TIMER || DEBUG_CYCLICTEST {
+        task.borrow_mut()
             .res
             .as_ref()
             .map(|r| r.tid)
-            .unwrap_or(usize::MAX);
+            .unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
+    };
+    if DEBUG_TIMER {
         crate::println!(
             "[sleep] tid={} request_ms={} now_ms={}",
             tid,
             time_ms,
             get_time_ms()
         );
+    }
+    if DEBUG_CYCLICTEST && time_ms > 2_000 {
+        log::warn!("[sleep] tid={} long sleep request_ms={}", tid, time_ms);
     }
     // Prevent "lost wakeup": make the enqueue+block sequence atomic w.r.t. timer interrupts.
     // Keep interrupts disabled in kernel code paths; restore the previous SIE state after we

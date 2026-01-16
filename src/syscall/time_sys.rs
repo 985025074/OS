@@ -1,12 +1,52 @@
 use crate::{
     config::CLOCK_FREQ,
-    debug_config::DEBUG_UNIXBENCH,
+    debug_config::{DEBUG_CYCLICTEST, DEBUG_UNIXBENCH},
     mm::{read_user_value, write_user_value},
-    task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
     syscall::thread,
+    task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
+    task::processor::current_task,
     time::get_time,
     trap::get_current_token,
 };
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const CYCLICTEST_LOG_LIMIT: usize = 32;
+static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
+
+const EINVAL: isize = -22;
+const EFAULT: isize = -14;
+const EOPNOTSUPP: isize = -95;
+const EINTR: isize = -4;
+
+fn ticks_to_ns(ticks: u64) -> u64 {
+    ((ticks as u128).saturating_mul(NSEC_PER_SEC as u128) / CLOCK_FREQ as u128) as u64
+}
+
+fn now_ns() -> u64 {
+    ticks_to_ns(get_time() as u64)
+}
+
+fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
+    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= NSEC_PER_SEC as i64 {
+        return None;
+    }
+    Some(
+        (ts.sec as u64)
+            .saturating_mul(NSEC_PER_SEC)
+            .saturating_add(ts.nsec as u64),
+    )
+}
+
+fn ns_to_timespec(ns: u64) -> TimeSpec {
+    TimeSpec {
+        sec: (ns / NSEC_PER_SEC) as i64,
+        nsec: (ns % NSEC_PER_SEC) as i64,
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,28 +102,40 @@ pub fn syscall_gettimeofday(tv_ptr: usize, _tz: usize) -> isize {
 
 pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     if req_ptr == 0 {
-        return -1;
+        return EFAULT;
     }
     let token = get_current_token();
     let ts = read_user_value(token, req_ptr as *const TimeSpec);
-    if ts.sec < 0 || ts.nsec < 0 {
-        return -1;
+    let Some(req_ns) = timespec_to_ns(ts) else {
+        return EINVAL;
+    };
+    if req_ns == 0 {
+        return 0;
     }
-    let ms = (ts.sec as usize)
-        .saturating_mul(1000)
-        .saturating_add((ts.nsec as usize) / 1_000_000);
-    thread::sys_sleep(ms)
+    let start_ns = now_ns();
+    let ms = ((req_ns + 999_999) / 1_000_000) as usize;
+    let ret = thread::sys_sleep(ms);
+    if ret == EINTR {
+        if _rem_ptr != 0 {
+            let elapsed = now_ns().saturating_sub(start_ns);
+            let remaining = req_ns.saturating_sub(elapsed);
+            let rem = ns_to_timespec(remaining);
+            let token = get_current_token();
+            write_user_value(token, _rem_ptr as *mut TimeSpec, &rem);
+        }
+        return EINTR;
+    }
+    0
 }
 
 pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
     if tp_ptr == 0 {
-        return -1;
+        return EFAULT;
     }
-    let ticks = get_time() as u64;
-    let ns = ticks.saturating_mul(1_000_000_000) / CLOCK_FREQ as u64;
+    let ns = now_ns();
     let ts = TimeSpec {
-        sec: (ns / 1_000_000_000) as i64,
-        nsec: (ns % 1_000_000_000) as i64,
+        sec: (ns / NSEC_PER_SEC) as i64,
+        nsec: (ns % NSEC_PER_SEC) as i64,
     };
     let token = get_current_token();
     write_user_value(token, tp_ptr as *mut TimeSpec, &ts);
@@ -93,31 +145,65 @@ pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
 /// Linux `clock_nanosleep` (syscall 115 on riscv64).
 ///
 /// rt-tests (cyclictest) uses this for periodic sleeps (often with TIMER_ABSTIME).
-pub fn syscall_clock_nanosleep(_clk_id: usize, flags: usize, req_ptr: usize, rem_ptr: usize) -> isize {
+pub fn syscall_clock_nanosleep(clk_id: usize, flags: usize, req_ptr: usize, rem_ptr: usize) -> isize {
     const TIMER_ABSTIME: usize = 1;
     if req_ptr == 0 {
-        return -1;
+        return EFAULT;
     }
-    // We only provide coarse sleeping based on the existing `sys_sleep(ms)` path.
-    if (flags & TIMER_ABSTIME) == 0 {
-        return syscall_nanosleep(req_ptr, rem_ptr);
+    if clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC {
+        return EOPNOTSUPP;
     }
     let token = get_current_token();
     let ts = read_user_value(token, req_ptr as *const TimeSpec);
-    if ts.sec < 0 || ts.nsec < 0 {
-        return -1;
+    let Some(req_ns) = timespec_to_ns(ts) else {
+        return EINVAL;
+    };
+    let start_ns = now_ns();
+    let target_ns = if (flags & TIMER_ABSTIME) != 0 {
+        req_ns
+    } else {
+        start_ns.saturating_add(req_ns)
+    };
+    loop {
+        let current_ns = now_ns();
+        if target_ns <= current_ns {
+            return 0;
+        }
+        let delta_ns = target_ns - current_ns;
+        // Our sleep granularity is milliseconds; don't block on sub-ms targets.
+        let ms = ((delta_ns + 999_999) / 1_000_000) as usize;
+        if DEBUG_CYCLICTEST {
+            let idx = CLOCK_NS_LOGS.fetch_add(1, Ordering::Relaxed);
+            if idx < CYCLICTEST_LOG_LIMIT || ms > 2_000 {
+                let tid = current_task()
+                    .and_then(|task| task.borrow_mut().res.as_ref().map(|r| r.tid))
+                    .unwrap_or(usize::MAX);
+                log::warn!(
+                    "[clock_nanosleep] tid={} clk_id={} flags={:#x} target_ns={} now_ns={} delta_ns={} sleep_ms={}",
+                    tid,
+                    clk_id,
+                    flags,
+                    target_ns,
+                    current_ns,
+                    delta_ns,
+                    ms
+                );
+            }
+        }
+        if ms == 0 {
+            return 0;
+        }
+        let ret = thread::sys_sleep(ms);
+        if ret == EINTR {
+            if rem_ptr != 0 {
+                let remaining = target_ns.saturating_sub(now_ns());
+                let rem = ns_to_timespec(remaining);
+                let token = get_current_token();
+                write_user_value(token, rem_ptr as *mut TimeSpec, &rem);
+            }
+            return EINTR;
+        }
     }
-    let target_ns: u64 = (ts.sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(ts.nsec as u64);
-    let ticks = get_time() as u64;
-    let now_ns = ticks.saturating_mul(1_000_000_000) / CLOCK_FREQ as u64;
-    if target_ns <= now_ns {
-        return 0;
-    }
-    let delta_ns = target_ns - now_ns;
-    let ms = (delta_ns / 1_000_000) as usize;
-    thread::sys_sleep(ms)
 }
 
 pub fn syscall_times(tms_ptr: usize) -> isize {

@@ -2,7 +2,9 @@ use alloc::sync::Arc;
 
 use crate::{
     config::MAX_HARTS,
+    debug_config::DEBUG_CYCLICTEST,
     mm::{read_user_value, translated_byte_buffer, write_user_value, MapPermission},
+    syscall::misc::decode_linux_tid,
     task::{manager::pid2process, processor::current_process, ProcessControlBlock},
     trap::get_current_token,
 };
@@ -13,10 +15,6 @@ const EINVAL: isize = -22;
 const SCHED_OTHER: i32 = 0;
 const SCHED_FIFO: i32 = 1;
 const SCHED_RR: i32 = 2;
-
-// Keep in sync with `syscall::misc` TID encoding.
-const LINUX_TID_MAGIC: usize = 1 << 30;
-const LINUX_TID_PID_SHIFT: usize = 15;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -40,15 +38,22 @@ fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
         // Accept both:
         // - plain TGIDs (process PIDs), and
         // - encoded TIDs produced by our `gettid()` compatibility layer.
-        let tgid = if (pid & LINUX_TID_MAGIC) != 0 {
-            (pid & !LINUX_TID_MAGIC) >> LINUX_TID_PID_SHIFT
-        } else {
-            pid
-        };
-        if tgid == cur.getpid() {
+        let cur_pid = cur.getpid();
+        if pid == cur_pid {
             Some(cur)
         } else {
-            pid2process(tgid)
+            if decode_linux_tid(cur_pid, pid).is_some() {
+                return Some(cur);
+            }
+            // Accept raw TIDs from the current process (pthread APIs may pass plain tid indexes).
+            let has_task = {
+                let inner = cur.borrow_mut();
+                pid < inner.tasks.len() && inner.tasks[pid].is_some()
+            };
+            if has_task {
+                return Some(cur);
+            }
+            pid2process(pid)
         }
     }
 }
@@ -156,6 +161,14 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         return EINVAL;
     }
     let Some(_process) = resolve_process(pid) else {
+        if DEBUG_CYCLICTEST {
+            log::warn!(
+                "[sched_setaffinity] ESRCH pid={} cpusetsize={} mask_ptr={:#x}",
+                pid,
+                cpusetsize,
+                mask_ptr
+            );
+        }
         return ESRCH;
     };
     // Best-effort: accept and ignore. The scheduler is FIFO and does not yet enforce affinity.

@@ -316,3 +316,9 @@ pub fn check_timer() {
     process_delayed_tid_clears(current_ms);
     process_alarm_timers(current_ms);
 }
+
+pub fn has_pending_timers() -> bool {
+    !TIMERS.lock().is_empty()
+        || !ALARM_TIMERS.lock().is_empty()
+        || !DELAYED_TID_CLEARS.lock().is_empty()
+}
